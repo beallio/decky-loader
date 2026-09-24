@@ -1,3 +1,5 @@
 minimumReleaseAgeExclude:
 - "@decky/api"
 - "@decky/ui"
+allowBuilds:
+  esbuild: true

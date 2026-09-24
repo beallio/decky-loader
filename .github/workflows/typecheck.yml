@@ -35,7 +35,7 @@ jobs:
         working-directory: frontend
         run: |
           npm i -g pnpm
-          pnpm i --frozen-lockfile --dangerously-allow-all-builds
+          pnpm i --frozen-lockfile
 
       - name: Run pyright (Python)
         uses: jakebailey/pyright-action@v1

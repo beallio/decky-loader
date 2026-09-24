@@ -56,11 +56,11 @@ class RouterHook extends Logger {
     window.__ROUTER_HOOK_INSTANCE?.deinit?.();
     window.__ROUTER_HOOK_INSTANCE = this;
 
-    const reactRouterStackModule = findModuleByExport((e) => e == 'router-backstack', 20);
+    const reactRouterStackModule = findModuleByExport((e) => typeof e == 'string' && e == 'router-backstack', 20);
     if (reactRouterStackModule) {
       this.Route =
         Object.values(reactRouterStackModule).find(
-          (e) => typeof e == 'function' && /routePath:.\.match\?\.path./.test(e.toString()),
+          (e) => typeof e == 'function' && /routePath:[\w$]+\.match\?\.path./.test(e.toString()),
         ) ||
         Object.values(reactRouterStackModule).find(
           (e) => typeof e == 'function' && /routePath:null===\(.=.\.match\)/.test(e.toString()),

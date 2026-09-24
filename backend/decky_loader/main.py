@@ -138,7 +138,17 @@ class PluginManager:
             tasks = all_tasks()
             current = current_task()
             async def cancel_task(task: Task[Any]):
-                name = task.get_coro().__qualname__
+                task_coro = task.get_coro() 
+                if not task_coro:
+                    # Can be None in case asyncio.eager_task_factory is used in the future
+                    return
+
+                if sys.version_info >= (3, 12):
+                    name = task_coro.__qualname__
+                else:
+                    # Before 3.12, the task_coro can be a generator and apparently it does not
+                    # have __qualname__, so this workaround is needed...
+                    name = getattr(task_coro, "__qualname__", task.get_name())
                 logger.debug(f"Cancelling task {name}")
                 try:
                     task.cancel()
