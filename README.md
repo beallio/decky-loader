@@ -125,6 +125,12 @@ pnpm update @decky/ui --latest
 
 Source control and deploying plugins are left to each respective contributor for the cloned repos in order to keep dependencies up to date.
 
+The experimental Rust compatibility probe is for private test systems only. It keeps Python plugins in a separate packaged Python runtime and uses the existing frontend. It is not a replacement installer and does not provide plugin installation or loader updates. See the [private bundle setup command](experiments/rust-runtime-probe/prepare_bundle.py) and [dependency audit](experiments/rust-runtime-probe/audit.sh).
+
+The current probe uses the `v3.2.10` source baseline. Bundle setup verifies the tracked Python SDK and frontend against that tag and records their source hashes. The packaged worker must report the same version.
+
+The dependency audit must pass its security, dependency-source, and dependency-use checks. License findings are reported for information only and do not block this private experiment.
+
 ## 📜 Credits
 
 The original idea for the plugin loader concept is based on the work of [marios8543's Steam Deck UI Inject project](https://github.com/marios8543/steamdeck-ui-inject).
