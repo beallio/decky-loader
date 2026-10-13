@@ -50,7 +50,8 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path)
         raise ValueError(f'output already exists; use a new isolated path: {output}')
     subprocess.run(
         ['git', 'diff', '--quiet', BASELINE_TAG, '--', 'backend/decky_loader', 'frontend',
-         ':(exclude)backend/decky_loader/plugin/worker.py'],
+         ':(exclude)backend/decky_loader/plugin/worker.py',
+         ':(exclude)backend/decky_loader/plugin/launcher.py'],
         cwd=REPO, check=True,
     )
     commit, backend_tree, frontend_tree = subprocess.check_output(

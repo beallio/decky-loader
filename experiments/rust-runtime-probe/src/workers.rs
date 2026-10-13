@@ -1,7 +1,12 @@
 use std::{
     collections::HashMap,
     fs, io,
-    os::unix::{fs::PermissionsExt, process::CommandExt},
+    os::fd::{FromRawFd, OwnedFd},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::PermissionsExt,
+        process::{CommandExt, ExitStatusExt},
+    },
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{
@@ -14,6 +19,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tokio::{
+    io::unix::AsyncFd,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, Command},
@@ -22,6 +28,8 @@ use tokio::{
     time::{sleep, timeout},
 };
 use uuid::Uuid;
+
+use crate::launcher::{ForkLauncher, LauncherStartError};
 
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -69,6 +77,9 @@ struct PluginEntry {
 pub struct PluginRegistry {
     plugins: HashMap<String, Arc<PluginEntry>>,
     worker_executable: PathBuf,
+    worker_mode: WorkerMode,
+    worker_bootstrap: WorkerBootstrap,
+    fork_launcher: Option<Arc<ForkLauncher>>,
     plugin_root: PathBuf,
     homebrew: PathBuf,
     user: String,
@@ -78,8 +89,38 @@ pub struct PluginRegistry {
     shutting_down: AtomicBool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerMode {
+    Exec,
+    Fork,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerBootstrap {
+    Full,
+    Lean,
+}
+
+impl WorkerBootstrap {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Lean => "lean",
+        }
+    }
+}
+
+pub struct WorkerConfiguration {
+    pub executable: PathBuf,
+    pub mode: WorkerMode,
+    pub bootstrap: WorkerBootstrap,
+}
+
 struct WorkerLaunchConfig<'a> {
     worker_executable: &'a Path,
+    worker_mode: WorkerMode,
+    worker_bootstrap: WorkerBootstrap,
+    fork_launcher: Option<&'a Arc<ForkLauncher>>,
     plugin_root: &'a Path,
     homebrew: &'a Path,
     user: &'a str,
@@ -90,6 +131,71 @@ struct WorkerProcess {
     handle: WorkerHandle,
     stop: Option<mpsc::UnboundedSender<()>>,
     monitor: Option<JoinHandle<()>>,
+}
+enum WorkerSupervisor {
+    Direct {
+        child: Child,
+        pid: u32,
+    },
+    Fork {
+        launcher: Arc<ForkLauncher>,
+        id: String,
+        pid: u32,
+        exit: AsyncFd<OwnedFd>,
+    },
+}
+
+impl WorkerSupervisor {
+    async fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        match self {
+            Self::Direct { child, pid } => match child.try_wait()? {
+                Some(status) => {
+                    send_group_signal(*pid, libc::SIGKILL);
+                    Ok(Some(status))
+                }
+                None => Ok(None),
+            },
+            Self::Fork {
+                launcher, id, pid, ..
+            } => {
+                let status = launcher
+                    .child_status(id)
+                    .await
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let Some(status) = status else {
+                    return Ok(None);
+                };
+                send_group_signal(*pid, libc::SIGKILL);
+                launcher
+                    .forget_child(id, *pid)
+                    .await
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                Ok(Some(ExitStatus::from_raw(status)))
+            }
+        }
+    }
+
+    async fn abort_startup(&mut self, socket_path: &Path) {
+        match self {
+            Self::Direct { child, pid } => terminate_and_reap(child, *pid).await,
+            Self::Fork {
+                launcher, id, pid, ..
+            } => terminate_fork_child(launcher, id, *pid).await,
+        }
+        let _ = fs::remove_file(socket_path);
+    }
+
+    fn spawn_reaper(self, stop: mpsc::UnboundedReceiver<()>) -> JoinHandle<io::Result<ExitStatus>> {
+        match self {
+            Self::Direct { child, pid } => tokio::spawn(reap_child(child, stop, pid)),
+            Self::Fork {
+                launcher,
+                id,
+                pid,
+                exit,
+            } => tokio::spawn(reap_fork_child(stop, launcher, id, pid, exit)),
+        }
+    }
 }
 
 enum WorkerLaunchError {
@@ -112,7 +218,7 @@ struct PendingState {
 
 impl PluginRegistry {
     pub async fn start(
-        worker_executable: PathBuf,
+        worker: WorkerConfiguration,
         plugin_root: PathBuf,
         homebrew: PathBuf,
         user: String,
@@ -120,11 +226,43 @@ impl PluginRegistry {
         events: broadcast::Sender<Value>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<Self> {
+        let WorkerConfiguration {
+            executable: worker_executable,
+            mode: worker_mode,
+            bootstrap: worker_bootstrap,
+        } = worker;
         let disabled = read_disabled_plugins(&homebrew);
         let metadata = discover_plugins(&plugin_root, &disabled)?;
         let socket_directory = create_socket_directory(user_ids)?;
+        let fork_launcher = if worker_mode == WorkerMode::Fork {
+            match ForkLauncher::spawn(
+                &worker_executable,
+                worker_bootstrap.as_str(),
+                &plugin_root,
+                &homebrew,
+                &user,
+                &mut shutdown,
+            )
+            .await
+            {
+                Ok(launcher) => Some(Arc::new(launcher)),
+                Err(LauncherStartError::Failed(error)) => {
+                    let _ = fs::remove_dir_all(&socket_directory);
+                    return Err(anyhow::anyhow!(error));
+                }
+                Err(LauncherStartError::Interrupted) => {
+                    let _ = fs::remove_dir_all(&socket_directory);
+                    return Err(anyhow::anyhow!("Plugin startup interrupted by shutdown"));
+                }
+            }
+        } else {
+            None
+        };
         let launch_config = WorkerLaunchConfig {
             worker_executable: &worker_executable,
+            worker_mode,
+            worker_bootstrap,
+            fork_launcher: fork_launcher.as_ref(),
             plugin_root: &plugin_root,
             homebrew: &homebrew,
             user: &user,
@@ -134,7 +272,7 @@ impl PluginRegistry {
 
         for plugin in metadata.into_values() {
             if shutdown_requested(&shutdown) {
-                cleanup_plugins(&plugins, &socket_directory).await;
+                cleanup_plugins(&plugins, &socket_directory, fork_launcher.as_ref()).await;
                 return Err(anyhow::anyhow!("Plugin startup interrupted by shutdown"));
             }
 
@@ -161,7 +299,7 @@ impl PluginRegistry {
                     Err(WorkerLaunchError::Failed(error)) => runtime.start_error = Some(error),
                     Err(WorkerLaunchError::Interrupted) => {
                         drop(runtime);
-                        cleanup_plugins(&plugins, &socket_directory).await;
+                        cleanup_plugins(&plugins, &socket_directory, fork_launcher.as_ref()).await;
                         return Err(anyhow::anyhow!("Plugin startup interrupted by shutdown"));
                     }
                 }
@@ -171,13 +309,16 @@ impl PluginRegistry {
         }
 
         if shutdown_requested(&shutdown) {
-            cleanup_plugins(&plugins, &socket_directory).await;
+            cleanup_plugins(&plugins, &socket_directory, fork_launcher.as_ref()).await;
             return Err(anyhow::anyhow!("Plugin startup interrupted by shutdown"));
         }
 
         Ok(Self {
             plugins,
             worker_executable,
+            worker_mode,
+            worker_bootstrap,
+            fork_launcher,
             plugin_root,
             homebrew,
             user,
@@ -349,6 +490,9 @@ impl PluginRegistry {
         } else {
             let launch_config = WorkerLaunchConfig {
                 worker_executable: &self.worker_executable,
+                worker_mode: self.worker_mode,
+                worker_bootstrap: self.worker_bootstrap,
+                fork_launcher: self.fork_launcher.as_ref(),
                 plugin_root: &self.plugin_root,
                 homebrew: &self.homebrew,
                 user: &self.user,
@@ -393,7 +537,12 @@ impl PluginRegistry {
         if self.shutting_down.swap(true, Ordering::AcqRel) {
             return;
         }
-        cleanup_plugins(&self.plugins, &self.socket_directory).await;
+        cleanup_plugins(
+            &self.plugins,
+            &self.socket_directory,
+            self.fork_launcher.as_ref(),
+        )
+        .await;
     }
 }
 
@@ -401,7 +550,11 @@ fn shutdown_requested(shutdown: &watch::Receiver<bool>) -> bool {
     *shutdown.borrow()
 }
 
-async fn cleanup_plugins(plugins: &HashMap<String, Arc<PluginEntry>>, socket_directory: &Path) {
+async fn cleanup_plugins(
+    plugins: &HashMap<String, Arc<PluginEntry>>,
+    socket_directory: &Path,
+    fork_launcher: Option<&Arc<ForkLauncher>>,
+) {
     let entries: Vec<_> = plugins.values().cloned().collect();
     let stops = entries.into_iter().map(|entry| async move {
         let mut runtime = entry.runtime.lock().await;
@@ -411,6 +564,9 @@ async fn cleanup_plugins(plugins: &HashMap<String, Arc<PluginEntry>>, socket_dir
     });
     futures_util::future::join_all(stops).await;
     let _ = fs::remove_dir_all(socket_directory);
+    if let Some(launcher) = fork_launcher {
+        launcher.shutdown().await;
+    }
 }
 
 fn display_name(plugin: &PluginMetadata) -> String {
@@ -513,11 +669,41 @@ fn read_disabled_plugins(homebrew: &Path) -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
+fn process_exit_notification(pid: u32) -> io::Result<AsyncFd<OwnedFd>> {
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
+    AsyncFd::new(descriptor)
+}
+
+fn socket_filename() -> String {
+    let identifier = Uuid::new_v4().as_u128() & ((1_u128 << 96) - 1);
+    format!("{identifier:024x}.sock")
+}
 
 fn create_socket_directory(user_ids: (u32, u32)) -> Result<PathBuf> {
-    // AF_UNIX path lengths are limited; keep addresses independent of a long
-    // frozen-runtime TMPDIR while retaining a private owned namespace.
-    let directory = Path::new("/tmp").join(format!("drp-{}", Uuid::new_v4().simple()));
+    let temporary_directory = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/tmp/omp-1000"));
+    if !temporary_directory.exists() {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&temporary_directory)?;
+    }
+    let temporary_directory =
+        fs::canonicalize(temporary_directory).context("resolving TMPDIR for worker IPC sockets")?;
+    let directory = temporary_directory.join(format!("drp-{}", Uuid::new_v4().simple()));
+    let example_socket = directory.join("user").join(socket_filename());
+    if example_socket.as_os_str().as_bytes().len() >= 108 {
+        anyhow::bail!(
+            "resolved TMPDIR produces worker IPC paths at or above the Linux AF_UNIX limit: {}",
+            example_socket.display()
+        );
+    }
     fs::create_dir(&directory).with_context(|| {
         format!(
             "Failed to create worker socket directory {}",
@@ -553,6 +739,9 @@ async fn launch_worker(
 ) -> std::result::Result<WorkerProcess, WorkerLaunchError> {
     let WorkerLaunchConfig {
         worker_executable,
+        worker_mode,
+        worker_bootstrap,
+        fork_launcher,
         plugin_root,
         homebrew,
         user,
@@ -573,37 +762,115 @@ async fn launch_worker(
 
     let socket_path = socket_directory
         .join(if plugin.requires_root { "root" } else { "user" })
-        .join(format!("{}.sock", Uuid::new_v4().simple()));
-    let mut command = Command::new(worker_executable);
-    command
-        .arg("--plugin-root")
-        .arg(plugin_root)
-        .arg("--plugin-directory")
-        .arg(&plugin.directory)
-        .arg("--socket")
-        .arg(&socket_path)
-        .arg("--homebrew")
-        .arg(homebrew)
-        .arg("--user")
-        .arg(user)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    // PyInstaller forks its Python runtime; isolate both in an owned process group.
-    command.as_std_mut().process_group(0);
-    let mut child = command.spawn().map_err(|error| {
-        WorkerLaunchError::Failed(format!(
-            "Failed to start worker for {} using {}: {error}",
-            display_name(plugin),
-            worker_executable.display()
-        ))
-    })?;
-    let pid = child.id().expect("a spawned worker has a process ID");
+        .join(socket_filename());
+    if socket_path.as_os_str().as_bytes().len() >= 108 {
+        return Err(WorkerLaunchError::Failed(format!(
+            "Worker IPC socket path exceeds the Linux AF_UNIX limit: {}",
+            socket_path.display()
+        )));
+    }
+
+    let mut supervisor = match worker_mode {
+        WorkerMode::Exec => {
+            let mut command = Command::new(worker_executable);
+            command
+                .arg("--plugin-root")
+                .arg(plugin_root)
+                .arg("--plugin-directory")
+                .arg(&plugin.directory)
+                .arg("--socket")
+                .arg(&socket_path)
+                .arg("--homebrew")
+                .arg(homebrew)
+                .arg("--user")
+                .arg(user)
+                .arg("--bootstrap")
+                .arg(worker_bootstrap.as_str())
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            command.as_std_mut().process_group(0);
+            let child = command.spawn().map_err(|error| {
+                WorkerLaunchError::Failed(format!(
+                    "Failed to start worker for {} using {}: {error}",
+                    display_name(plugin),
+                    worker_executable.display()
+                ))
+            })?;
+            let pid = child.id().expect("a spawned worker has a process ID");
+            WorkerSupervisor::Direct { child, pid }
+        }
+        WorkerMode::Fork => {
+            let Some(launcher) = fork_launcher else {
+                return Err(WorkerLaunchError::Failed(
+                    "Fork worker mode has no shared launcher".to_owned(),
+                ));
+            };
+            let id = Uuid::new_v4().to_string();
+            match launcher
+                .start_child(json!({
+                    "op": "start",
+                    "id": id,
+                    "plugin_root": plugin_root,
+                    "plugin_directory": plugin.directory,
+                    "socket": socket_path,
+                    "homebrew": homebrew,
+                    "user": user,
+                    "bootstrap": worker_bootstrap.as_str(),
+                }))
+                .await
+            {
+                Ok(pid) => {
+                    let exit = match process_exit_notification(pid) {
+                        Ok(exit) => exit,
+                        Err(error) => {
+                            terminate_fork_child(launcher, &id, pid).await;
+                            return Err(WorkerLaunchError::Failed(format!(
+                                "Could not monitor forked worker exit: {error}"
+                            )));
+                        }
+                    };
+                    WorkerSupervisor::Fork {
+                        launcher: Arc::clone(launcher),
+                        id,
+                        pid,
+                        exit,
+                    }
+                }
+                Err(error) => {
+                    return Err(WorkerLaunchError::Failed(format!(
+                        "Failed to fork worker for {}: {error:#}",
+                        display_name(plugin)
+                    )));
+                }
+            }
+        }
+    };
+    if shutdown_requested(shutdown) {
+        supervisor.abort_startup(&socket_path).await;
+        return Err(WorkerLaunchError::Interrupted);
+    }
+    let release = match &supervisor {
+        WorkerSupervisor::Direct { .. } => None,
+        WorkerSupervisor::Fork { launcher, id, .. } => Some(launcher.release_child(id).await),
+    };
+    if let Some(Err(error)) = release {
+        supervisor.abort_startup(&socket_path).await;
+        return Err(WorkerLaunchError::Failed(format!(
+            "Could not release forked worker for {}: {error:#}",
+            display_name(plugin)
+        )));
+    }
+    if shutdown_requested(shutdown) {
+        supervisor.abort_startup(&socket_path).await;
+        return Err(WorkerLaunchError::Interrupted);
+    }
 
     let start = Instant::now();
     let stream = loop {
         if shutdown_requested(shutdown) {
-            abort_worker_startup(&mut child, pid, &socket_path).await;
+            let mut supervisor = supervisor;
+            supervisor.abort_startup(&socket_path).await;
             return Err(WorkerLaunchError::Interrupted);
         }
 
@@ -611,7 +878,8 @@ async fn launch_worker(
             biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || shutdown_requested(shutdown) {
-                    abort_worker_startup(&mut child, pid, &socket_path).await;
+                    let mut supervisor = supervisor;
+                    supervisor.abort_startup(&socket_path).await;
                     return Err(WorkerLaunchError::Interrupted);
                 }
                 continue;
@@ -621,9 +889,9 @@ async fn launch_worker(
         match connection {
             Ok(stream) => break stream,
             Err(last_socket_error) => {
-                match child.try_wait() {
+                let child_status = supervisor.try_wait().await;
+                match child_status {
                     Ok(Some(status)) => {
-                        send_group_signal(pid, libc::SIGKILL);
                         let _ = fs::remove_file(&socket_path);
                         return Err(WorkerLaunchError::Failed(format!(
                             "Worker for {} exited before IPC readiness: {status}",
@@ -632,7 +900,8 @@ async fn launch_worker(
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        abort_worker_startup(&mut child, pid, &socket_path).await;
+                        let mut supervisor = supervisor;
+                        supervisor.abort_startup(&socket_path).await;
                         return Err(WorkerLaunchError::Failed(format!(
                             "Could not check worker startup for {}: {error}",
                             display_name(plugin)
@@ -641,7 +910,8 @@ async fn launch_worker(
                 }
 
                 if start.elapsed() >= WORKER_READY_TIMEOUT {
-                    abort_worker_startup(&mut child, pid, &socket_path).await;
+                    let mut supervisor = supervisor;
+                    supervisor.abort_startup(&socket_path).await;
                     let detail = last_socket_error.to_string();
                     return Err(WorkerLaunchError::Failed(format!(
                         "Worker for {} did not become IPC-ready within {} seconds: {detail}",
@@ -654,7 +924,8 @@ async fn launch_worker(
                     biased;
                     changed = shutdown.changed() => {
                         if changed.is_err() || shutdown_requested(shutdown) {
-                            abort_worker_startup(&mut child, pid, &socket_path).await;
+                            let mut supervisor = supervisor;
+                            supervisor.abort_startup(&socket_path).await;
                             return Err(WorkerLaunchError::Interrupted);
                         }
                     }
@@ -666,12 +937,13 @@ async fn launch_worker(
 
     if shutdown_requested(shutdown) {
         drop(stream);
-        abort_worker_startup(&mut child, pid, &socket_path).await;
+        let mut supervisor = supervisor;
+        supervisor.abort_startup(&socket_path).await;
         return Err(WorkerLaunchError::Interrupted);
     }
 
     let (stop, stop_receiver) = mpsc::unbounded_channel();
-    let reaper = tokio::spawn(reap_child(child, stop_receiver, pid));
+    let reaper = supervisor.spawn_reaper(stop_receiver);
     let (reader, writer) = stream.into_split();
     let handle = WorkerHandle {
         writer: Arc::new(Mutex::new(writer)),
@@ -698,12 +970,6 @@ async fn launch_worker(
         monitor: Some(monitor),
     })
 }
-
-async fn abort_worker_startup(child: &mut Child, pid: u32, socket_path: &Path) {
-    terminate_and_reap(child, pid).await;
-    let _ = fs::remove_file(socket_path);
-}
-
 impl WorkerProcess {
     async fn stop(&mut self) {
         {
@@ -742,6 +1008,71 @@ async fn reap_child(
     // The bootloader may exit before a Python child or plugin descendant.
     send_group_signal(pid, libc::SIGKILL);
     status
+}
+async fn reap_fork_child(
+    mut stop: mpsc::UnboundedReceiver<()>,
+    launcher: Arc<ForkLauncher>,
+    id: String,
+    pid: u32,
+    exit: AsyncFd<OwnedFd>,
+) -> io::Result<ExitStatus> {
+    let exited = tokio::select! {
+        result = exit.readable() => result.map(drop),
+        _ = stop.recv() => {
+            send_signal(pid, libc::SIGTERM);
+            match timeout(WORKER_GRACEFUL_TIMEOUT, exit.readable()).await {
+                Ok(result) => result.map(drop),
+                Err(_) => {
+                    send_group_signal(pid, libc::SIGKILL);
+                    match timeout(WORKER_GRACEFUL_TIMEOUT, exit.readable()).await {
+                        Ok(result) => result.map(drop),
+                        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "forked plugin did not exit after SIGKILL")),
+                    }
+                }
+            }
+        }
+    };
+    send_group_signal(pid, libc::SIGKILL);
+    exited?;
+    let status = launcher
+        .child_status(&id)
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .ok_or_else(|| io::Error::other("forked plugin exited without a launcher wait status"))?;
+    launcher
+        .forget_child(&id, pid)
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(ExitStatus::from_raw(status))
+}
+
+async fn terminate_fork_child(launcher: &Arc<ForkLauncher>, id: &str, pid: u32) {
+    send_signal(pid, libc::SIGTERM);
+    let graceful_deadline = Instant::now() + WORKER_GRACEFUL_TIMEOUT;
+    let mut kill_deadline = None;
+    loop {
+        match launcher.child_status(id).await {
+            Ok(Some(_)) => {
+                send_group_signal(pid, libc::SIGKILL);
+                let _ = launcher.forget_child(id, pid).await;
+                return;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                send_group_signal(pid, libc::SIGKILL);
+                return;
+            }
+        }
+        let now = Instant::now();
+        if kill_deadline.is_none() && now >= graceful_deadline {
+            send_group_signal(pid, libc::SIGKILL);
+            kill_deadline = Some(now + WORKER_GRACEFUL_TIMEOUT);
+        }
+        if kill_deadline.is_some_and(|deadline| now >= deadline) {
+            return;
+        }
+        sleep(SOCKET_RETRY_INTERVAL).await;
+    }
 }
 
 async fn terminate_and_reap(child: &mut Child, pid: u32) {

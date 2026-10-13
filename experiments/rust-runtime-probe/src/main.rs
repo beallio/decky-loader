@@ -1,4 +1,5 @@
 mod backend;
+mod launcher;
 mod transport;
 mod workers;
 
@@ -12,9 +13,9 @@ use tokio::{
 };
 
 use backend::Backend;
-use workers::PluginRegistry;
+use workers::{PluginRegistry, WorkerBootstrap, WorkerConfiguration, WorkerMode};
 
-const HELP: &str = "Decky Rust runtime compatibility probe (not a production loader)\n\nRequired:\n  --worker PATH              Packaged DeckyPluginWorker executable\n  --plugin-root PATH         Isolated plugin directory\n  --homebrew PATH            Isolated settings/data/logs root\n  --user USER                Host user identity for normal plugins\n  --assets PATH              Existing Decky frontend bundles\n  --locales PATH             Existing Decky locale JSON directory\n\nOptional:\n  --listen ADDRESS           Loopback address (default 127.0.0.1:1339)\n  --auth-file PATH           Read token from a private file instead of generating one\n\nSupports plugin discovery/RPC/events/reload, loader settings, bootstrap information,\nstatic assets and the existing fetch proxy. Installation, OS administration and\nrelease-update routes are intentionally unavailable; they return explicit errors.\n";
+const HELP: &str = "Decky Rust runtime compatibility probe (not a production loader)\n\nRequired:\n  --worker PATH              Packaged DeckyPluginWorker executable\n  --plugin-root PATH         Isolated plugin directory\n  --homebrew PATH            Isolated settings/data/logs root\n  --user USER                Host user identity for normal plugins\n  --assets PATH              Existing Decky frontend bundles\n  --locales PATH             Existing Decky locale JSON directory\n\nOptional:\n  --worker-mode MODE         Worker supervision: exec or fork (default exec)\n  --worker-bootstrap MODE    Runtime preload: full or lean (default lean)\n  --listen ADDRESS           Loopback address (default 127.0.0.1:1339)\n  --auth-file PATH           Read token from a private file instead of generating one\n\nSupports plugin discovery/RPC/events/reload, loader settings, bootstrap information,\nstatic assets and the existing fetch proxy. Installation, OS administration and\nrelease-update routes are intentionally unavailable; they return explicit errors.\n";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,6 +28,8 @@ async fn main() -> anyhow::Result<()> {
         }
         if ![
             "--worker",
+            "--worker-mode",
+            "--worker-bootstrap",
             "--plugin-root",
             "--homebrew",
             "--user",
@@ -47,6 +50,20 @@ async fn main() -> anyhow::Result<()> {
         }
         options.insert(key, value);
     }
+    let worker_mode = match options.remove("--worker-mode").as_deref().unwrap_or("exec") {
+        "exec" => WorkerMode::Exec,
+        "fork" => WorkerMode::Fork,
+        value => bail!("invalid --worker-mode {value:?}; expected exec or fork"),
+    };
+    let worker_bootstrap = match options
+        .remove("--worker-bootstrap")
+        .as_deref()
+        .unwrap_or("lean")
+    {
+        "full" => WorkerBootstrap::Full,
+        "lean" => WorkerBootstrap::Lean,
+        value => bail!("invalid --worker-bootstrap {value:?}; expected full or lean"),
+    };
     let address: SocketAddr = options
         .remove("--listen")
         .unwrap_or_else(|| "127.0.0.1:1339".into())
@@ -144,7 +161,11 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(());
     });
     let registry = match PluginRegistry::start(
-        worker,
+        WorkerConfiguration {
+            executable: worker,
+            mode: worker_mode,
+            bootstrap: worker_bootstrap,
+        },
         plugin_root,
         homebrew.clone(),
         user.clone(),
@@ -157,6 +178,9 @@ async fn main() -> anyhow::Result<()> {
         Ok(registry) => Arc::new(registry),
         Err(error) => {
             signal_task.abort();
+            if *shutdown_watch_rx.borrow() {
+                return Ok(());
+            }
             return Err(error);
         }
     };
@@ -176,7 +200,7 @@ async fn main() -> anyhow::Result<()> {
             let _ = shutdown_watch_tx.send(true);
             registry.shutdown().await;
             signal_task.abort();
-            return Err(anyhow::anyhow!("Probe startup interrupted by shutdown"));
+            return Ok(());
         }
     };
     eprintln!(

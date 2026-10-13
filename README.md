@@ -133,6 +133,8 @@ Worker builds use a single executable by default. For the shared-directory packa
 
 Packaged workers default to the lean SDK startup path. Legacy SDK modules load when a plugin imports them. Use the worker's `--bootstrap full` option for a full-startup comparison; both paths use the same Python runtime and plugin API.
 
+For the shared-launcher experiment, pass `--worker-mode fork` to the Rust probe. One single-threaded Python launcher loads the SDK and forks a separate process for each plugin. Plugin code runs only in the child process, with the existing user permissions and socket API. The default `exec` mode starts each worker separately. Both modes retain process-group cleanup on worker failure and shutdown.
+
 The [SteamOS VM benchmark driver](experiments/rust-runtime-probe/benchmark_vm.py) compares the installed Python backend with both worker formats. It requires root access on a private VM with Decky Metadata, CSS Loader, SDH-Ludusavi, and HLTB for Deck installed. Use `--help` for the required executable and output paths. It runs at least ten trials per format using cloned plugin and settings files, private network namespaces, and complete process-group memory and CPU measurements. It leaves the normal service running and records raw trials, failures, and summary statistics. These are backend measurements, not full-product performance or production-parity results.
 
 The dependency audit must pass its security, dependency-source, and dependency-use checks. License findings are reported for information only and do not block this private experiment.

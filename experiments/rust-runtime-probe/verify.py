@@ -93,6 +93,11 @@ async def main(base: str, privileged: bool):
             assert modern['native_modules'] == ['aiohttp._http_parser', 'multidict._multidict'], modern
             legacy = await client.call('loader/call_legacy_plugin_method', 'Rust Probe Legacy', 'compute', {'values': [3, 4]})
             assert legacy['success'] and legacy['result']['total'] == 25 and legacy['result']['user'] == 1000, legacy
+            modern_identity = await client.call('loader/call_plugin_method', 'Rust Probe Modern', 'process_identity')
+            legacy_identity = await client.call('loader/call_legacy_plugin_method', 'Rust Probe Legacy', 'process_identity', {})
+            assert legacy_identity['success'], legacy_identity
+            assert modern_identity['pid'] != legacy_identity['result']['pid'], (modern_identity, legacy_identity)
+            assert modern_identity['cmdline'] != legacy_identity['result']['cmdline'], (modern_identity, legacy_identity)
             event = next(frame for frame in client.events if frame['event'] == 'loader/plugin_event' and frame['args'][0]['plugin'] == 'Rust Probe Modern')
             assert event['args'][0]['event'] == 'calculated' and event['args'][0]['args'] == [25.0, '日本語'], event
 

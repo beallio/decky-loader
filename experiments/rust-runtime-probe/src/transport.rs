@@ -809,7 +809,11 @@ mod tests {
         let user = std::env::var("USER").expect("test account USER");
         let registry = Arc::new(
             crate::workers::PluginRegistry::start(
-                std::env::current_exe().unwrap(),
+                crate::workers::WorkerConfiguration {
+                    executable: std::env::current_exe().unwrap(),
+                    mode: crate::workers::WorkerMode::Exec,
+                    bootstrap: crate::workers::WorkerBootstrap::Lean,
+                },
                 plugin_root,
                 directory.0.clone(),
                 user.clone(),

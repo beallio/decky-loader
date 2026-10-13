@@ -32,6 +32,9 @@ class Plugin:
         await decky.emit('calculated', result, '日本語')
         return {'total': result, 'calls': state['calls'], 'alias': decky is decky_plugin, 'python': __import__('platform').python_version(), 'native_modules': [aiohttp._http_parser.__name__, multidict._multidict.__name__], 'user': os.geteuid(), 'name': decky.DECKY_PLUGIN_NAME}
 
+    async def process_identity(self):
+        return {'pid': os.getpid(), 'cmdline': Path('/proc/self/cmdline').read_bytes().hex()}
+
     async def slow(self, seconds):
         await decky.emit('slow_started', seconds)
         await asyncio.sleep(seconds)
