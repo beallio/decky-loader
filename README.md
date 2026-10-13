@@ -129,6 +129,8 @@ The experimental Rust compatibility probe is for private test systems only. It k
 
 The current probe uses the `v3.2.10` source baseline. Bundle setup verifies the tracked Python SDK and frontend against that tag and records their source hashes. The packaged worker must report the same version.
 
+Worker builds use a single executable by default. For the shared-directory packaging experiment, set `DECKY_WORKER_ONEDIR=1` when building `backend/worker.spec`. Keep the executable and its `_internal` directory together; bundle setup copies and checks both.
+
 The dependency audit must pass its security, dependency-source, and dependency-use checks. License findings are reported for information only and do not block this private experiment.
 
 ## 📜 Credits

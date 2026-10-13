@@ -7,10 +7,15 @@ Install the backend with POETRY_DYNAMIC_VERSIONING_BYPASS=3.2.10 so that its
 package metadata reports the verified SDK baseline, not the probe branch's
 development commit count.
 
-From the repository root, build backend/worker.spec with PyInstaller and build
-experiments/rust-runtime-probe/Cargo.toml with cargo build --locked --release.
-Then supply those two executables to this command. It records the release
-commit, SDK/frontend Git tree hashes, runtime description, and file checksums.
+From the repository root, build the default one-file worker with:
+    python -m PyInstaller --distpath /var/tmp/worker-dist --workpath /var/tmp/worker-build backend/worker.spec
+For an onedir worker, set DECKY_WORKER_ONEDIR=1 on the same command:
+    DECKY_WORKER_ONEDIR=1 python -m PyInstaller --distpath /var/tmp/worker-dist --workpath /var/tmp/worker-build backend/worker.spec
+Both builds produce DeckyPluginWorker under the supplied dist path; the onedir build also produces its
+sibling _internal directory. Then supply the worker executable, Rust executable
+and frontend assets/locales to this command. It records the release commit,
+SDK/frontend Git tree hashes, runtime description, packaging variant, and file
+checksums, including every onedir runtime file.
 """
 from __future__ import annotations
 
@@ -57,6 +62,10 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path)
         'tag': BASELINE_TAG, 'commit': commit,
         'backend_tree': backend_tree, 'frontend_tree': frontend_tree,
     }
+    onedir_runtime = worker.parent / '_internal'
+    worker_packaging = 'onedir' if onedir_runtime.is_dir() else 'onefile'
+    if worker_packaging == 'onedir' and not any(onedir_runtime.rglob('*')):
+        raise ValueError(f'worker onedir runtime directory is empty: {onedir_runtime}')
     runtime = json.loads(subprocess.check_output([str(worker), '--describe'], text=True, timeout=20))
     if not runtime['frozen'] or not runtime['python'].startswith('3.11.'):
         raise ValueError('the private probe requires a frozen CPython 3.11 worker')
@@ -69,6 +78,8 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path)
         bundle = staging / 'bundle'
         bundle.mkdir(parents=True)
         shutil.copy2(worker, bundle / 'DeckyPluginWorker')
+        if worker_packaging == 'onedir':
+            shutil.copytree(onedir_runtime, bundle / '_internal')
         shutil.copy2(rust, bundle / 'decky-rust-runtime-probe')
         shutil.copytree(assets, bundle / 'assets')
         shutil.copytree(locales, bundle / 'locales')
@@ -76,6 +87,7 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path)
             'kind': 'decky-rust-runtime-probe',
             'private_only': True,
             'distribution_approved': False,
+            'worker_packaging': worker_packaging,
             'runtime': runtime,
             'source_baseline': source_baseline,
             'cargo_lock_sha256': digest(HERE / 'Cargo.lock'),

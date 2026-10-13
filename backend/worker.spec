@@ -1,6 +1,6 @@
 import os
 
-from PyInstaller.building.api import EXE, PYZ
+from PyInstaller.building.api import COLLECT, EXE, PYZ
 from PyInstaller.building.build_main import Analysis
 from PyInstaller.utils.hooks import collect_all, collect_submodules, copy_metadata
 
@@ -74,13 +74,33 @@ a = Analysis(
 )
 pyz = PYZ(a.pure, a.zipped_data)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    name="DeckyPluginWorker",
-    console=True,
-    upx=False,
-)
+onedir = os.environ.get("DECKY_WORKER_ONEDIR") == "1"
+if onedir:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        name="DeckyPluginWorker",
+        console=True,
+        upx=False,
+    )
+    bundle = COLLECT(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        name="DeckyPluginWorker",
+        upx=False,
+    )
+else:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        name="DeckyPluginWorker",
+        console=True,
+        upx=False,
+    )
