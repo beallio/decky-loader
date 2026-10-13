@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib
+from importlib.abc import Loader, MetaPathFinder
+from importlib.machinery import ModuleSpec
 import json
 import logging
 import os
@@ -10,11 +12,67 @@ import platform
 import sys
 import sysconfig
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Callable, Coroutine, Sequence, cast
 
 
 class WorkerError(RuntimeError):
     """A worker invocation or plugin startup failure."""
+
+
+_SDK_ALIAS_ROOTS = frozenset(
+    ("browser", "enums", "helpers", "injector", "loader", "localplatform",
+     "main", "plugin", "settings", "updater", "utilities", "wsrouter")
+)
+_prepared_bootstraps: set[str] = set()
+
+
+class _SdkAliasLoader(Loader):
+    def __init__(self, module: ModuleType) -> None:
+        self.module = module
+        self.original_spec = module.__spec__
+
+    def create_module(self, spec: ModuleSpec) -> ModuleType:
+        return self.module
+
+    def exec_module(self, module: ModuleType) -> None:
+        # importlib assigns the alias spec; keep the real SDK's reload identity.
+        module.__spec__ = self.original_spec
+
+
+class _SdkAliasFinder(MetaPathFinder):
+    def find_spec(
+        self,
+        fullname: str,
+        path: Sequence[str] | None = None,
+        target: ModuleType | None = None,
+    ) -> ModuleSpec | None:
+        if fullname.partition(".")[0] not in _SDK_ALIAS_ROOTS:
+            return None
+        module = importlib.import_module(f"decky_loader.{fullname}")
+        spec = ModuleSpec(fullname, _SdkAliasLoader(module), is_package=hasattr(module, "__path__"))
+        if module.__spec__ is not None:
+            spec.submodule_search_locations = module.__spec__.submodule_search_locations
+        return spec
+
+
+def prepare_runtime(bootstrap: str) -> None:
+    if bootstrap in _prepared_bootstraps:
+        return
+    if bootstrap == "full":
+        importlib.import_module("decky_loader.main")
+    elif bootstrap == "lean":
+        from decky_loader.localplatform.localplatform import chmod
+
+        if hasattr(sys, "_MEIPASS"):
+            chmod(cast(str, getattr(sys, "_MEIPASS")), 755)
+        if not any(isinstance(finder, _SdkAliasFinder) for finder in sys.meta_path):
+            sys.meta_path.insert(0, _SdkAliasFinder())
+    else:
+        raise WorkerError(f"unknown worker bootstrap: {bootstrap}")
+    importlib.import_module("decky_loader.localplatform.localsocket")
+    importlib.import_module("decky_loader.plugin.sandboxed_plugin")
+    _prepared_bootstraps.add(bootstrap)
 
 
 def _runtime_description() -> dict[str, Any]:
@@ -38,6 +96,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--socket", help="Unix socket path used for plugin IPC")
     parser.add_argument("--homebrew", help="isolated Decky homebrew directory")
     parser.add_argument("--user", help="account that owns the isolated Decky tree")
+    parser.add_argument("--bootstrap", choices=("full", "lean"), default="lean", help="SDK startup path")
     return parser
 
 
@@ -206,7 +265,7 @@ def _append_system_pythonpaths(get_system_pythonpaths: Any) -> None:
             sys.path.append(python_path)
 
 
-def _launch(args: argparse.Namespace) -> None:
+def launch(args: argparse.Namespace) -> None:
     root, plugin_directory = _resolve_plugin_directory(args.plugin_root, args.plugin_directory)
     name, flags, entrypoint, version, author, api_version = _plugin_metadata(plugin_directory)
     account = _selected_user(args.user)
@@ -233,9 +292,7 @@ def _launch(args: argparse.Namespace) -> None:
         stream=sys.stderr,
     )
 
-    # Importing main loads the legacy module graph (including its SDK aliases and
-    # PyInstaller extraction permissions) but does not construct or run services.
-    importlib.import_module("decky_loader.main")
+    prepare_runtime(args.bootstrap)
     from decky_loader.helpers import get_system_pythonpaths
     from decky_loader.localplatform.localsocket import LocalSocket
     from decky_loader.plugin.sandboxed_plugin import SandboxedPlugin
@@ -293,7 +350,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     _required_arguments(parser, args)
     try:
-        _launch(args)
+        launch(args)
     except Exception as error:
         print(f"DeckyPluginWorker: {error}", file=sys.stderr)
         return 1
