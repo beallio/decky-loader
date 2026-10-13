@@ -645,6 +645,7 @@ def _rust_command(
     return [
         str(rust_executable),
         '--listen', LISTEN,
+        '--inject-frontend', 'true',
         '--worker', str(worker),
         '--worker-mode', mode,
         '--worker-bootstrap', bootstrap,
@@ -785,8 +786,8 @@ def run_trial(
         'snapshot_sha256': expected_snapshot_digest['sha256'],
         'log_path': str(log_path),
         'comparability_note': (
-            'python-installed runs the official Python Decky backend; Rust runs the private compatibility probe, '
-            'which intentionally lacks production installation, administrative, and updater behavior.'
+            'python-installed runs the official Python Decky backend; Rust runs the private Linux/SteamOS '
+            'backend build. These isolated backend trials do not measure the live Steam frontend.'
         ),
     }
     launch_attempted = False
@@ -1137,10 +1138,12 @@ def run_benchmark(args: argparse.Namespace) -> int:
         'started_at_utc': utc_now(),
         'output_directory': str(output),
         'comparability_limitation': (
-            'python-installed is the official installed Decky v3.2.10 Python backend. The Rust executable is a '
-            'private compatibility probe and lacks production installation, administrative, updater, and other '
-            'full-loader behavior; performance results are not production parity claims. Startup is process-cold '
-            'only and does not flush OS caches.'
+            'python-installed is the official installed Decky v3.2.10 Python backend. Rust runs the private '
+            'Linux/SteamOS backend build with the same plugin data and SDK/frontend baseline. Each trial '
+            'has a private network without Steam CEF, with both backends running their injector retry path; '
+            'these results do not establish full-product, '
+            'physical Steam Deck, or long-duration performance. Startup is process-cold only and does '
+            'not flush OS caches.'
         ),
         'memory_sharing_note': (
             'PSS apportions shared resident pages across mapped processes, while Private_Dirty reports pages private '
