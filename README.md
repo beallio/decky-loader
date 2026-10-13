@@ -131,6 +131,8 @@ The current probe uses the `v3.2.10` source baseline. Bundle setup verifies the 
 
 Worker builds use a single executable by default. For the shared-directory packaging experiment, set `DECKY_WORKER_ONEDIR=1` when building `backend/worker.spec`. Keep the executable and its `_internal` directory together; bundle setup copies and checks both.
 
+The [SteamOS VM benchmark driver](experiments/rust-runtime-probe/benchmark_vm.py) compares the installed Python backend with both worker formats. It requires root access on a private VM with Decky Metadata, CSS Loader, SDH-Ludusavi, and HLTB for Deck installed. Use `--help` for the required executable and output paths. It runs at least ten trials per format using cloned plugin and settings files, private network namespaces, and complete process-group memory and CPU measurements. It leaves the normal service running and records raw trials, failures, and summary statistics. These are backend measurements, not full-product performance or production-parity results.
+
 The dependency audit must pass its security, dependency-source, and dependency-use checks. License findings are reported for information only and do not block this private experiment.
 
 ## 📜 Credits
