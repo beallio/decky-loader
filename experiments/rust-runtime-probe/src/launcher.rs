@@ -32,12 +32,20 @@ pub(crate) struct ForkLauncher {
     groups: Arc<Mutex<HashSet<u32>>>,
     stop: mpsc::UnboundedSender<()>,
     reaper: Mutex<Option<JoinHandle<io::Result<ExitStatus>>>>,
+    failure: watch::Receiver<bool>,
 }
 
 #[derive(Debug)]
 pub(crate) enum LauncherStartError {
     Failed(String),
     Interrupted,
+}
+
+pub(crate) struct LauncherEnvironment<'a> {
+    pub auth_token: &'a str,
+    pub server_host: &'a str,
+    pub server_port: u16,
+    pub chown_plugin_path: bool,
 }
 
 impl ForkLauncher {
@@ -48,6 +56,7 @@ impl ForkLauncher {
         homebrew: &Path,
         user: &str,
         shutdown: &mut watch::Receiver<bool>,
+        environment: LauncherEnvironment<'_>,
     ) -> std::result::Result<Self, LauncherStartError> {
         if *shutdown.borrow() {
             return Err(LauncherStartError::Interrupted);
@@ -62,7 +71,17 @@ impl ForkLauncher {
             .env("UNPRIVILEGED_PATH", homebrew)
             .env("PRIVILEGED_PATH", plugin_root.parent().unwrap_or(homebrew))
             .env("UNPRIVILEGED_USER", user)
-            .env("CHOWN_PLUGIN_PATH", "0")
+            .env("DECKY_AUTH_TOKEN", environment.auth_token)
+            .env("SERVER_HOST", environment.server_host)
+            .env("SERVER_PORT", environment.server_port.to_string())
+            .env(
+                "CHOWN_PLUGIN_PATH",
+                if environment.chown_plugin_path {
+                    "1"
+                } else {
+                    "0"
+                },
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -133,13 +152,24 @@ impl ForkLauncher {
 
         let groups = Arc::new(Mutex::new(HashSet::new()));
         let (stop, stop_receiver) = mpsc::unbounded_channel();
-        let reaper = tokio::spawn(reap_launcher(child, pid, groups.clone(), stop_receiver));
+        let (failed, failure) = watch::channel(false);
+        let reaper_groups = groups.clone();
+        let reaper = tokio::spawn(async move {
+            let result = reap_launcher(child, pid, reaper_groups, stop_receiver).await;
+            let _ = failed.send(true);
+            result
+        });
         Ok(Self {
             control: Mutex::new(Control { input, output }),
             groups,
             stop,
             reaper: Mutex::new(Some(reaper)),
+            failure,
         })
+    }
+
+    pub(crate) fn failure(&self) -> watch::Receiver<bool> {
+        self.failure.clone()
     }
 
     pub(crate) async fn start_child(&self, request: Value) -> Result<u32> {

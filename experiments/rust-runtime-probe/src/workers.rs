@@ -1,17 +1,18 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    ffi::{CString, OsStr},
     fs, io,
-    os::fd::{FromRawFd, OwnedFd},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::{
         ffi::OsStrExt,
-        fs::PermissionsExt,
+        fs::{MetadataExt, PermissionsExt},
         process::{CommandExt, ExitStatusExt},
     },
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -23,13 +24,13 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, Command},
-    sync::{Mutex, broadcast, mpsc, oneshot, watch},
+    sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{sleep, timeout},
 };
 use uuid::Uuid;
 
-use crate::launcher::{ForkLauncher, LauncherStartError};
+use crate::launcher::{ForkLauncher, LauncherEnvironment, LauncherStartError};
 
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -61,6 +62,7 @@ struct PluginMetadata {
     passive: bool,
     disabled: bool,
     requires_root: bool,
+    debug: bool,
 }
 
 struct PluginRuntime {
@@ -75,20 +77,59 @@ struct PluginEntry {
 }
 
 pub struct PluginRegistry {
-    plugins: HashMap<String, Arc<PluginEntry>>,
+    plugins: tokio::sync::RwLock<HashMap<String, Arc<PluginEntry>>>,
+    mutations: Mutex<()>,
     worker_executable: PathBuf,
     worker_mode: WorkerMode,
     worker_bootstrap: WorkerBootstrap,
     fork_launcher: Option<Arc<ForkLauncher>>,
     plugin_root: PathBuf,
+    loader_settings_path: PathBuf,
     homebrew: PathBuf,
     user: String,
+    user_ids: (u32, u32),
+    auth_token: String,
+    server_host: String,
+    server_port: u16,
+    chown_plugin_path: bool,
     socket_directory: PathBuf,
     events: broadcast::Sender<Value>,
     shutdown: watch::Receiver<bool>,
     shutting_down: AtomicBool,
+    live_reload_task: Mutex<Option<JoinHandle<()>>>,
+    live_reload_paused: AtomicUsize,
+    live_reload_resync: AtomicBool,
+    live_reload_notify: Arc<Notify>,
+    active_install_transactions: AtomicUsize,
+    install_transactions_changed: Notify,
 }
 
+pub struct LiveReloadPause<'a> {
+    paused: &'a AtomicUsize,
+    resync: &'a AtomicBool,
+    notify: &'a Notify,
+}
+
+impl Drop for LiveReloadPause<'_> {
+    fn drop(&mut self) {
+        self.paused.fetch_sub(1, Ordering::AcqRel);
+        self.resync.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+}
+
+pub struct InstallTransaction<'a> {
+    active: &'a AtomicUsize,
+    changed: &'a Notify,
+}
+
+impl Drop for InstallTransaction<'_> {
+    fn drop(&mut self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.changed.notify_one();
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerMode {
     Exec,
@@ -114,6 +155,10 @@ pub struct WorkerConfiguration {
     pub executable: PathBuf,
     pub mode: WorkerMode,
     pub bootstrap: WorkerBootstrap,
+    pub auth_token: String,
+    pub server_host: String,
+    pub server_port: u16,
+    pub chown_plugin_path: bool,
 }
 
 struct WorkerLaunchConfig<'a> {
@@ -124,6 +169,10 @@ struct WorkerLaunchConfig<'a> {
     plugin_root: &'a Path,
     homebrew: &'a Path,
     user: &'a str,
+    auth_token: &'a str,
+    server_host: &'a str,
+    server_port: u16,
+    chown_plugin_path: bool,
     socket_directory: &'a Path,
 }
 
@@ -132,23 +181,43 @@ struct WorkerProcess {
     stop: Option<mpsc::UnboundedSender<()>>,
     monitor: Option<JoinHandle<()>>,
 }
+
+impl Drop for WorkerProcess {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+struct ProcessGroupGuard {
+    pid: u32,
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        send_group_signal(self.pid, libc::SIGKILL);
+    }
+}
+
 enum WorkerSupervisor {
     Direct {
         child: Child,
         pid: u32,
+        group: ProcessGroupGuard,
     },
     Fork {
         launcher: Arc<ForkLauncher>,
         id: String,
         pid: u32,
         exit: AsyncFd<OwnedFd>,
+        group: ProcessGroupGuard,
     },
 }
 
 impl WorkerSupervisor {
     async fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         match self {
-            Self::Direct { child, pid } => match child.try_wait()? {
+            Self::Direct { child, pid, .. } => match child.try_wait()? {
                 Some(status) => {
                     send_group_signal(*pid, libc::SIGKILL);
                     Ok(Some(status))
@@ -177,7 +246,7 @@ impl WorkerSupervisor {
 
     async fn abort_startup(&mut self, socket_path: &Path) {
         match self {
-            Self::Direct { child, pid } => terminate_and_reap(child, *pid).await,
+            Self::Direct { child, pid, .. } => terminate_and_reap(child, *pid).await,
             Self::Fork {
                 launcher, id, pid, ..
             } => terminate_fork_child(launcher, id, *pid).await,
@@ -187,13 +256,14 @@ impl WorkerSupervisor {
 
     fn spawn_reaper(self, stop: mpsc::UnboundedReceiver<()>) -> JoinHandle<io::Result<ExitStatus>> {
         match self {
-            Self::Direct { child, pid } => tokio::spawn(reap_child(child, stop, pid)),
+            Self::Direct { child, pid, group } => tokio::spawn(reap_child(child, stop, pid, group)),
             Self::Fork {
                 launcher,
                 id,
                 pid,
                 exit,
-            } => tokio::spawn(reap_fork_child(stop, launcher, id, pid, exit)),
+                group,
+            } => tokio::spawn(reap_fork_child(stop, launcher, id, pid, exit, group)),
         }
     }
 }
@@ -230,8 +300,16 @@ impl PluginRegistry {
             executable: worker_executable,
             mode: worker_mode,
             bootstrap: worker_bootstrap,
+            auth_token,
+            server_host,
+            server_port,
+            chown_plugin_path,
         } = worker;
-        let disabled = read_disabled_plugins(&homebrew);
+        let loader_settings_path = plugin_root
+            .parent()
+            .unwrap_or(&homebrew)
+            .join("settings/loader.json");
+        let disabled = read_disabled_plugins(&loader_settings_path);
         let metadata = discover_plugins(&plugin_root, &disabled)?;
         let socket_directory = create_socket_directory(user_ids)?;
         let fork_launcher = if worker_mode == WorkerMode::Fork {
@@ -242,6 +320,12 @@ impl PluginRegistry {
                 &homebrew,
                 &user,
                 &mut shutdown,
+                LauncherEnvironment {
+                    auth_token: &auth_token,
+                    server_host: &server_host,
+                    server_port,
+                    chown_plugin_path,
+                },
             )
             .await
             {
@@ -266,6 +350,10 @@ impl PluginRegistry {
             plugin_root: &plugin_root,
             homebrew: &homebrew,
             user: &user,
+            auth_token: &auth_token,
+            server_host: &server_host,
+            server_port,
+            chown_plugin_path,
             socket_directory: &socket_directory,
         };
         let mut plugins = HashMap::with_capacity(metadata.len());
@@ -287,21 +375,31 @@ impl PluginRegistry {
 
             if !entry.metadata.passive && !entry.disabled.load(Ordering::Relaxed) {
                 let mut runtime = entry.runtime.lock().await;
-                match launch_worker(
-                    &launch_config,
-                    &entry.metadata,
-                    events.clone(),
-                    &mut shutdown,
-                )
-                .await
-                {
-                    Ok(worker) => runtime.worker = Some(worker),
-                    Err(WorkerLaunchError::Failed(error)) => runtime.start_error = Some(error),
-                    Err(WorkerLaunchError::Interrupted) => {
-                        drop(runtime);
-                        cleanup_plugins(&plugins, &socket_directory, fork_launcher.as_ref()).await;
-                        return Err(anyhow::anyhow!("Plugin startup interrupted by shutdown"));
-                    }
+                let plugin_directory = plugin_root.join(&entry.metadata.directory);
+                match set_plugin_permissions_inner(
+                    &plugin_directory,
+                    entry.metadata.requires_root,
+                    user_ids,
+                    chown_plugin_path,
+                ) {
+                    Err(error) => runtime.start_error = Some(error.to_string()),
+                    Ok(()) => match launch_worker(
+                        &launch_config,
+                        &entry.metadata,
+                        events.clone(),
+                        &mut shutdown,
+                    )
+                    .await
+                    {
+                        Ok(worker) => runtime.worker = Some(worker),
+                        Err(WorkerLaunchError::Failed(error)) => runtime.start_error = Some(error),
+                        Err(WorkerLaunchError::Interrupted) => {
+                            drop(runtime);
+                            cleanup_plugins(&plugins, &socket_directory, fork_launcher.as_ref())
+                                .await;
+                            return Err(anyhow::anyhow!("Plugin startup interrupted by shutdown"));
+                        }
+                    },
                 }
             }
 
@@ -314,23 +412,85 @@ impl PluginRegistry {
         }
 
         Ok(Self {
-            plugins,
+            plugins: tokio::sync::RwLock::new(plugins),
+            mutations: Mutex::new(()),
             worker_executable,
             worker_mode,
             worker_bootstrap,
             fork_launcher,
             plugin_root,
+            loader_settings_path,
             homebrew,
             user,
+            user_ids,
+            auth_token,
+            server_host,
+            server_port,
+            chown_plugin_path,
             socket_directory,
             events,
             shutdown,
             shutting_down: AtomicBool::new(false),
+            live_reload_task: Mutex::new(None),
+            live_reload_paused: AtomicUsize::new(0),
+            live_reload_resync: AtomicBool::new(false),
+            live_reload_notify: Arc::new(Notify::new()),
+            active_install_transactions: AtomicUsize::new(0),
+            install_transactions_changed: Notify::new(),
+        })
+    }
+
+    pub fn pause_live_reload(&self) -> LiveReloadPause<'_> {
+        self.live_reload_paused.fetch_add(1, Ordering::AcqRel);
+        LiveReloadPause {
+            paused: &self.live_reload_paused,
+            resync: &self.live_reload_resync,
+            notify: &self.live_reload_notify,
+        }
+    }
+
+    pub fn plugin_root(&self) -> &Path {
+        &self.plugin_root
+    }
+
+    pub fn essential_failure(&self) -> Option<watch::Receiver<bool>> {
+        self.fork_launcher
+            .as_ref()
+            .map(|launcher| launcher.failure())
+    }
+
+    pub fn emit(&self, event: &str, args: Vec<Value>) {
+        let mut payload = json!({"type": 5, "event": event});
+        payload["args"] = Value::Array(args);
+        let _ = self.events.send(payload);
+    }
+
+    pub fn begin_install_transaction(
+        &self,
+    ) -> std::result::Result<InstallTransaction<'_>, WorkerError> {
+        if self.shutting_down.load(Ordering::Acquire) || shutdown_requested(&self.shutdown) {
+            return Err(WorkerError::Stopped);
+        }
+        self.active_install_transactions
+            .fetch_add(1, Ordering::AcqRel);
+        if self.shutting_down.load(Ordering::Acquire) || shutdown_requested(&self.shutdown) {
+            if self
+                .active_install_transactions
+                .fetch_sub(1, Ordering::AcqRel)
+                == 1
+            {
+                self.install_transactions_changed.notify_one();
+            }
+            return Err(WorkerError::Stopped);
+        }
+        Ok(InstallTransaction {
+            active: &self.active_install_transactions,
+            changed: &self.install_transactions_changed,
         })
     }
 
     pub async fn list(&self) -> Value {
-        let mut entries: Vec<_> = self.plugins.values().collect();
+        let mut entries: Vec<_> = self.plugins.read().await.values().cloned().collect();
         entries.sort_unstable_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
 
         let mut result = Vec::with_capacity(entries.len());
@@ -359,6 +519,8 @@ impl PluginRegistry {
 
     pub async fn directory(&self, name: &str) -> Option<PathBuf> {
         self.plugins
+            .read()
+            .await
             .get(name)
             .map(|entry| self.plugin_root.join(&entry.metadata.directory))
     }
@@ -376,7 +538,10 @@ impl PluginRegistry {
 
         let entry = self
             .plugins
+            .read()
+            .await
             .get(name)
+            .cloned()
             .ok_or_else(|| WorkerError::Error(format!("Plugin {name} not found")))?;
         if method.starts_with('_') {
             return Err(WorkerError::Error(format!(
@@ -453,7 +618,270 @@ impl PluginRegistry {
         receiver.await.unwrap_or(Err(WorkerError::Stopped))
     }
 
+    pub async fn import_directory(
+        &self,
+        directory: &str,
+        refresh: bool,
+        batch: bool,
+    ) -> std::result::Result<(), WorkerError> {
+        let _mutation = self.mutations.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(WorkerError::Stopped);
+        }
+        if refresh && self.live_reload_paused.load(Ordering::Acquire) > 0 {
+            self.live_reload_resync.store(true, Ordering::Release);
+            return Ok(());
+        }
+        let directory_path = resolve_plugin_directory(&self.plugin_root, directory)?;
+        let disabled_plugins = read_disabled_plugins(&self.loader_settings_path);
+        let mut metadata = read_plugin_metadata(&directory_path, &disabled_plugins)?;
+        let previous = self.plugins.read().await.get(&metadata.name).cloned();
+        if refresh && previous.is_some() && !metadata.debug {
+            return Ok(());
+        }
+        metadata.disabled = disabled_plugins
+            .iter()
+            .any(|disabled| disabled == &metadata.name);
+        if !metadata.passive && !metadata.disabled {
+            self.set_plugin_permissions(&directory_path, metadata.requires_root)?;
+        }
+
+        let (previous_was_running, previous_error) = if let Some(previous) = &previous {
+            let mut runtime = previous.runtime.lock().await;
+            let worker = runtime.worker.take();
+            let was_running = worker.is_some();
+            let previous_error = runtime.start_error.clone();
+            drop(runtime);
+            if let Some(mut worker) = worker {
+                worker.stop(false).await;
+            }
+            (was_running, previous_error)
+        } else {
+            (false, None)
+        };
+
+        let mut shutdown = self.shutdown.clone();
+        let worker = match self.launch_plugin_worker(&metadata, &mut shutdown).await {
+            Ok(worker) => worker,
+            Err(WorkerError::Error(error)) => {
+                if let Some(previous) = &previous
+                    && let Some(restore_error) = self
+                        .restore_previous_entry(previous, previous_was_running, previous_error)
+                        .await
+                {
+                    return Err(WorkerError::Error(format!(
+                        "{error}; previous plugin restart failed: {restore_error}"
+                    )));
+                }
+                return Err(WorkerError::Error(error));
+            }
+            Err(WorkerError::Stopped) => return Err(WorkerError::Stopped),
+        };
+        if self.shutting_down.load(Ordering::Acquire) || shutdown_requested(&shutdown) {
+            if let Some(mut worker) = worker {
+                worker.stop(false).await;
+            }
+            return Err(WorkerError::Stopped);
+        }
+
+        let entry = Arc::new(PluginEntry {
+            disabled: AtomicBool::new(metadata.disabled),
+            metadata: metadata.clone(),
+            runtime: Mutex::new(PluginRuntime {
+                worker,
+                start_error: None,
+            }),
+        });
+        self.plugins
+            .write()
+            .await
+            .insert(metadata.name.clone(), entry);
+
+        if !metadata.disabled && !batch {
+            self.emit(
+                "loader/import_plugin",
+                vec![
+                    Value::String(metadata.name),
+                    metadata.version.unwrap_or(Value::Null),
+                    Value::from(metadata.load_type),
+                    Value::Bool(true),
+                    Value::from(15_000),
+                ],
+            );
+        }
+        Ok(())
+    }
+
+    async fn launch_plugin_worker(
+        &self,
+        metadata: &PluginMetadata,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> std::result::Result<Option<WorkerProcess>, WorkerError> {
+        if metadata.passive || metadata.disabled {
+            return Ok(None);
+        }
+        let config = self.launch_config();
+        match launch_worker(&config, metadata, self.events.clone(), shutdown).await {
+            Ok(worker) => Ok(Some(worker)),
+            Err(WorkerLaunchError::Failed(error)) => Err(WorkerError::Error(error)),
+            Err(WorkerLaunchError::Interrupted) => Err(WorkerError::Stopped),
+        }
+    }
+
+    async fn restore_previous_entry(
+        &self,
+        entry: &Arc<PluginEntry>,
+        was_running: bool,
+        previous_error: Option<String>,
+    ) -> Option<String> {
+        let mut worker = None;
+        let mut start_error = previous_error;
+        let mut restart_error = None;
+        if was_running
+            && !self.shutting_down.load(Ordering::Acquire)
+            && !shutdown_requested(&self.shutdown)
+        {
+            let mut shutdown = self.shutdown.clone();
+            match self
+                .launch_plugin_worker(&entry.metadata, &mut shutdown)
+                .await
+            {
+                Ok(restarted) => {
+                    worker = restarted;
+                    start_error = None;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    restart_error = Some(message.clone());
+                    start_error = Some(message);
+                }
+            }
+        }
+        let mut runtime = entry.runtime.lock().await;
+        runtime.worker = worker;
+        runtime.start_error = start_error;
+        restart_error
+    }
+
+    pub async fn remove(
+        &self,
+        name: &str,
+        uninstall: bool,
+    ) -> std::result::Result<(), WorkerError> {
+        let _mutation = self.mutations.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(WorkerError::Stopped);
+        }
+        let entry = self
+            .plugins
+            .write()
+            .await
+            .remove(name)
+            .ok_or_else(|| WorkerError::Error(format!("Plugin {name} not found")))?;
+        self.emit("loader/unload_plugin", vec![Value::String(name.to_owned())]);
+        let mut runtime = entry.runtime.lock().await;
+        if let Some(mut worker) = runtime.worker.take() {
+            worker.stop(uninstall).await;
+        }
+        Ok(())
+    }
+
+    pub async fn set_disabled(
+        &self,
+        name: &str,
+        disabled: bool,
+    ) -> std::result::Result<(), WorkerError> {
+        let _mutation = self.mutations.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(WorkerError::Stopped);
+        }
+        let entry = self
+            .plugins
+            .read()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or_else(|| WorkerError::Error(format!("Plugin {name} not found")))?;
+        let was_disabled = entry.disabled.load(Ordering::Acquire);
+        if disabled && was_disabled {
+            return Ok(());
+        }
+
+        let mut metadata = entry.metadata.clone();
+        metadata.disabled = disabled;
+        if !disabled && !metadata.passive {
+            let directory = self.plugin_root.join(&metadata.directory);
+            self.set_plugin_permissions(&directory, metadata.requires_root)?;
+        }
+
+        let (previous_was_running, previous_error, previous_worker) = {
+            let mut runtime = entry.runtime.lock().await;
+            let worker = runtime.worker.take();
+            (worker.is_some(), runtime.start_error.clone(), worker)
+        };
+        if let Some(mut worker) = previous_worker {
+            worker.stop(false).await;
+        }
+        if disabled {
+            entry.disabled.store(true, Ordering::Release);
+            let mut runtime = entry.runtime.lock().await;
+            runtime.start_error = None;
+            drop(runtime);
+            self.emit(
+                "loader/disable_plugin",
+                vec![Value::String(name.to_owned())],
+            );
+            return Ok(());
+        }
+
+        let mut shutdown = self.shutdown.clone();
+        let worker = match self.launch_plugin_worker(&metadata, &mut shutdown).await {
+            Ok(worker) => worker,
+            Err(WorkerError::Error(error)) => {
+                entry.disabled.store(was_disabled, Ordering::Release);
+                if let Some(restore_error) = self
+                    .restore_previous_entry(&entry, previous_was_running, previous_error)
+                    .await
+                {
+                    return Err(WorkerError::Error(format!(
+                        "{error}; previous plugin restart failed: {restore_error}"
+                    )));
+                }
+                return Err(WorkerError::Error(error));
+            }
+            Err(WorkerError::Stopped) => {
+                entry.disabled.store(was_disabled, Ordering::Release);
+                return Err(WorkerError::Stopped);
+            }
+        };
+        if self.shutting_down.load(Ordering::Acquire) || shutdown_requested(&shutdown) {
+            if let Some(mut worker) = worker {
+                worker.stop(false).await;
+            }
+            entry.disabled.store(was_disabled, Ordering::Release);
+            return Err(WorkerError::Stopped);
+        }
+
+        entry.disabled.store(false, Ordering::Release);
+        let mut runtime = entry.runtime.lock().await;
+        runtime.worker = worker;
+        runtime.start_error = None;
+        drop(runtime);
+        self.emit(
+            "loader/import_plugin",
+            vec![
+                Value::String(metadata.name),
+                metadata.version.unwrap_or(Value::Null),
+                Value::from(metadata.load_type),
+                Value::Bool(true),
+                Value::from(15_000),
+            ],
+        );
+        Ok(())
+    }
+
     pub async fn reload(&self, name: &str) -> std::result::Result<(), WorkerError> {
+        let _mutation = self.mutations.lock().await;
         let mut shutdown = self.shutdown.clone();
         if self.shutting_down.load(Ordering::Acquire) || shutdown_requested(&shutdown) {
             return Err(WorkerError::Stopped);
@@ -461,75 +889,95 @@ impl PluginRegistry {
 
         let entry = self
             .plugins
+            .read()
+            .await
             .get(name)
+            .cloned()
             .ok_or_else(|| WorkerError::Error(format!("Plugin {name} not found")))?;
-        let disabled = read_disabled_plugins(&self.homebrew)
+        let disabled = read_disabled_plugins(&self.loader_settings_path)
             .iter()
             .any(|entry| entry == name);
-        entry.disabled.store(disabled, Ordering::Release);
         let mut metadata = entry.metadata.clone();
         metadata.disabled = disabled;
-        let mut runtime = entry.runtime.lock().await;
-        if self.shutting_down.load(Ordering::Acquire) || shutdown_requested(&shutdown) {
-            return Err(WorkerError::Stopped);
+        if !metadata.disabled && !metadata.passive {
+            let directory = self.plugin_root.join(&metadata.directory);
+            self.set_plugin_permissions(&directory, metadata.requires_root)?;
         }
 
-        if let Some(mut worker) = runtime.worker.take() {
-            worker.stop().await;
+        let (previous_was_running, previous_error, previous_worker) = {
+            let mut runtime = entry.runtime.lock().await;
+            let worker = runtime.worker.take();
+            (worker.is_some(), runtime.start_error.clone(), worker)
+        };
+        if let Some(mut worker) = previous_worker {
+            worker.stop(false).await;
         }
-        runtime.start_error = None;
         if self.shutting_down.load(Ordering::Acquire) || shutdown_requested(&shutdown) {
             return Err(WorkerError::Stopped);
         }
         if metadata.disabled {
+            entry.disabled.store(true, Ordering::Release);
+            let mut runtime = entry.runtime.lock().await;
+            runtime.start_error = None;
             return Ok(());
         }
 
-        let worker = if metadata.passive {
-            None
-        } else {
-            let launch_config = WorkerLaunchConfig {
-                worker_executable: &self.worker_executable,
-                worker_mode: self.worker_mode,
-                worker_bootstrap: self.worker_bootstrap,
-                fork_launcher: self.fork_launcher.as_ref(),
-                plugin_root: &self.plugin_root,
-                homebrew: &self.homebrew,
-                user: &self.user,
-                socket_directory: &self.socket_directory,
-            };
-            match launch_worker(
-                &launch_config,
-                &metadata,
-                self.events.clone(),
-                &mut shutdown,
-            )
-            .await
-            {
-                Ok(worker) => Some(worker),
-                Err(WorkerLaunchError::Failed(error)) => {
-                    runtime.start_error = Some(error.clone());
-                    return Err(WorkerError::Error(error));
+        let worker = match self.launch_plugin_worker(&metadata, &mut shutdown).await {
+            Ok(worker) => worker,
+            Err(WorkerError::Error(error)) => {
+                if let Some(restore_error) = self
+                    .restore_previous_entry(&entry, previous_was_running, previous_error)
+                    .await
+                {
+                    return Err(WorkerError::Error(format!(
+                        "{error}; previous plugin restart failed: {restore_error}"
+                    )));
                 }
-                Err(WorkerLaunchError::Interrupted) => return Err(WorkerError::Stopped),
+                return Err(WorkerError::Error(error));
             }
+            Err(WorkerError::Stopped) => return Err(WorkerError::Stopped),
         };
-
         if self.shutting_down.load(Ordering::Acquire) || shutdown_requested(&shutdown) {
             if let Some(mut worker) = worker {
-                worker.stop().await;
+                worker.stop(false).await;
             }
             return Err(WorkerError::Stopped);
         }
+        entry.disabled.store(false, Ordering::Release);
+        let mut runtime = entry.runtime.lock().await;
         runtime.worker = worker;
-        let mut event = json!({"type": 5, "event": "loader/import_plugin"});
-        event["args"] = Value::Array(vec![
-            Value::String(metadata.name),
-            metadata.version.unwrap_or(Value::Null),
-            Value::from(metadata.load_type),
-            Value::Bool(false),
-        ]);
-        let _ = self.events.send(event);
+        runtime.start_error = None;
+        drop(runtime);
+        self.emit(
+            "loader/import_plugin",
+            vec![
+                Value::String(metadata.name),
+                metadata.version.unwrap_or(Value::Null),
+                Value::from(metadata.load_type),
+                Value::Bool(false),
+            ],
+        );
+        Ok(())
+    }
+
+    pub async fn start_live_reload(self: &Arc<Self>) -> std::result::Result<(), WorkerError> {
+        if std::env::var("LIVE_RELOAD").is_ok_and(|value| value != "1") {
+            return Ok(());
+        }
+        let mut task = self.live_reload_task.lock().await;
+        if task.as_ref().is_some_and(|task| !task.is_finished()) {
+            return Ok(());
+        }
+        let root = self.plugin_root.clone();
+        let weak = Arc::downgrade(self);
+        let shutdown = self.shutdown.clone();
+        let live_reload_notify = Arc::clone(&self.live_reload_notify);
+        *task = Some(tokio::spawn(live_reload_loop(
+            root,
+            weak,
+            shutdown,
+            live_reload_notify,
+        )));
         Ok(())
     }
 
@@ -537,12 +985,78 @@ impl PluginRegistry {
         if self.shutting_down.swap(true, Ordering::AcqRel) {
             return;
         }
+        let live_reload_task = self.live_reload_task.lock().await.take();
+        if let Some(mut task) = live_reload_task
+            && timeout(Duration::from_secs(40), &mut task).await.is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        loop {
+            let changed = self.install_transactions_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.active_install_transactions.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            changed.await;
+        }
+        let _mutation = self.mutations.lock().await;
+        let plugins = self.plugins.read().await.clone();
         cleanup_plugins(
-            &self.plugins,
+            &plugins,
             &self.socket_directory,
             self.fork_launcher.as_ref(),
         )
         .await;
+    }
+
+    pub fn set_plugin_permissions(
+        &self,
+        directory: &Path,
+        requires_root: bool,
+    ) -> std::result::Result<(), WorkerError> {
+        let directory = directory
+            .to_str()
+            .ok_or_else(|| WorkerError::Error("Plugin path is not valid UTF-8".to_owned()))?;
+        let directory = resolve_plugin_directory(&self.plugin_root, directory)?;
+        set_plugin_permissions_inner(
+            &directory,
+            requires_root,
+            self.user_ids,
+            self.chown_plugin_path,
+        )
+    }
+
+    pub async fn validate_directory(
+        &self,
+        directory: &str,
+    ) -> std::result::Result<(), WorkerError> {
+        let _mutation = self.mutations.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(WorkerError::Stopped);
+        }
+        let directory_path = resolve_plugin_directory(&self.plugin_root, directory)?;
+        let metadata = read_plugin_metadata(&directory_path, &[])?;
+        self.set_plugin_permissions(&directory_path, metadata.requires_root)?;
+        Ok(())
+    }
+
+    fn launch_config(&self) -> WorkerLaunchConfig<'_> {
+        WorkerLaunchConfig {
+            worker_executable: &self.worker_executable,
+            worker_mode: self.worker_mode,
+            worker_bootstrap: self.worker_bootstrap,
+            fork_launcher: self.fork_launcher.as_ref(),
+            plugin_root: &self.plugin_root,
+            homebrew: &self.homebrew,
+            user: &self.user,
+            auth_token: &self.auth_token,
+            server_host: &self.server_host,
+            server_port: self.server_port,
+            chown_plugin_path: self.chown_plugin_path,
+            socket_directory: &self.socket_directory,
+        }
     }
 }
 
@@ -559,7 +1073,7 @@ async fn cleanup_plugins(
     let stops = entries.into_iter().map(|entry| async move {
         let mut runtime = entry.runtime.lock().await;
         if let Some(mut worker) = runtime.worker.take() {
-            worker.stop().await;
+            worker.stop(false).await;
         }
     });
     futures_util::future::join_all(stops).await;
@@ -594,6 +1108,9 @@ fn discover_plugins(
     for directory in directories {
         let directory_name = directory.file_name().to_string_lossy().into_owned();
         let directory_path = directory.path();
+        if is_managed_plugin_directory(plugin_root, &directory_path) {
+            continue;
+        }
         let plugin_json_path = directory_path.join("plugin.json");
         if !plugin_json_path.is_file() {
             continue;
@@ -608,10 +1125,17 @@ fn discover_plugins(
         if metadata_json.get("author").is_none() || metadata_json.get("flags").is_none() {
             continue;
         }
-        let requires_root = match metadata_json.get("flags") {
+        let flags = metadata_json.get("flags");
+        let requires_root = match flags {
             Some(Value::Array(flags)) => flags.iter().any(|flag| flag.as_str() == Some("root")),
             Some(Value::String(flags)) => flags.contains("root"),
             Some(Value::Object(flags)) => flags.contains_key("root"),
+            _ => false,
+        };
+        let debug = match flags {
+            Some(Value::Array(flags)) => flags.iter().any(|flag| flag.as_str() == Some("debug")),
+            Some(Value::String(flags)) => flags.contains("debug"),
+            Some(Value::Object(flags)) => flags.contains_key("debug"),
             _ => false,
         };
 
@@ -642,11 +1166,224 @@ fn discover_plugins(
             passive: !directory_path.join("main.py").is_file(),
             disabled: disabled.iter().any(|disabled| disabled == name),
             requires_root,
+            debug,
         };
         plugins.insert(plugin.name.clone(), plugin);
     }
 
     Ok(plugins)
+}
+
+fn resolve_plugin_directory(
+    plugin_root: &Path,
+    requested: &str,
+) -> std::result::Result<PathBuf, WorkerError> {
+    let root = fs::canonicalize(plugin_root).map_err(|error| {
+        WorkerError::Error(format!(
+            "Could not resolve plugin root {}: {error}",
+            plugin_root.display()
+        ))
+    })?;
+    let requested = Path::new(requested);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    let directory = fs::canonicalize(&candidate).map_err(|error| {
+        WorkerError::Error(format!(
+            "Plugin directory {} is not accessible: {error}",
+            candidate.display()
+        ))
+    })?;
+    if directory == root || directory.parent() != Some(root.as_path()) || !directory.is_dir() {
+        return Err(WorkerError::Error(format!(
+            "Plugin directory must be a direct child of {}: {}",
+            root.display(),
+            directory.display()
+        )));
+    }
+    Ok(directory)
+}
+
+fn read_plugin_metadata(
+    directory: &Path,
+    disabled_plugins: &[String],
+) -> std::result::Result<PluginMetadata, WorkerError> {
+    let plugin_json_path = directory.join("plugin.json");
+    let metadata_json = read_json(&plugin_json_path).map_err(|error| {
+        WorkerError::Error(format!(
+            "Could not read plugin metadata {}: {error}",
+            plugin_json_path.display()
+        ))
+    })?;
+    let name = metadata_json
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            WorkerError::Error(format!(
+                "Plugin metadata has no valid name: {}",
+                plugin_json_path.display()
+            ))
+        })?;
+    if metadata_json.get("author").is_none() || metadata_json.get("flags").is_none() {
+        return Err(WorkerError::Error(format!(
+            "Plugin metadata is missing author or flags: {}",
+            plugin_json_path.display()
+        )));
+    }
+    let flags = metadata_json.get("flags");
+    let requires_root = match flags {
+        Some(Value::Array(flags)) => flags.iter().any(|flag| flag.as_str() == Some("root")),
+        Some(Value::String(flags)) => flags.contains("root"),
+        Some(Value::Object(flags)) => flags.contains_key("root"),
+        _ => false,
+    };
+    let debug = match flags {
+        Some(Value::Array(flags)) => flags.iter().any(|flag| flag.as_str() == Some("debug")),
+        Some(Value::String(flags)) => flags.contains("debug"),
+        Some(Value::Object(flags)) => flags.contains_key("debug"),
+        _ => false,
+    };
+    let package_path = directory.join("package.json");
+    let (version, load_type) = if package_path.is_file() {
+        let package = read_json(&package_path).map_err(|error| {
+            WorkerError::Error(format!(
+                "Could not read package metadata {}: {error}",
+                package_path.display()
+            ))
+        })?;
+        let version = package.get("version").ok_or_else(|| {
+            WorkerError::Error(format!(
+                "Package metadata has no version: {}",
+                package_path.display()
+            ))
+        })?;
+        (
+            Some(version.clone()),
+            u8::from(package.get("type").and_then(Value::as_str) == Some("module")),
+        )
+    } else {
+        (None, 0)
+    };
+    let directory_name = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| WorkerError::Error("Plugin directory name is not valid UTF-8".to_owned()))?
+        .to_owned();
+    Ok(PluginMetadata {
+        name: name.to_owned(),
+        directory: directory_name,
+        version,
+        load_type,
+        passive: !directory.join("main.py").is_file(),
+        disabled: disabled_plugins.iter().any(|disabled| disabled == name),
+        requires_root,
+        debug,
+    })
+}
+
+fn set_plugin_permissions_inner(
+    directory: &Path,
+    requires_root: bool,
+    host_user_ids: (u32, u32),
+    enabled: bool,
+) -> std::result::Result<(), WorkerError> {
+    if !enabled {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(directory).map_err(|error| {
+        WorkerError::Error(format!(
+            "Could not inspect plugin directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(WorkerError::Error(format!(
+            "Plugin path is not a directory: {}",
+            directory.display()
+        )));
+    }
+    let effective_user_ids = (unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+    let tree_user_ids = if requires_root {
+        effective_user_ids
+    } else {
+        host_user_ids
+    };
+    chown_tree(directory, tree_user_ids).map_err(|error| {
+        WorkerError::Error(format!(
+            "Could not chown plugin directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+    chown_path(directory, effective_user_ids).map_err(|error| {
+        WorkerError::Error(format!(
+            "Could not chown plugin directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+    chmod_tree(directory).map_err(|error| {
+        WorkerError::Error(format!(
+            "Could not chmod plugin directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+    let plugin_json = directory.join("plugin.json");
+    chown_path(&plugin_json, effective_user_ids).map_err(|error| {
+        WorkerError::Error(format!(
+            "Could not chown plugin metadata {}: {error}",
+            plugin_json.display()
+        ))
+    })?;
+    fs::set_permissions(&plugin_json, fs::Permissions::from_mode(0o755)).map_err(|error| {
+        WorkerError::Error(format!(
+            "Could not chmod plugin metadata {}: {error}",
+            plugin_json.display()
+        ))
+    })
+}
+
+fn chown_tree(path: &Path, owner: (u32, u32)) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            chown_tree(&entry?.path(), owner)?;
+        }
+    }
+    chown_path(path, owner)
+}
+
+fn chown_path(path: &Path, owner: (u32, u32)) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || (metadata.uid() == owner.0 && metadata.gid() == owner.1)
+    {
+        return Ok(());
+    }
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let result = unsafe { libc::lchown(path.as_ptr(), owner.0, owner.1) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn chmod_tree(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            chmod_tree(&entry?.path())?;
+        }
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
 }
 
 fn read_json(path: &Path) -> io::Result<Value> {
@@ -655,9 +1392,8 @@ fn read_json(path: &Path) -> io::Result<Value> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn read_disabled_plugins(homebrew: &Path) -> Vec<String> {
-    let path = homebrew.join("settings").join("loader.json");
-    let Ok(settings) = read_json(&path) else {
+fn read_disabled_plugins(settings_path: &Path) -> Vec<String> {
+    let Ok(settings) = read_json(settings_path) else {
         return Vec::new();
     };
     settings
@@ -668,6 +1404,400 @@ fn read_disabled_plugins(homebrew: &Path) -> Vec<String> {
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect()
+}
+
+struct InotifyEvent {
+    watch_descriptor: i32,
+    mask: u32,
+    name: Option<PathBuf>,
+}
+
+struct InotifyWatcher {
+    fd: AsyncFd<OwnedFd>,
+    plugin_root: PathBuf,
+    watched_directories: HashMap<i32, PathBuf>,
+}
+
+impl InotifyWatcher {
+    fn new(plugin_root: &Path) -> io::Result<Self> {
+        let plugin_root = fs::canonicalize(plugin_root)?;
+        let descriptor = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut watcher = Self {
+            fd: AsyncFd::new(unsafe { OwnedFd::from_raw_fd(descriptor) })?,
+            plugin_root,
+            watched_directories: HashMap::new(),
+        };
+        watcher.rebuild()?;
+        Ok(watcher)
+    }
+
+    fn add_watch(&mut self, directory: &Path) -> io::Result<()> {
+        let path = CString::new(directory.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "directory path contains NUL")
+        })?;
+        let mask = libc::IN_CREATE
+            | libc::IN_CLOSE_WRITE
+            | libc::IN_MOVED_TO
+            | libc::IN_DELETE
+            | libc::IN_MOVED_FROM
+            | libc::IN_DELETE_SELF
+            | libc::IN_MOVE_SELF
+            | libc::IN_ONLYDIR
+            | libc::IN_DONT_FOLLOW;
+        let watch_descriptor =
+            unsafe { libc::inotify_add_watch(self.fd.get_ref().as_raw_fd(), path.as_ptr(), mask) };
+        if watch_descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.watched_directories
+            .insert(watch_descriptor, directory.to_path_buf());
+        Ok(())
+    }
+
+    fn add_tree(&mut self, directory: &Path) -> io::Result<()> {
+        let mut pending = vec![directory.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            if is_managed_plugin_directory(&self.plugin_root, &directory) {
+                continue;
+            }
+            let metadata = match fs::symlink_metadata(&directory) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if !metadata.is_dir() {
+                continue;
+            }
+            match self.add_watch(&directory) {
+                Ok(()) => {}
+                Err(error)
+                    if directory != self.plugin_root
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                        ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+            let entries = match fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error)
+                    if directory != self.plugin_root
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                        ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                if entry.file_type()?.is_dir() {
+                    pending.push(entry.path());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn rebuild(&mut self) -> io::Result<()> {
+        self.discard_pending_events()?;
+        let descriptor = self.fd.get_ref().as_raw_fd();
+        for watch_descriptor in self.watched_directories.keys().copied().collect::<Vec<_>>() {
+            let result = unsafe { libc::inotify_rm_watch(descriptor, watch_descriptor) };
+            if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL) {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        self.watched_directories.clear();
+        self.add_tree(&self.plugin_root.clone())?;
+        self.discard_pending_events()
+    }
+
+    fn discard_pending_events(&self) -> io::Result<()> {
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = unsafe {
+                libc::read(
+                    self.fd.get_ref().as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if count >= 0 {
+                if count == 0 {
+                    return Ok(());
+                }
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(());
+            }
+            return Err(error);
+        }
+    }
+
+    async fn read_events(&self) -> io::Result<Vec<InotifyEvent>> {
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let mut readiness = self.fd.readable().await?;
+            match readiness.try_io(|inner| {
+                let count = unsafe {
+                    libc::read(
+                        inner.get_ref().as_raw_fd(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                    )
+                };
+                if count < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(count as usize)
+                }
+            }) {
+                Ok(Ok(count)) => {
+                    let header_size = std::mem::size_of::<libc::inotify_event>();
+                    let mut offset = 0;
+                    let mut events = Vec::new();
+                    while offset < count {
+                        if count - offset < header_size {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "truncated inotify event header",
+                            ));
+                        }
+                        let event = unsafe {
+                            std::ptr::read_unaligned(
+                                buffer.as_ptr().add(offset).cast::<libc::inotify_event>(),
+                            )
+                        };
+                        offset += header_size;
+                        let name_length = event.len as usize;
+                        if name_length > count - offset {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "truncated inotify event name",
+                            ));
+                        }
+                        let name = if name_length == 0 {
+                            None
+                        } else {
+                            let bytes = &buffer[offset..offset + name_length];
+                            let name_length = bytes
+                                .iter()
+                                .position(|byte| *byte == 0)
+                                .unwrap_or(bytes.len());
+                            (name_length > 0)
+                                .then(|| PathBuf::from(OsStr::from_bytes(&bytes[..name_length])))
+                        };
+                        offset += event.len as usize;
+                        events.push(InotifyEvent {
+                            watch_descriptor: event.wd,
+                            mask: event.mask,
+                            name,
+                        });
+                    }
+                    return Ok(events);
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn affected_plugins(&mut self, events: Vec<InotifyEvent>) -> io::Result<Vec<String>> {
+        let mut changed = HashSet::new();
+        let mut rebuild = false;
+        for event in events {
+            if event.mask & libc::IN_Q_OVERFLOW != 0 {
+                rebuild = true;
+                continue;
+            }
+            if event.mask & libc::IN_IGNORED != 0 {
+                self.watched_directories.remove(&event.watch_descriptor);
+                continue;
+            }
+            let Some(directory) = self
+                .watched_directories
+                .get(&event.watch_descriptor)
+                .cloned()
+            else {
+                continue;
+            };
+            let path = event
+                .name
+                .map_or_else(|| directory.clone(), |name| directory.join(name));
+            let is_directory = event.mask & libc::IN_ISDIR != 0;
+            if event.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0
+                && path != self.plugin_root
+            {
+                rebuild = true;
+            }
+            if is_directory && event.mask & (libc::IN_DELETE | libc::IN_MOVED_FROM) != 0 {
+                rebuild = true;
+            }
+            if is_directory && event.mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
+                self.add_tree(&path)?;
+            }
+            if !is_directory
+                && event.mask
+                    & (libc::IN_CLOSE_WRITE
+                        | libc::IN_MOVED_TO
+                        | libc::IN_DELETE
+                        | libc::IN_MOVED_FROM)
+                    != 0
+                && let Some(plugin) = changed_plugin_directory(&self.plugin_root, &path)
+            {
+                changed.insert(plugin);
+            }
+        }
+        if rebuild {
+            self.rebuild()?;
+        }
+        let mut changed = changed.into_iter().collect::<Vec<_>>();
+        changed.sort_unstable();
+        Ok(changed)
+    }
+}
+
+fn is_managed_plugin_directory(plugin_root: &Path, directory: &Path) -> bool {
+    if directory.parent() != Some(plugin_root) {
+        return false;
+    }
+    directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".decky-stage-") || name.starts_with(".decky-backup-"))
+}
+
+fn changed_plugin_directory(plugin_root: &Path, source: &Path) -> Option<String> {
+    let mut components = source.strip_prefix(plugin_root).ok()?.components();
+    let directory = match components.next()? {
+        std::path::Component::Normal(directory) => directory.to_str()?,
+        _ => return None,
+    };
+    if directory.starts_with('.') {
+        return None;
+    }
+    let is_source = match (components.next(), components.next(), components.next()) {
+        (Some(std::path::Component::Normal(file)), None, None) => file == "main.py",
+        (
+            Some(std::path::Component::Normal(dist)),
+            Some(std::path::Component::Normal(file)),
+            None,
+        ) => dist == "dist" && file == "index.js",
+        _ => false,
+    };
+    if is_source && plugin_root.join(directory).join("plugin.json").is_file() {
+        Some(directory.to_owned())
+    } else {
+        None
+    }
+}
+
+async fn live_reload_loop(
+    plugin_root: PathBuf,
+    registry: Weak<PluginRegistry>,
+    mut shutdown: watch::Receiver<bool>,
+    live_reload_notify: Arc<Notify>,
+) {
+    if shutdown_requested(&shutdown) {
+        return;
+    }
+    tokio::select! {
+        _ = sleep(Duration::from_secs(10)) => {}
+        changed = shutdown.changed() => {
+            if changed.is_err() || shutdown_requested(&shutdown) {
+                return;
+            }
+        }
+    }
+    if shutdown_requested(&shutdown) {
+        return;
+    }
+    let mut watcher = match InotifyWatcher::new(&plugin_root) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            eprintln!("Could not start plugin live reload watcher: {error}");
+            return;
+        }
+    };
+    loop {
+        let events = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || shutdown_requested(&shutdown) {
+                    return;
+                }
+                continue;
+            }
+            _ = live_reload_notify.notified() => None,
+            events = watcher.read_events() => match events {
+                Ok(events) => Some(events),
+                Err(error) => {
+                    eprintln!("Plugin live reload watcher failed: {error}");
+                    return;
+                }
+            },
+        };
+        let Some(owner) = registry.upgrade() else {
+            return;
+        };
+        if owner.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        if owner.live_reload_paused.load(Ordering::Acquire) > 0 {
+            continue;
+        }
+        if owner.live_reload_resync.swap(false, Ordering::AcqRel) {
+            drop(owner);
+            if let Err(error) = watcher.rebuild() {
+                eprintln!("Could not resynchronize plugin live reload watcher: {error}");
+                return;
+            }
+            continue;
+        }
+        drop(owner);
+        let Some(events) = events else {
+            continue;
+        };
+
+        let changed_plugins = match watcher.affected_plugins(events) {
+            Ok(changed) => changed,
+            Err(error) => {
+                eprintln!("Could not update plugin live reload watches: {error}");
+                return;
+            }
+        };
+        for directory in changed_plugins {
+            if !plugin_root.join(&directory).is_dir() {
+                continue;
+            }
+            let Some(owner) = registry.upgrade() else {
+                return;
+            };
+            if owner.shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+            if owner.live_reload_paused.load(Ordering::Acquire) > 0 {
+                owner.live_reload_resync.store(true, Ordering::Release);
+                break;
+            }
+            let _ = owner.import_directory(&directory, true, false).await;
+        }
+    }
 }
 fn process_exit_notification(pid: u32) -> io::Result<AsyncFd<OwnedFd>> {
     let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -745,6 +1875,10 @@ async fn launch_worker(
         plugin_root,
         homebrew,
         user,
+        auth_token,
+        server_host,
+        server_port,
+        chown_plugin_path,
         socket_directory,
     } = *config;
     if shutdown_requested(shutdown) {
@@ -786,10 +1920,18 @@ async fn launch_worker(
                 .arg(user)
                 .arg("--bootstrap")
                 .arg(worker_bootstrap.as_str())
+                .env("DECKY_AUTH_TOKEN", auth_token)
+                .env("SERVER_HOST", server_host)
+                .env("SERVER_PORT", server_port.to_string())
+                .env(
+                    "CHOWN_PLUGIN_PATH",
+                    if chown_plugin_path { "1" } else { "0" },
+                )
                 .stdin(Stdio::null())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());
             command.as_std_mut().process_group(0);
+            command.kill_on_drop(true);
             let child = command.spawn().map_err(|error| {
                 WorkerLaunchError::Failed(format!(
                     "Failed to start worker for {} using {}: {error}",
@@ -798,7 +1940,11 @@ async fn launch_worker(
                 ))
             })?;
             let pid = child.id().expect("a spawned worker has a process ID");
-            WorkerSupervisor::Direct { child, pid }
+            WorkerSupervisor::Direct {
+                child,
+                pid,
+                group: ProcessGroupGuard { pid },
+            }
         }
         WorkerMode::Fork => {
             let Some(launcher) = fork_launcher else {
@@ -835,6 +1981,7 @@ async fn launch_worker(
                         id,
                         pid,
                         exit,
+                        group: ProcessGroupGuard { pid },
                     }
                 }
                 Err(error) => {
@@ -971,7 +2118,20 @@ async fn launch_worker(
     })
 }
 impl WorkerProcess {
-    async fn stop(&mut self) {
+    async fn stop(&mut self, uninstall: bool) {
+        if uninstall {
+            let notify_plugin = async {
+                let mut writer = self.handle.writer.lock().await;
+                writer.write_all(b"{\"uninstall\":true}\n").await?;
+                writer.flush().await
+            };
+            if matches!(
+                timeout(Duration::from_secs(1), notify_plugin).await,
+                Ok(Ok(()))
+            ) {
+                sleep(Duration::from_millis(25)).await;
+            }
+        }
         {
             let mut state = self.handle.state.lock().await;
             state.stopping = true;
@@ -991,6 +2151,7 @@ async fn reap_child(
     mut child: Child,
     mut stop: mpsc::UnboundedReceiver<()>,
     pid: u32,
+    _group: ProcessGroupGuard,
 ) -> io::Result<ExitStatus> {
     let status = tokio::select! {
         status = child.wait() => status,
@@ -1015,6 +2176,7 @@ async fn reap_fork_child(
     id: String,
     pid: u32,
     exit: AsyncFd<OwnedFd>,
+    _group: ProcessGroupGuard,
 ) -> io::Result<ExitStatus> {
     let exited = tokio::select! {
         result = exit.readable() => result.map(drop),

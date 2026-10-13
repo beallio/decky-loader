@@ -1,6 +1,10 @@
 mod backend;
+mod cef;
 mod launcher;
+mod plugin_manager;
 mod transport;
+mod updater;
+mod utilities;
 mod workers;
 
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
@@ -9,13 +13,13 @@ use anyhow::{Context, bail};
 use serde_json::Value;
 use tokio::{
     process::Command,
-    sync::{broadcast, oneshot, watch},
+    sync::{Mutex, broadcast, oneshot, watch},
 };
 
-use backend::Backend;
+use backend::{Backend, RuntimeConfig};
 use workers::{PluginRegistry, WorkerBootstrap, WorkerConfiguration, WorkerMode};
 
-const HELP: &str = "Decky Rust runtime compatibility probe (not a production loader)\n\nRequired:\n  --worker PATH              Packaged DeckyPluginWorker executable\n  --plugin-root PATH         Isolated plugin directory\n  --homebrew PATH            Isolated settings/data/logs root\n  --user USER                Host user identity for normal plugins\n  --assets PATH              Existing Decky frontend bundles\n  --locales PATH             Existing Decky locale JSON directory\n\nOptional:\n  --worker-mode MODE         Worker supervision: exec or fork (default exec)\n  --worker-bootstrap MODE    Runtime preload: full or lean (default lean)\n  --listen ADDRESS           Loopback address (default 127.0.0.1:1339)\n  --auth-file PATH           Read token from a private file instead of generating one\n\nSupports plugin discovery/RPC/events/reload, loader settings, bootstrap information,\nstatic assets and the existing fetch proxy. Installation, OS administration and\nrelease-update routes are intentionally unavailable; they return explicit errors.\n";
+const HELP: &str = "Decky Rust backend (private SteamOS validation build)\n\nRequired:\n  --worker PATH              Packaged DeckyPluginWorker executable\n  --plugin-root PATH         Installed plugin directory\n  --homebrew PATH            Unprivileged settings/data/logs root\n  --user USER                Host user identity for normal plugins\n  --assets PATH              Existing Decky frontend bundles\n  --locales PATH             Existing Decky locale JSON directory\n\nOptional:\n  --worker-mode MODE         Worker supervision: exec or fork (default exec)\n  --worker-bootstrap MODE    Runtime preload: full or lean (default lean)\n  --listen ADDRESS           Loopback address (default 127.0.0.1:1339)\n  --auth-file PATH           Read token from a private file\n  --service-name NAME        Loader systemd service (default plugin_loader)\n  --cef-url URL              Steam CEF debugger (default http://127.0.0.1:8080)\n  --inject-frontend BOOL     Run native frontend injector (default false)\n  --installer PATH           Transactional installer used for loader updates\n  --github-api URL           GitHub API origin\n  --release-repository NAME  Release repository (default SteamDeckHomebrew/decky-loader)\n  --service-release-url URL  Stable update service template\n  --service-prerelease-url URL Prerelease update service template\n  --testing-download-url URL Testing artifact service (default https://nightly.link)\n\nUses the unchanged v3.2.10 frontend and packaged Python SDK. Supports plugin\nmanagement, utilities, native CEF integration and transactional loader updates.\nPhysical Steam Deck validation and public distribution are not complete.\n";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,6 +41,15 @@ async fn main() -> anyhow::Result<()> {
             "--locales",
             "--listen",
             "--auth-file",
+            "--service-name",
+            "--cef-url",
+            "--inject-frontend",
+            "--installer",
+            "--github-api",
+            "--release-repository",
+            "--service-release-url",
+            "--service-prerelease-url",
+            "--testing-download-url",
         ]
         .contains(&key.as_str())
         {
@@ -77,6 +90,43 @@ async fn main() -> anyhow::Result<()> {
     let user = required(&mut options, "--user")?;
     let assets = PathBuf::from(required(&mut options, "--assets")?);
     let locales = PathBuf::from(required(&mut options, "--locales")?);
+    let defaults = RuntimeConfig::default();
+    let config = RuntimeConfig {
+        service_name: options
+            .remove("--service-name")
+            .unwrap_or(defaults.service_name),
+        cef_url: options.remove("--cef-url").unwrap_or(defaults.cef_url),
+        inject_frontend: match options
+            .remove("--inject-frontend")
+            .as_deref()
+            .unwrap_or("false")
+        {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            value => bail!("invalid --inject-frontend {value:?}; expected true or false"),
+        },
+        installer: options.remove("--installer").map(PathBuf::from),
+        github_api: options
+            .remove("--github-api")
+            .unwrap_or(defaults.github_api),
+        release_repository: options
+            .remove("--release-repository")
+            .unwrap_or(defaults.release_repository),
+        service_release_url: options
+            .remove("--service-release-url")
+            .unwrap_or(defaults.service_release_url),
+        service_prerelease_url: options
+            .remove("--service-prerelease-url")
+            .unwrap_or(defaults.service_prerelease_url),
+        testing_download_url: options
+            .remove("--testing-download-url")
+            .unwrap_or(defaults.testing_download_url),
+        keep_systemd_service: std::env::var("KEEP_SYSTEMD_SERVICE").is_ok_and(|value| value == "1"),
+        chown_plugin_path: std::env::var("CHOWN_PLUGIN_PATH").map_or(true, |value| value == "1"),
+    };
+    if config.inject_frontend && address.port() != 1337 {
+        bail!("the unchanged Decky frontend requires port 1337 for native injection");
+    }
     for (label, path) in [
         ("worker", &worker),
         ("plugins", &plugin_root),
@@ -142,8 +192,10 @@ async fn main() -> anyhow::Result<()> {
         .to_owned();
     let (events, _) = broadcast::channel(256);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
     let (shutdown_watch_tx, mut shutdown_watch_rx) = watch::channel(false);
     let signal_shutdown_tx = shutdown_watch_tx.clone();
+    let signal_server_shutdown = shutdown_tx.clone();
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing SIGTERM handler")?;
@@ -158,13 +210,19 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
         let _ = signal_shutdown_tx.send(true);
-        let _ = shutdown_tx.send(());
+        if let Some(shutdown) = signal_server_shutdown.lock().await.take() {
+            let _ = shutdown.send(());
+        }
     });
     let registry = match PluginRegistry::start(
         WorkerConfiguration {
             executable: worker,
             mode: worker_mode,
             bootstrap: worker_bootstrap,
+            auth_token: auth.clone(),
+            server_host: address.ip().to_string(),
+            server_port: address.port(),
+            chown_plugin_path: config.chown_plugin_path,
         },
         plugin_root,
         homebrew.clone(),
@@ -187,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
     let backend = tokio::select! {
         result = Backend::new(registry.clone(), homebrew, user, user_home, version) => {
             match result {
-                Ok(backend) => Arc::new(backend),
+                Ok(backend) => Arc::new(backend.with_config(config)),
                 Err(error) => {
                     let _ = shutdown_watch_tx.send(true);
                     registry.shutdown().await;
@@ -203,13 +261,93 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
     };
+    let initialize = async {
+        backend
+            .initialize_plugin_order()
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message().to_owned()))?;
+        if backend.setting("branch", serde_json::json!(-1)).await == serde_json::json!(-1) {
+            let prerelease = backend.loader_version().starts_with('v')
+                && backend.loader_version().contains("-pre");
+            backend
+                .set_setting("branch", serde_json::json!(if prerelease { 1 } else { 0 }))
+                .await
+                .map_err(|error| anyhow::anyhow!(error.message().to_owned()))?;
+        }
+        registry.start_live_reload().await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = initialize {
+        let _ = shutdown_watch_tx.send(true);
+        registry.shutdown().await;
+        signal_task.abort();
+        return Err(error);
+    }
+    if backend.config.inject_frontend {
+        let route = if backend.setting("cef_forward", Value::Bool(false)).await == Value::Bool(true)
+        {
+            "utilities/allow_remote_debugging"
+        } else {
+            "utilities/disallow_remote_debugging"
+        };
+        if let Err(error) = backend.dispatch(route, vec![]).await {
+            eprintln!("CEF forwarding startup failed: {}", error.message());
+        }
+    }
+    let updater_task = backend.updater.clone().start(backend.clone());
+    let injector_task = backend.config.inject_frontend.then(|| {
+        tokio::spawn(cef::Cef::run_injector(
+            backend.clone(),
+            shutdown_watch_rx.clone(),
+        ))
+    });
     eprintln!(
-        "Decky Rust compatibility probe listening at {address}; CPython runtime: {}",
+        "Decky Rust backend listening at {address}; CPython runtime: {}",
         runtime["python"]
     );
-    let result =
-        transport::serve(address, auth, assets, locales, backend, events, shutdown_rx).await;
+    let server = transport::serve(
+        address,
+        auth,
+        assets,
+        locales,
+        backend.clone(),
+        events,
+        shutdown_rx,
+    );
+    tokio::pin!(server);
+    let result = tokio::select! {
+        result = &mut server => result,
+        _ = shutdown_watch_rx.changed() => {
+            backend.cancel_utilities_setup();
+            server.await
+        }
+        _ = essential_launcher_failed(registry.essential_failure()) => {
+            let requested = *shutdown_watch_rx.borrow();
+            let _ = shutdown_watch_tx.send(true);
+            if let Some(shutdown) = shutdown_tx.lock().await.take() {
+                let _ = shutdown.send(());
+            }
+            backend.cancel_utilities_setup();
+            let server_result = server.await;
+            if requested {
+                server_result
+            } else {
+                if let Err(error) = server_result {
+                    eprintln!("Server shutdown after launcher loss failed: {error}");
+                }
+                Err(anyhow::anyhow!("shared Python launcher exited; stopping backend so its service can restart"))
+            }
+        }
+    };
     let _ = shutdown_watch_tx.send(true);
+    updater_task.shutdown().await;
+    if let Some(task) = injector_task {
+        let _ = task.await;
+    }
+    if let Err(error) = backend.shutdown_utilities().await {
+        eprintln!("Utility shutdown failed: {}", error.message());
+    }
     registry.shutdown().await;
     signal_task.abort();
     result
@@ -219,4 +357,16 @@ fn required(options: &mut HashMap<String, String>, key: &str) -> anyhow::Result<
     options
         .remove(key)
         .with_context(|| format!("{key} is required; use --help"))
+}
+
+async fn essential_launcher_failed(receiver: Option<watch::Receiver<bool>>) {
+    let Some(mut receiver) = receiver else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    while !*receiver.borrow() {
+        if receiver.changed().await.is_err() {
+            return;
+        }
+    }
 }

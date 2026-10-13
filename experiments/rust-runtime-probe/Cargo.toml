@@ -8,15 +8,23 @@ publish = false
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
+brotli = "9"
+encoding_rs = "0.8"
+flate2 = "1"
 futures-util = "0.3"
+fancy-regex = "0.16"
 libc = "0.2"
 mime_guess = "2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "charset", "gzip", "brotli", "deflate", "cookies"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
+sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.29"
 tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }
+unicode-casefold = "0.2"
+zip = { version = "9.0.2", default-features = false, features = ["deflate-flate2-zlib-rs", "bzip2", "lzma"] }
 
 [profile.dev]
 debug = 0

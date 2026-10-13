@@ -82,6 +82,7 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path)
         if worker_packaging == 'onedir':
             shutil.copytree(onedir_runtime, bundle / '_internal')
         shutil.copy2(rust, bundle / 'decky-rust-runtime-probe')
+        shutil.copy2(HERE / 'install.py', bundle / 'install.py')
         shutil.copytree(assets, bundle / 'assets')
         shutil.copytree(locales, bundle / 'locales')
         manifest = {
@@ -89,6 +90,7 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path)
             'private_only': True,
             'distribution_approved': False,
             'worker_packaging': worker_packaging,
+            'rust_executable': 'decky-rust-runtime-probe',
             'runtime': runtime,
             'source_baseline': source_baseline,
             'cargo_lock_sha256': digest(HERE / 'Cargo.lock'),

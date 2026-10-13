@@ -72,6 +72,11 @@ def prepare_runtime(bootstrap: str) -> None:
         raise WorkerError(f"unknown worker bootstrap: {bootstrap}")
     importlib.import_module("decky_loader.localplatform.localsocket")
     importlib.import_module("decky_loader.plugin.sandboxed_plugin")
+    auth_token = os.environ.get("DECKY_AUTH_TOKEN")
+    if auth_token is not None:
+        from decky_loader import helpers
+
+        helpers.csrf_token = auth_token
     _prepared_bootstraps.add(bootstrap)
 
 
@@ -254,7 +259,7 @@ def _configure_environment(plugin_root: Path, homebrew: Path, user: str) -> None
             "PRIVILEGED_PATH": str(plugin_root.parent),
             "PLUGIN_PATH": str(plugin_root),
             "UNPRIVILEGED_USER": user,
-            "CHOWN_PLUGIN_PATH": "0",
+            "CHOWN_PLUGIN_PATH": os.environ.get("CHOWN_PLUGIN_PATH", "0"),
         }
     )
 
@@ -286,8 +291,10 @@ def launch(args: argparse.Namespace) -> None:
     if socket_path.exists() or socket_path.is_symlink():
         raise WorkerError(f"refusing to replace an existing IPC socket path: {socket_path}")
 
+    from decky_loader.localplatform.localplatform import get_log_level
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=get_log_level(),
         format="[%(name)s][%(levelname)s]: %(message)s",
         stream=sys.stderr,
     )

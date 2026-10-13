@@ -5,7 +5,9 @@ use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 
 use crate::workers::{PluginRegistry, WorkerError};
+use crate::{cef::Cef, plugin_manager::PluginManager, updater::Updater, utilities::Utilities};
 
+#[derive(Debug)]
 pub enum RpcError {
     Error {
         name: String,
@@ -16,7 +18,7 @@ pub enum RpcError {
 }
 
 impl RpcError {
-    fn invalid(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self::Error {
             name: "ValueError".into(),
             message: message.into(),
@@ -24,11 +26,18 @@ impl RpcError {
         }
     }
 
-    fn failure(message: impl Into<String>) -> Self {
+    pub(crate) fn failure(message: impl Into<String>) -> Self {
         Self::Error {
             name: "Exception".into(),
             message: message.into(),
             traceback: None,
+        }
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::Error { message, .. } => message,
+            Self::Stopped => "Plugin has been stopped",
         }
     }
 }
@@ -42,14 +51,52 @@ impl From<WorkerError> for RpcError {
     }
 }
 
+pub(crate) struct RuntimeConfig {
+    pub service_name: String,
+    pub cef_url: String,
+    pub inject_frontend: bool,
+    pub installer: Option<PathBuf>,
+    pub github_api: String,
+    pub release_repository: String,
+    pub service_release_url: String,
+    pub service_prerelease_url: String,
+    pub testing_download_url: String,
+    pub keep_systemd_service: bool,
+    pub chown_plugin_path: bool,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            service_name: "plugin_loader".into(),
+            cef_url: "http://127.0.0.1:8080".into(),
+            inject_frontend: false,
+            installer: None,
+            github_api: "https://api.github.com".into(),
+            release_repository: "SteamDeckHomebrew/decky-loader".into(),
+            service_release_url: "https://raw.githubusercontent.com/SteamDeckHomebrew/decky-loader/main/dist/plugin_loader-release.service".into(),
+            service_prerelease_url: "https://raw.githubusercontent.com/SteamDeckHomebrew/decky-loader/main/dist/plugin_loader-prerelease.service".into(),
+            testing_download_url: "https://nightly.link".into(),
+            keep_systemd_service: false,
+            chown_plugin_path: true,
+        }
+    }
+}
+
 pub struct Backend {
     pub registry: Arc<PluginRegistry>,
-    homebrew: PathBuf,
+    pub(crate) homebrew: PathBuf,
     settings_path: PathBuf,
     settings: Mutex<Map<String, Value>>,
-    user: String,
-    user_home: String,
-    version: String,
+    pub(crate) user: String,
+    pub(crate) user_home: String,
+    pub(crate) version: String,
+    pub(crate) client: reqwest::Client,
+    pub(crate) config: RuntimeConfig,
+    pub(crate) cef: Cef,
+    pub(crate) updater: Arc<Updater>,
+    plugin_manager: PluginManager,
+    utilities: Utilities,
 }
 
 impl Backend {
@@ -60,13 +107,26 @@ impl Backend {
         user_home: String,
         version: String,
     ) -> anyhow::Result<Self> {
-        let settings_path = homebrew.join("settings/loader.json");
+        let settings_path = registry
+            .plugin_root()
+            .parent()
+            .unwrap_or(&homebrew)
+            .join("settings/loader.json");
         let settings = match tokio::fs::read(&settings_path).await {
             Ok(bytes) => serde_json::from_slice::<Map<String, Value>>(&bytes)
                 .context("reading isolated loader settings")?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Map::new(),
             Err(error) => return Err(error.into()),
         };
+        let config = RuntimeConfig::default();
+        let client = reqwest::Client::builder()
+            .user_agent(format!("Decky/{version} (https://decky.xyz)"))
+            .no_proxy()
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .build()?;
+        let cef = Cef::new(client.clone(), config.cef_url.clone());
         Ok(Self {
             registry,
             homebrew,
@@ -75,7 +135,92 @@ impl Backend {
             user,
             user_home,
             version,
+            client,
+            config,
+            cef,
+            updater: Arc::new(Updater::new()),
+            plugin_manager: PluginManager::new(),
+            utilities: Utilities::new(),
         })
+    }
+
+    pub(crate) fn with_config(mut self, config: RuntimeConfig) -> Self {
+        self.cef = Cef::new(self.client.clone(), config.cef_url.clone());
+        self.config = config;
+        self
+    }
+
+    pub(crate) fn emit(&self, event: &str, args: Vec<Value>) {
+        self.registry.emit(event, args);
+    }
+
+    pub(crate) async fn setting(&self, key: &str, default: Value) -> Value {
+        self.settings
+            .lock()
+            .await
+            .get(key)
+            .cloned()
+            .unwrap_or(default)
+    }
+
+    pub(crate) async fn set_setting(&self, key: &str, value: Value) -> Result<(), RpcError> {
+        let mut settings = self.settings.lock().await;
+        if settings.get(key) == Some(&value) {
+            return Ok(());
+        }
+        let previous = settings.insert(key.to_owned(), value);
+        let commit = async {
+            let data = serde_json::to_vec_pretty(&*settings)
+                .map_err(|error| RpcError::failure(error.to_string()))?;
+            let parent = self.settings_path.parent().expect("settings parent");
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| RpcError::failure(error.to_string()))?;
+            let temporary = self.settings_path.with_extension("json.new");
+            tokio::fs::write(&temporary, data)
+                .await
+                .map_err(|error| RpcError::failure(error.to_string()))?;
+            tokio::fs::rename(&temporary, &self.settings_path)
+                .await
+                .map_err(|error| RpcError::failure(error.to_string()))
+        }
+        .await;
+        if let Err(error) = commit {
+            if let Some(previous) = previous {
+                settings.insert(key.to_owned(), previous);
+            } else {
+                settings.remove(key);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn initialize_plugin_order(&self) -> Result<(), RpcError> {
+        if self.setting("pluginOrder", Value::Null).await.is_null() {
+            let plugins = self.registry.list().await;
+            let names = plugins
+                .as_array()
+                .expect("registry plugin list")
+                .iter()
+                .filter_map(|plugin| plugin.get("name"))
+                .cloned()
+                .collect();
+            self.set_setting("pluginOrder", Value::Array(names)).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn legacy_utility(&self, method: &str, kwargs: Value) -> Value {
+        self.utilities.legacy_call(self, method, kwargs).await
+    }
+
+    pub(crate) fn cancel_utilities_setup(&self) {
+        self.utilities.cancel_setup();
+    }
+
+    pub(crate) async fn shutdown_utilities(&self) -> Result<(), RpcError> {
+        self.utilities.shutdown(self).await
     }
 
     pub fn loader_version(&self) -> &str {
@@ -92,6 +237,30 @@ impl Backend {
     }
 
     pub async fn dispatch(&self, route: &str, mut args: Vec<Value>) -> Result<Value, RpcError> {
+        if route.starts_with("updater/") {
+            return self
+                .updater
+                .dispatch(self, route, args)
+                .await
+                .unwrap_or_else(|| Err(missing_route(route)));
+        }
+        if matches!(
+            route,
+            "utilities/install_plugin"
+                | "utilities/install_plugins"
+                | "utilities/cancel_plugin_install"
+                | "utilities/confirm_plugin_install"
+                | "utilities/uninstall_plugin"
+                | "utilities/enable_plugin"
+                | "utilities/disable_plugin"
+                | "utilities/set_all_plugins_disabled"
+        ) {
+            return self
+                .plugin_manager
+                .dispatch(self, route, args)
+                .await
+                .unwrap_or_else(|| Err(missing_route(route)));
+        }
         match route {
             "loader/get_plugins" => {
                 exact(&args, 0)?;
@@ -151,66 +320,31 @@ impl Backend {
             }
             "utilities/settings/get" => {
                 exact(&args, 2)?;
-                let settings = self.settings.lock().await;
-                Ok(settings.get(string(&args, 0)?).unwrap_or(&args[1]).clone())
+                let default = args.pop().expect("validated default");
+                Ok(self.setting(string(&args, 0)?, default).await)
             }
             "utilities/settings/set" => {
                 exact(&args, 2)?;
                 let value = args.pop().expect("validated setting value");
                 let key = string(&args, 0)?;
-                let mut settings = self.settings.lock().await;
-                let previous = settings.insert(key.to_owned(), value);
-                let commit = async {
-                    let data = serde_json::to_vec_pretty(&*settings)
-                        .map_err(|error| RpcError::failure(error.to_string()))?;
-                    let parent = self.settings_path.parent().expect("settings parent");
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(|error| RpcError::failure(error.to_string()))?;
-                    let temporary = self.settings_path.with_extension("json.new");
-                    tokio::fs::write(&temporary, data)
-                        .await
-                        .map_err(|error| RpcError::failure(error.to_string()))?;
-                    tokio::fs::rename(&temporary, &self.settings_path)
-                        .await
-                        .map_err(|error| RpcError::failure(error.to_string()))
-                }
-                .await;
-                if let Err(error) = commit {
-                    if let Some(previous) = previous {
-                        settings.insert(key.to_owned(), previous);
-                    } else {
-                        settings.remove(key);
-                    }
-                    return Err(error);
-                }
+                self.set_setting(key, value).await?;
                 Ok(Value::Null)
             }
             "utilities/get_user_info" => {
                 exact(&args, 0)?;
                 Ok(json!({"username": self.user, "path": self.user_home}))
             }
-            "updater/get_version_info" => {
-                exact(&args, 0)?;
-                // Report the packaged SDK/source baseline, not a Rust release.
-                // This private probe has no release updater or administrative update routes.
-                Ok(json!({
-                    "current": self.version,
-                    "remote": null,
-                    "all": [],
-                    "updatable": false,
-                }))
-            }
-            _ => Err(RpcError::Error {
-                name: "RouteNotFoundError".into(),
-                message: format!("Route {route} does not exist."),
-                traceback: None,
-            }),
+            _ if route.starts_with("utilities/") => self
+                .utilities
+                .dispatch(self, route, args)
+                .await
+                .unwrap_or_else(|| Err(missing_route(route))),
+            _ => Err(missing_route(route)),
         }
     }
 }
 
-fn exact(args: &[Value], expected: usize) -> Result<(), RpcError> {
+pub(crate) fn exact(args: &[Value], expected: usize) -> Result<(), RpcError> {
     if args.len() == expected {
         Ok(())
     } else {
@@ -221,8 +355,16 @@ fn exact(args: &[Value], expected: usize) -> Result<(), RpcError> {
     }
 }
 
-fn string(args: &[Value], index: usize) -> Result<&str, RpcError> {
+pub(crate) fn string(args: &[Value], index: usize) -> Result<&str, RpcError> {
     args.get(index)
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::invalid(format!("argument {index} must be a string")))
+}
+
+fn missing_route(route: &str) -> RpcError {
+    RpcError::Error {
+        name: "RouteNotFoundError".into(),
+        message: format!("Route {route} does not exist."),
+        traceback: None,
+    }
 }

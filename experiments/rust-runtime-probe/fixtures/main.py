@@ -35,6 +35,18 @@ class Plugin:
     async def process_identity(self):
         return {'pid': os.getpid(), 'cmdline': Path('/proc/self/cmdline').read_bytes().hex()}
 
+    async def backend_ping(self):
+        import aiohttp
+        host = os.environ['SERVER_HOST']
+        port = os.environ['SERVER_PORT']
+        async with aiohttp.ClientSession() as client:
+            async with client.post(
+                f'http://{host}:{port}/methods/ping',
+                json={},
+                headers={'X-Decky-Auth': helpers.get_csrf_token()},
+            ) as response:
+                return {'status': response.status, 'body': await response.json()}
+
     async def slow(self, seconds):
         await decky.emit('slow_started', seconds)
         await asyncio.sleep(seconds)

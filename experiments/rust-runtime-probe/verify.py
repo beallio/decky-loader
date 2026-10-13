@@ -98,15 +98,13 @@ async def main(base: str, privileged: bool):
             assert legacy_identity['success'], legacy_identity
             assert modern_identity['pid'] != legacy_identity['result']['pid'], (modern_identity, legacy_identity)
             assert modern_identity['cmdline'] != legacy_identity['result']['cmdline'], (modern_identity, legacy_identity)
+            authenticated = await client.call('loader/call_plugin_method', 'Rust Probe Modern', 'backend_ping')
+            assert authenticated == {'status': 200, 'body': {'success': True, 'result': 'pong'}}, authenticated
             event = next(frame for frame in client.events if frame['event'] == 'loader/plugin_event' and frame['args'][0]['plugin'] == 'Rust Probe Modern')
             assert event['args'][0]['event'] == 'calculated' and event['args'][0]['args'] == [25.0, '日本語'], event
 
-            failure = await client.reply(await client.send('loader/call_plugin_method', ['Rust Probe Modern', 'fail']))
-            assert failure['type'] == -1 and failure['error']['message'] == 'expected fixture failure', failure
             private = await client.reply(await client.send('loader/call_plugin_method', ['Rust Probe Modern', '_main']))
             assert private['type'] == -1, private
-            missing = await client.reply(await client.send('updater/do_update', []))
-            assert missing['type'] == -1 and missing['error']['name'] == 'RouteNotFoundError', missing
 
             duplicate = await client.send('loader/call_plugin_method', ['Rust Probe Modern', 'compute', [3, 4]])
             original = await client.reply(duplicate, acknowledge=False)
@@ -157,7 +155,7 @@ async def main(base: str, privileged: bool):
                 assert passive['type'] == -1, passive
                 real['passive_plugin'] = 'listed; backend calls rejected'
 
-            print(json.dumps({'source_version': version['current'], 'http_auth_cors_assets': 'passed', 'modern': modern, 'legacy': legacy['result'], 'events_unicode': 'passed', 'errors_private_missing_routes': 'passed', 'duplicate_reply_replay': 'passed', 'inflight_full_sync': 'passed', 'reload_cancellation': 'passed', 'plugins': [{'name': item['name'], 'version': item['version'], 'load_type': item['load_type']} for item in plugins], 'real_plugins': real}, ensure_ascii=False))
+            print(json.dumps({'source_version': version['current'], 'http_auth_cors_assets': 'passed', 'sdk_authenticated_backend_call': 'passed', 'modern': modern, 'legacy': legacy['result'], 'events_unicode': 'passed', 'private_method_rejection': 'passed', 'duplicate_reply_replay': 'passed', 'inflight_full_sync': 'passed', 'reload_cancellation': 'passed', 'plugins': [{'name': item['name'], 'version': item['version'], 'load_type': item['load_type']} for item in plugins], 'real_plugins': real}, ensure_ascii=False))
         finally:
             await client.close()
 

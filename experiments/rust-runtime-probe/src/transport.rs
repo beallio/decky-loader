@@ -20,7 +20,7 @@ use axum::{
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
@@ -111,7 +111,7 @@ pub async fn serve(
     shutdown: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(address).await?;
-    let http_client = Client::builder().build()?;
+    let http_client = backend.client.clone();
     let token: Arc<str> = Arc::from(auth);
     let user_agent = HeaderValue::from_str(&format!(
         "Decky/{} (https://decky.xyz)",
@@ -190,6 +190,10 @@ pub async fn serve(
                 // aiohttp's existing 1 MiB upload limit rejects the boundary itself.
                 .layer(DefaultBodyLimit::max(1024 * 1024 - 1)),
         )
+        .route(
+            "/methods/{method_name}",
+            post(legacy_utility).layer(DefaultBodyLimit::max(1024 * 1024 - 1)),
+        )
         .layer(cors)
         .layer(middleware::from_fn(expose_response_headers))
         .layer(middleware::from_fn_with_state(token, csrf_middleware))
@@ -238,6 +242,19 @@ async fn auth_token(State(state): State<AppState>) -> Response {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
+}
+
+async fn legacy_utility(
+    State(state): State<AppState>,
+    AxumPath(method): AxumPath<String>,
+    request: Request<Body>,
+) -> Response {
+    let body = match Bytes::from_request(request, &state).await {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let kwargs = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    Json(state.backend.legacy_utility(&method, kwargs).await).into_response()
 }
 
 async fn csrf_middleware(
@@ -813,6 +830,10 @@ mod tests {
                     executable: std::env::current_exe().unwrap(),
                     mode: crate::workers::WorkerMode::Exec,
                     bootstrap: crate::workers::WorkerBootstrap::Lean,
+                    auth_token: "test-token".into(),
+                    server_host: "127.0.0.1".into(),
+                    server_port: 1339,
+                    chown_plugin_path: false,
                 },
                 plugin_root,
                 directory.0.clone(),

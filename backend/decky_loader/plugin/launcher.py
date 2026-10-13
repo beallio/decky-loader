@@ -140,6 +140,12 @@ def _request(arguments: dict[str, Any], key: str, expected: type) -> Any:
     return value
 
 
+def _assert_fork_safe() -> None:
+    with os.scandir("/proc/self/task") as tasks:
+        if sum(1 for _ in tasks) != 1:
+            raise RuntimeError("the shared Python launcher must be single-threaded before fork")
+
+
 def _start_child(
     request: dict[str, Any], bootstrap: str, children: dict[str, _Child]
 ) -> dict[str, Any]:
@@ -154,6 +160,7 @@ def _start_child(
         arguments[key] = _request(request, key, str)
     arguments["bootstrap"] = bootstrap
 
+    _assert_fork_safe()
     gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
     parent_pid = os.getpid()
     try:
@@ -279,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
     children: dict[str, _Child] = {}
     try:
         worker.prepare_runtime(args.bootstrap)
+        _assert_fork_safe()
         gc.collect()
         gc.freeze()
         _write_message({"ok": True, "op": "ready", "pid": os.getpid()})
