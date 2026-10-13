@@ -19,6 +19,7 @@ import statistics
 import subprocess
 import sys
 import time
+import tempfile
 import traceback
 import uuid
 from urllib.parse import quote
@@ -40,9 +41,10 @@ STOP_TIMEOUT_SECONDS = 55
 UNIT_STOP_SECONDS = 45
 
 VARIANTS = (
-    ('python-installed', 'python'),
-    ('rust-onefile', 'onefile_worker'),
-    ('rust-onedir', 'onedir_worker'),
+    ('python-installed', None, None),
+    ('rust-full-exec', 'exec', 'full'),
+    ('rust-lean-exec', 'exec', 'lean'),
+    ('rust-lean-fork', 'fork', 'lean'),
 )
 
 PLUGIN_METADATA = {
@@ -53,6 +55,7 @@ PLUGIN_METADATA = {
 }
 PLUGIN_SOURCE = '''"""Marked, deterministic arithmetic-only runtime benchmark plugin."""
 import multiprocessing
+import os
 import sys
 VECTOR = tuple(range(1, 2049))
 
@@ -60,7 +63,14 @@ class Plugin:
     async def sum_squares(self):
         return sum(value * value for value in VECTOR)
     async def runtime_info(self):
-        return {'python': sys.version.split()[0], 'multiprocessing_start_method': multiprocessing.get_start_method()}
+        return {
+            'python': sys.version.split()[0],
+            'multiprocessing_start_method': multiprocessing.get_start_method(),
+            'pid': os.getpid(),
+            'ppid': os.getppid(),
+            'module_count': len(sys.modules),
+            'main_graph_loaded': 'decky_loader.main' in sys.modules,
+        }
 '''
 
 
@@ -379,36 +389,50 @@ def cgroup_usage_usec(control_group: str | None) -> int:
 
 def cgroup_pss(control_group: str | None) -> dict[str, object]:
     pss_kib = 0
-    pids = 0
+    private_dirty_kib = 0
+    processes = []
     skipped_vanished = 0
     for pid in cgroup_members(control_group):
-        stat = process_identity(pid)
-        if stat is None:
+        identity = process_identity(pid)
+        if identity is None:
             skipped_vanished += 1
             continue
-        if stat[1] == 'Z':
-            pids += 1
-            continue
-        pids += 1
-        path = Path('/proc') / str(pid) / 'smaps_rollup'
+        process_dir = Path('/proc') / str(pid)
         try:
-            lines = path.read_text().splitlines()
+            comm = process_dir.joinpath('comm').read_text().strip()
+            status = process_dir.joinpath('status').read_text().splitlines()
+            ppid = next((int(line.split()[1]) for line in status if line.startswith('PPid:')), None)
+            if identity[1] == 'Z':
+                processes.append({'pid': pid, 'ppid': ppid, 'comm': comm, 'state': 'zombie'})
+                continue
+            smaps = process_dir.joinpath('smaps_rollup').read_text().splitlines()
         except FileNotFoundError:
             skipped_vanished += 1
-            pids -= 1
             continue
         except OSError as error:
-            raise BenchmarkError(f'cannot read PSS for cgroup process {pid}: {error}') from error
-        for line in lines:
-            if line.startswith('Pss:'):
-                pss_kib += int(line.split()[1])
-                break
-        else:
-            raise BenchmarkError(f'process {pid} smaps_rollup has no Pss entry')
+            raise BenchmarkError(f'cannot read memory details for cgroup process {pid}: {error}') from error
+        values = {}
+        for line in smaps:
+            key, separator, value = line.partition(':')
+            if separator and key in ('Pss', 'Private_Dirty'):
+                values[key] = int(value.split()[0])
+        if 'Pss' not in values or 'Private_Dirty' not in values:
+            raise BenchmarkError(f'process {pid} smaps_rollup has no Pss or Private_Dirty entry')
+        pss_kib += values['Pss']
+        private_dirty_kib += values['Private_Dirty']
+        processes.append({
+            'pid': pid,
+            'ppid': ppid,
+            'comm': comm,
+            'pss_mib': values['Pss'] / 1024,
+            'private_dirty_mib': values['Private_Dirty'] / 1024,
+        })
     return {
         'pss_mib': pss_kib / 1024,
-        'process_count': pids,
+        'private_dirty_mib': private_dirty_kib / 1024,
+        'process_count': len(processes),
         'vanished_during_sample': skipped_vanished,
+        'processes': processes,
     }
 
 
@@ -615,11 +639,15 @@ def _rust_command(
     homebrew: Path,
     assets: Path,
     locales: Path,
+    mode: str,
+    bootstrap: str,
 ) -> list[str]:
     return [
         str(rust_executable),
         '--listen', LISTEN,
         '--worker', str(worker),
+        '--worker-mode', mode,
+        '--worker-bootstrap', bootstrap,
         '--plugin-root', str(homebrew / 'plugins'),
         '--homebrew', str(homebrew),
         '--user', 'deck',
@@ -730,8 +758,7 @@ def run_trial(
     work_root: Path,
     python_executable: Path,
     rust_executable: Path,
-    onefile_worker: Path,
-    onedir_worker: Path,
+    worker: Path,
     assets: Path,
     locales: Path,
     startup_timeout: float,
@@ -743,7 +770,8 @@ def run_trial(
     description = f'Decky Runtime Benchmark {run_uuid}'
     trial_root = work_root / f'trial-{run_uuid}'
     homebrew = trial_root / 'homebrew'
-    tmpdir = trial_root / 'tmp'
+    # Keep worker Unix socket paths below AF_UNIX's 108-byte limit.
+    tmpdir = Path(tempfile.mkdtemp(prefix='t', dir=work_root.parent))
     log_path = output / 'logs' / f'{unit}.log'
     trial: dict[str, object] = {
         'trial_uuid': run_uuid,
@@ -766,7 +794,7 @@ def run_trial(
     keep_runtime = False
     trial_error: BaseException | None = None
     trial_root.mkdir(parents=True)
-    tmpdir.mkdir()
+    os.chown(tmpdir, account.pw_uid, account.pw_gid)
     try:
         shutil.copytree(snapshot, homebrew, symlinks=True)
         copied_inputs = inputs_digest(homebrew)
@@ -781,14 +809,16 @@ def run_trial(
         trial['benchmark_plugin_sha256'] = plugin_digest['sha256']
         chown_tree(homebrew, account.pw_uid, account.pw_gid)
 
-        if variant == 'python-installed':
-            service_command = _normal_service_command(python_executable)
-        elif variant == 'rust-onefile':
-            service_command = _rust_command(rust_executable, onefile_worker, homebrew, assets, locales)
-        elif variant == 'rust-onedir':
-            service_command = _rust_command(rust_executable, onedir_worker, homebrew, assets, locales)
-        else:
+        variant_config = next((entry for entry in VARIANTS if entry[0] == variant), None)
+        if variant_config is None:
             raise BenchmarkError(f'unknown benchmark variant: {variant}')
+        _, worker_mode, worker_bootstrap = variant_config
+        if worker_mode is None:
+            service_command = _normal_service_command(python_executable)
+        else:
+            service_command = _rust_command(
+                rust_executable, worker, homebrew, assets, locales, worker_mode, worker_bootstrap
+            )
 
         existing = systemctl_properties(unit)
         if existing.get('LoadState') not in (None, 'not-found'):
@@ -832,6 +862,7 @@ def run_trial(
 
         pss = cgroup_pss(control_group)
         trial['pss_after_readiness_mib'] = pss['pss_mib']
+        trial['private_dirty_after_readiness_mib'] = pss['private_dirty_mib']
         trial['process_count_after_readiness'] = pss['process_count']
         trial['pss_sample'] = pss
 
@@ -921,6 +952,7 @@ def run_trial(
         if not keep_runtime:
             try:
                 shutil.rmtree(trial_root)
+                shutil.rmtree(tmpdir)
                 trial['runtime_data_removed_after_drain'] = True
             except OSError as error:
                 trial['runtime_data_removed_after_drain'] = False
@@ -928,6 +960,7 @@ def run_trial(
                 trial['status'] = 'failed'
         else:
             trial['runtime_data_retained'] = str(trial_root)
+            trial['runtime_temp_retained'] = str(tmpdir)
 
         try:
             assert_service_unchanged(_ACTIVE_BASELINE)
@@ -984,6 +1017,7 @@ def summarize(raw: dict[str, object]) -> dict[str, object]:
         'created_at_utc': utc_now(),
         'raw_file': 'raw.json',
         'comparability_limitation': raw.get('comparability_limitation'),
+        'memory_sharing_note': raw.get('memory_sharing_note'),
         'trial_count': len(trials),
         'successful_trial_count': sum(trial.get('status') == 'success' for trial in trials),
         'failed_trial_count': sum(trial.get('status') != 'success' for trial in trials),
@@ -1004,15 +1038,18 @@ def summarize(raw: dict[str, object]) -> dict[str, object]:
     metric_getters = {
         'startup_to_readiness_seconds': lambda trial: trial.get('startup_to_readiness_seconds'),
         'pss_after_readiness_mib': lambda trial: trial.get('pss_after_readiness_mib'),
+        'private_dirty_after_readiness_mib': lambda trial: trial.get('private_dirty_after_readiness_mib'),
         'process_count_after_readiness': lambda trial: trial.get('process_count_after_readiness'),
         'idle_cpu_percent_of_one_core': lambda trial: (trial.get('idle_cpu') or {}).get('percent_of_one_core'),
         'rpc_latency_p50_ms': lambda trial: (trial.get('rpc') or {}).get('latency_p50_ms'),
         'rpc_latency_p95_ms': lambda trial: (trial.get('rpc') or {}).get('latency_p95_ms'),
         'rpc_throughput_calls_per_second': lambda trial: (trial.get('rpc') or {}).get('throughput_calls_per_second'),
         'loaded_cpu_usec_per_completed_call': lambda trial: (trial.get('rpc') or {}).get('loaded_cpu_usec_per_completed_call'),
+        'loaded_cpu_usage_usec': lambda trial: (trial.get('rpc') or {}).get('loaded_cpu_usage_usec'),
+        'loaded_wall_seconds': lambda trial: (trial.get('rpc') or {}).get('loaded_wall_seconds'),
         'shutdown_latency_seconds': lambda trial: trial.get('shutdown_latency_seconds'),
     }
-    for variant, _ in VARIANTS:
+    for variant, _, _ in VARIANTS:
         selected = [trial for trial in trials if trial.get('variant') == variant]
         successes = [trial for trial in selected if trial.get('status') == 'success']
         metrics = {}
@@ -1025,6 +1062,7 @@ def summarize(raw: dict[str, object]) -> dict[str, object]:
             'successful_trial_count': len(successes),
             'failed_trial_count': len(selected) - len(successes),
             'successful_trials_only': True,
+            'drained_trial_count': sum((trial.get('containment') or {}).get('drained') is True for trial in selected),
             'metrics': metrics,
         }
     return summary
@@ -1034,8 +1072,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--python-executable', required=True, help='installed Python backend executable (PluginLoader)')
     parser.add_argument('--rust-executable', required=True, help='private Rust compatibility probe executable')
-    parser.add_argument('--onefile-worker', required=True, help='PyInstaller one-file DeckyPluginWorker executable')
-    parser.add_argument('--onedir-worker', required=True, help='PyInstaller onedir DeckyPluginWorker executable')
+    parser.add_argument('--worker', required=True, help='single PyInstaller onedir DeckyPluginWorker executable')
     parser.add_argument('--assets', required=True, help='existing Rust probe frontend assets directory')
     parser.add_argument('--locales', required=True, help='existing Rust probe locale directory')
     parser.add_argument('--output', required=True, help='new or empty output directory outside the repository')
@@ -1058,23 +1095,17 @@ def prepare_inputs(args: argparse.Namespace, work_root: Path) -> dict[str, objec
             f'--python-executable must identify the untouched installed backend at {NORMAL_BINARY.resolve(strict=True)}'
         )
     rust_executable = validate_path(args.rust_executable, 'Rust executable', executable=True)
-    onefile_worker = validate_path(args.onefile_worker, 'one-file worker', executable=True)
-    onedir_worker = validate_path(args.onedir_worker, 'onedir worker', executable=True)
-    if onefile_worker == onedir_worker:
-        raise BenchmarkError('one-file and onedir worker arguments must identify separate executables')
-    if not (onedir_worker.parent / '_internal').is_dir():
-        raise BenchmarkError(f'onedir worker must have a sibling _internal directory: {onedir_worker.parent / "_internal"}')
+    worker = validate_path(args.worker, 'onedir worker', executable=True)
+    if not (worker.parent / '_internal').is_dir():
+        raise BenchmarkError(f'onedir worker must have a sibling _internal directory: {worker.parent / "_internal"}')
     assets = validate_path(args.assets, 'frontend assets', directory=True)
     locales = validate_path(args.locales, 'locale directory', directory=True)
-    describe_dir = work_root / 'worker-describe-tmp'
-    onefile_description = worker_description(onefile_worker, describe_dir / 'onefile')
-    onedir_description = worker_description(onedir_worker, describe_dir / 'onedir')
+    worker_info = worker_description(worker, work_root / 'worker-describe-tmp')
     return {
         'paths': {
             'python_executable': str(python_executable),
             'rust_executable': str(rust_executable),
-            'onefile_worker': str(onefile_worker),
-            'onedir_worker': str(onedir_worker),
+            'worker': str(worker),
             'assets': str(assets),
             'locales': str(locales),
             'live_homebrew_snapshot_source': str(HOME_BREW),
@@ -1082,16 +1113,12 @@ def prepare_inputs(args: argparse.Namespace, work_root: Path) -> dict[str, objec
         'binary_sha256': {
             'python_executable': sha256_file(python_executable),
             'rust_executable': sha256_file(rust_executable),
-            'onefile_worker': sha256_file(onefile_worker),
-            'onedir_worker': sha256_file(onedir_worker),
+            'worker': sha256_file(worker),
         },
-        'runtime_descriptions': {
-            'onefile_worker': onefile_description,
-            'onedir_worker': onedir_description,
-        },
+        'runtime_descriptions': {'worker': worker_info},
         'assets_tree': tree_digest(assets),
         'locales_tree': tree_digest(locales),
-        'worker_onedir_internal_tree': tree_digest(onedir_worker.parent / '_internal'),
+        'worker_onedir_internal_tree': tree_digest(worker.parent / '_internal'),
     }
 
 
@@ -1102,6 +1129,8 @@ def run_benchmark(args: argparse.Namespace) -> int:
     output = ensure_output_directory(Path(args.output), repository_root)
     if not (CGROUP_ROOT / 'cgroup.controllers').is_file():
         raise BenchmarkError('benchmark requires the systemd cgroup v2 hierarchy')
+    temporary_root = Path(os.environ.get('TMPDIR') or '/var/tmp/omp-1000').expanduser().resolve()
+    temporary_root.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     raw: dict[str, object] = {
         'schema_version': 1,
@@ -1113,12 +1142,19 @@ def run_benchmark(args: argparse.Namespace) -> int:
             'full-loader behavior; performance results are not production parity claims. Startup is process-cold '
             'only and does not flush OS caches.'
         ),
+        'memory_sharing_note': (
+            'PSS apportions shared resident pages across mapped processes, while Private_Dirty reports pages private '
+            'to one process and modified since sharing; forked workers may share copy-on-write pages until modified. '
+            'Use cgroup totals and per-process PSS/private-dirty together; do not add RSS values.'
+        ),
         'measurement_definitions': {
             'startup_to_readiness_seconds': 'monotonic time from before systemd-run until auth, plugin discovery, '
             'the benchmark arithmetic RPC, installed backend RPCs, and v3.2.10 version check all succeed',
             'pss_after_readiness_mib': 'sum of Pss from /proc/<pid>/smaps_rollup for every live process in the '
             'owned transient unit cgroup immediately after readiness',
-            'process_count_after_readiness': 'number of processes found recursively in the owned cgroup at the PSS sample',
+            'private_dirty_after_readiness_mib': 'sum of Private_Dirty from /proc/<pid>/smaps_rollup for every '
+            'live process in the owned transient unit cgroup at readiness; per-process PSS/private-dirty, comm, PID, '
+            'and PPID are in pss_sample.processes',
             'idle_cpu_percent_of_one_core': 'owned cgroup cpu.stat usage_usec delta divided by wall interval; '
             '100 percent means one fully occupied CPU core',
             'rpc_latency_ms': 'sequential arithmetic WebSocket CALL/REPLY latency per successful call after 10 warmups; '
@@ -1131,6 +1167,11 @@ def run_benchmark(args: argparse.Namespace) -> int:
         },
         'configuration': {
             'iterations_per_variant': args.iterations,
+            'variants': [
+                {'name': name, 'worker_mode': mode, 'worker_bootstrap': bootstrap}
+                for name, mode, bootstrap in VARIANTS
+            ],
+            'temporary_directory': str(temporary_root),
             'rpc_calls_per_trial': 200,
             'rpc_warmup_calls': 10,
             'idle_interval_seconds': args.idle_seconds,
@@ -1160,7 +1201,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
         global _ACTIVE_BASELINE
         _ACTIVE_BASELINE = baseline
 
-        work_root = output / f'.work-{uuid.uuid4().hex}'
+        work_root = temporary_root / f'decky-runtime-benchmark-{uuid.uuid4().hex}'
         work_root.mkdir(mode=0o755)
         preflight = prepare_inputs(args, work_root)
         raw['inputs'] = preflight
@@ -1187,8 +1228,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
         path_map = preflight['paths']
         python_executable = Path(path_map['python_executable'])
         rust_executable = Path(path_map['rust_executable'])
-        onefile_worker = Path(path_map['onefile_worker'])
-        onedir_worker = Path(path_map['onedir_worker'])
+        worker = Path(path_map['worker'])
         assets = Path(path_map['assets'])
         locales = Path(path_map['locales'])
 
@@ -1205,8 +1245,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 work_root=work_root,
                 python_executable=python_executable,
                 rust_executable=rust_executable,
-                onefile_worker=onefile_worker,
-                onedir_worker=onedir_worker,
+                worker=worker,
                 assets=assets,
                 locales=locales,
                 startup_timeout=args.startup_timeout,
