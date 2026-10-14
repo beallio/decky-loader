@@ -1,6 +1,9 @@
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 mod backend;
 mod cef;
 mod launcher;
+mod platform;
 mod plugin_manager;
 mod transport;
 mod updater;

@@ -155,6 +155,8 @@ Installer stop checks accept an inactive or failed service only after its main p
 
 The dependency audit must pass its security, dependency-source, and dependency-use checks. License findings are reported for information only and do not block this private experiment.
 
+The Rust test build keeps its remaining unsafe Linux calls in the platform helpers and the child process setup hook. Each boundary documents its safety requirements. User IDs, ordinary signals, reads, ownership changes, and inotify descriptor creation use safe library interfaces; event decoding uses checked byte slices rather than raw pointer reads. Clippy rejects undocumented unsafe blocks. This does not mean that the whole dependency graph is free of unsafe code or that runtime tests prove every safety requirement.
+
 ## 📜 Credits
 
 The original idea for the plugin loader concept is based on the work of [marios8543's Steam Deck UI Inject project](https://github.com/marios8543/steamdeck-ui-inject).

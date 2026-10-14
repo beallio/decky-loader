@@ -1,8 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
-    ffi::{CString, OsStr},
+    ffi::OsStr,
     fs, io,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, OwnedFd},
     os::unix::{
         ffi::OsStrExt,
         fs::{MetadataExt, PermissionsExt},
@@ -30,7 +30,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::launcher::{ForkLauncher, LauncherEnvironment, LauncherStartError};
+use crate::{
+    launcher::{ForkLauncher, LauncherEnvironment, LauncherStartError},
+    platform,
+};
 
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1305,7 +1308,7 @@ fn set_plugin_permissions_inner(
             directory.display()
         )));
     }
-    let effective_user_ids = (unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+    let effective_user_ids = platform::effective_user_ids();
     let tree_user_ids = if requires_root {
         effective_user_ids
     } else {
@@ -1363,14 +1366,7 @@ fn chown_path(path: &Path, owner: (u32, u32)) -> io::Result<()> {
     {
         return Ok(());
     }
-    let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    let result = unsafe { libc::lchown(path.as_ptr(), owner.0, owner.1) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    platform::chown_link(path, owner)
 }
 
 fn chmod_tree(path: &Path) -> io::Result<()> {
@@ -1421,12 +1417,8 @@ struct InotifyWatcher {
 impl InotifyWatcher {
     fn new(plugin_root: &Path) -> io::Result<Self> {
         let plugin_root = fs::canonicalize(plugin_root)?;
-        let descriptor = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-        if descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
         let mut watcher = Self {
-            fd: AsyncFd::new(unsafe { OwnedFd::from_raw_fd(descriptor) })?,
+            fd: AsyncFd::new(platform::inotify_init()?)?,
             plugin_root,
             watched_directories: HashMap::new(),
         };
@@ -1435,9 +1427,6 @@ impl InotifyWatcher {
     }
 
     fn add_watch(&mut self, directory: &Path) -> io::Result<()> {
-        let path = CString::new(directory.as_os_str().as_bytes()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "directory path contains NUL")
-        })?;
         let mask = libc::IN_CREATE
             | libc::IN_CLOSE_WRITE
             | libc::IN_MOVED_TO
@@ -1448,10 +1437,7 @@ impl InotifyWatcher {
             | libc::IN_ONLYDIR
             | libc::IN_DONT_FOLLOW;
         let watch_descriptor =
-            unsafe { libc::inotify_add_watch(self.fd.get_ref().as_raw_fd(), path.as_ptr(), mask) };
-        if watch_descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
+            platform::inotify_add_watch(self.fd.get_ref().as_fd(), directory, mask)?;
         self.watched_directories
             .insert(watch_descriptor, directory.to_path_buf());
         Ok(())
@@ -1513,11 +1499,11 @@ impl InotifyWatcher {
 
     fn rebuild(&mut self) -> io::Result<()> {
         self.discard_pending_events()?;
-        let descriptor = self.fd.get_ref().as_raw_fd();
         for watch_descriptor in self.watched_directories.keys().copied().collect::<Vec<_>>() {
-            let result = unsafe { libc::inotify_rm_watch(descriptor, watch_descriptor) };
-            if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL) {
-                return Err(io::Error::last_os_error());
+            match platform::inotify_remove_watch(self.fd.get_ref().as_fd(), watch_descriptor) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {}
+                Err(error) => return Err(error),
             }
         }
         self.watched_directories.clear();
@@ -1528,24 +1514,12 @@ impl InotifyWatcher {
     fn discard_pending_events(&self) -> io::Result<()> {
         let mut buffer = [0_u8; 64 * 1024];
         loop {
-            let count = unsafe {
-                libc::read(
-                    self.fd.get_ref().as_raw_fd(),
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                )
-            };
-            if count >= 0 {
-                if count == 0 {
-                    return Ok(());
-                }
-                continue;
+            match platform::read_fd(self.fd.get_ref().as_fd(), &mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => return Err(error),
             }
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::WouldBlock {
-                return Ok(());
-            }
-            return Err(error);
         }
     }
 
@@ -1553,64 +1527,9 @@ impl InotifyWatcher {
         let mut buffer = [0_u8; 64 * 1024];
         loop {
             let mut readiness = self.fd.readable().await?;
-            match readiness.try_io(|inner| {
-                let count = unsafe {
-                    libc::read(
-                        inner.get_ref().as_raw_fd(),
-                        buffer.as_mut_ptr().cast(),
-                        buffer.len(),
-                    )
-                };
-                if count < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(count as usize)
-                }
-            }) {
-                Ok(Ok(count)) => {
-                    let header_size = std::mem::size_of::<libc::inotify_event>();
-                    let mut offset = 0;
-                    let mut events = Vec::new();
-                    while offset < count {
-                        if count - offset < header_size {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "truncated inotify event header",
-                            ));
-                        }
-                        let event = unsafe {
-                            std::ptr::read_unaligned(
-                                buffer.as_ptr().add(offset).cast::<libc::inotify_event>(),
-                            )
-                        };
-                        offset += header_size;
-                        let name_length = event.len as usize;
-                        if name_length > count - offset {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "truncated inotify event name",
-                            ));
-                        }
-                        let name = if name_length == 0 {
-                            None
-                        } else {
-                            let bytes = &buffer[offset..offset + name_length];
-                            let name_length = bytes
-                                .iter()
-                                .position(|byte| *byte == 0)
-                                .unwrap_or(bytes.len());
-                            (name_length > 0)
-                                .then(|| PathBuf::from(OsStr::from_bytes(&bytes[..name_length])))
-                        };
-                        offset += event.len as usize;
-                        events.push(InotifyEvent {
-                            watch_descriptor: event.wd,
-                            mask: event.mask,
-                            name,
-                        });
-                    }
-                    return Ok(events);
-                }
+            match readiness.try_io(|inner| platform::read_fd(inner.get_ref().as_fd(), &mut buffer))
+            {
+                Ok(Ok(count)) => return parse_inotify_events(&buffer[..count]),
                 Ok(Err(error)) => return Err(error),
                 Err(_) => continue,
             }
@@ -1670,6 +1589,64 @@ impl InotifyWatcher {
         changed.sort_unstable();
         Ok(changed)
     }
+}
+const INOTIFY_EVENT_HEADER_SIZE: usize =
+    std::mem::size_of::<i32>() + 3 * std::mem::size_of::<u32>();
+
+fn parse_inotify_events(buffer: &[u8]) -> io::Result<Vec<InotifyEvent>> {
+    let mut offset = 0;
+    let mut events = Vec::new();
+    while offset < buffer.len() {
+        let header_end = offset
+            .checked_add(INOTIFY_EVENT_HEADER_SIZE)
+            .filter(|end| *end <= buffer.len())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "truncated inotify event header")
+            })?;
+        let header = &buffer[offset..header_end];
+        let watch_descriptor = i32::from_ne_bytes(
+            header[0..4]
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid inotify wd"))?,
+        );
+        let mask = u32::from_ne_bytes(
+            header[4..8]
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid inotify mask"))?,
+        );
+        let _cookie =
+            u32::from_ne_bytes(header[8..12].try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid inotify cookie")
+            })?);
+        let name_length = usize::try_from(u32::from_ne_bytes(header[12..16].try_into().map_err(
+            |_| io::Error::new(io::ErrorKind::InvalidData, "invalid inotify name length"),
+        )?))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "inotify name length overflow"))?;
+        offset = header_end;
+        let name_end = offset
+            .checked_add(name_length)
+            .filter(|end| *end <= buffer.len())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "truncated inotify event name")
+            })?;
+        let name = if name_length == 0 {
+            None
+        } else {
+            let bytes = &buffer[offset..name_end];
+            let name_length = bytes
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(bytes.len());
+            (name_length > 0).then(|| PathBuf::from(OsStr::from_bytes(&bytes[..name_length])))
+        };
+        offset = name_end;
+        events.push(InotifyEvent {
+            watch_descriptor,
+            mask,
+            name,
+        });
+    }
+    Ok(events)
 }
 
 fn is_managed_plugin_directory(plugin_root: &Path, directory: &Path) -> bool {
@@ -1800,12 +1777,7 @@ async fn live_reload_loop(
     }
 }
 fn process_exit_notification(pid: u32) -> io::Result<AsyncFd<OwnedFd>> {
-    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if descriptor < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
-    AsyncFd::new(descriptor)
+    AsyncFd::new(platform::process_exit_fd(pid)?)
 }
 
 fn socket_filename() -> String {
@@ -1849,7 +1821,7 @@ fn create_socket_directory(user_ids: (u32, u32)) -> Result<PathBuf> {
             fs::create_dir(&child)?;
             fs::set_permissions(&child, fs::Permissions::from_mode(0o700))?;
         }
-        if unsafe { libc::geteuid() } == 0 {
+        if platform::effective_user_ids().0 == 0 {
             std::os::unix::fs::chown(directory.join("user"), Some(user_ids.0), Some(user_ids.1))?;
         }
         Ok(())
@@ -1885,7 +1857,7 @@ async fn launch_worker(
         return Err(WorkerLaunchError::Interrupted);
     }
     if plugin.requires_root {
-        let effective_uid = unsafe { libc::geteuid() };
+        let effective_uid = platform::effective_user_ids().0;
         if effective_uid != 0 {
             return Err(WorkerLaunchError::Failed(format!(
                 "Plugin {} requires root privileges, but the worker launcher is running as UID {effective_uid}",
@@ -2249,15 +2221,11 @@ async fn terminate_and_reap(child: &mut Child, pid: u32) {
 }
 
 fn send_signal(pid: u32, signal: i32) {
-    unsafe {
-        libc::kill(pid as libc::pid_t, signal);
-    }
+    let _ = platform::signal_process(pid, signal);
 }
 
 fn send_group_signal(pid: u32, signal: i32) {
-    unsafe {
-        libc::kill(-(pid as libc::pid_t), signal);
-    }
+    let _ = platform::signal_group(pid, signal);
 }
 
 async fn monitor_worker(
@@ -2416,5 +2384,45 @@ async fn mark_worker_dead(state: &Arc<Mutex<PendingState>>, failure: Option<Stri
     }
     for (_, request) in state.requests.drain() {
         let _ = request.send(Err(WorkerError::Stopped));
+    }
+}
+#[cfg(test)]
+mod inotify_parser_tests {
+    use super::{INOTIFY_EVENT_HEADER_SIZE, parse_inotify_events};
+    use std::path::Path;
+
+    fn event_header(watch_descriptor: i32, mask: u32, name_length: u32) -> Vec<u8> {
+        let mut header = Vec::with_capacity(INOTIFY_EVENT_HEADER_SIZE);
+        header.extend_from_slice(&watch_descriptor.to_ne_bytes());
+        header.extend_from_slice(&mask.to_ne_bytes());
+        header.extend_from_slice(&0_u32.to_ne_bytes());
+        header.extend_from_slice(&name_length.to_ne_bytes());
+        header
+    }
+
+    #[test]
+    fn rejects_truncated_header_and_name() {
+        assert_eq!(
+            parse_inotify_events(&[0; 15]).err().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            parse_inotify_events(&event_header(1, 2, 4))
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn decodes_native_header_and_nul_terminated_name() {
+        let mut bytes = event_header(7, 3, 4);
+        bytes.extend_from_slice(b"abc\0");
+        let events = parse_inotify_events(&bytes).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].watch_descriptor, 7);
+        assert_eq!(events[0].mask, 3);
+        assert_eq!(events[0].name.as_deref(), Some(Path::new("abc")));
     }
 }

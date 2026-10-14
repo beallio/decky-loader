@@ -86,15 +86,17 @@ impl ForkLauncher {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         command.as_std_mut().process_group(0);
-        let parent_pid = unsafe { libc::getpid() };
+        let parent_pid = nix::unistd::Pid::this();
+        // SAFETY: the child-side callback only uses nix wrappers around the
+        // Linux prctl/getppid syscalls and constructs an error if the syscall
+        // fails. Those paths take no locks or access mutable shared state; the
+        // successful startup path does not allocate.
         unsafe {
             command.as_std_mut().pre_exec(move || {
-                let result = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
-                if result != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::getppid() != parent_pid {
-                    return Err(io::Error::from_raw_os_error(libc::ECHILD));
+                nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGTERM)
+                    .map_err(io::Error::from)?;
+                if nix::unistd::Pid::parent() != parent_pid {
+                    return Err(io::Error::from(nix::errno::Errno::ECHILD));
                 }
                 Ok(())
             });
@@ -394,13 +396,9 @@ async fn reap_launcher(
 }
 
 fn send_signal(pid: u32, signal: i32) {
-    unsafe {
-        libc::kill(pid as libc::pid_t, signal);
-    }
+    let _ = crate::platform::signal_process(pid, signal);
 }
 
 fn send_group_signal(pid: u32, signal: i32) {
-    unsafe {
-        libc::kill(-(pid as libc::pid_t), signal);
-    }
+    let _ = crate::platform::signal_group(pid, signal);
 }

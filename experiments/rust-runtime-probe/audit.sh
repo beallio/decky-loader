@@ -36,14 +36,14 @@ check() {
 check 'RustSec vulnerabilities, unmaintained crates, and warnings' \
     cargo audit --file "$DIR/Cargo.lock" --db "$RUSTSEC_ADVISORY_DB" --no-fetch --deny warnings
 check 'Source provenance, wildcard versions, and duplicate versions' \
-    cargo deny --locked --offline --manifest-path "$DIR/Cargo.toml" \
-        check --config "$DIR/deny.toml" sources bans --show-stats
+    cargo deny --locked --offline --manifest-path "$DIR/Cargo.toml" --config "$DIR/deny.toml" \
+        check sources bans --show-stats
 check 'Unused direct dependencies' cargo machete "$DIR"
 
 # License findings remain visible, but are not a gate for this private experiment.
 printf '\nLicense inventory (informational, not a validation gate)\n'
-if ! cargo deny --locked --offline --manifest-path "$DIR/Cargo.toml" \
-    check --config "$DIR/deny.toml" licenses --show-stats; then
+if ! cargo deny --locked --offline --manifest-path "$DIR/Cargo.toml" --config "$DIR/deny.toml" \
+    check licenses --show-stats; then
     printf 'License findings recorded; continuing under the private-test policy.\n'
 fi
 exit "$failed"

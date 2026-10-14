@@ -1744,7 +1744,7 @@ async fn service_active(unit: &str, manager: &str) -> Result<bool, RpcError> {
 
 async fn openrc_command(unit: &str, action: &str) -> Result<Output, RpcError> {
     let mut args = Vec::with_capacity(3);
-    if unsafe { libc::geteuid() } != 0 {
+    if crate::platform::effective_user_ids().0 != 0 {
         args.push("--user".to_owned());
     }
     args.push(unit.to_owned());
@@ -1818,7 +1818,7 @@ async fn close_cef_socket() -> Result<(), RpcError> {
     }
     // The original Linux workaround requires Decky to run as root to inject
     // close(2) into steamwebhelper with gdb.
-    if unsafe { libc::geteuid() } != 0 {
+    if crate::platform::effective_user_ids().0 != 0 {
         eprintln!("Can't close CEF socket because Decky isn't running as root.");
         return Ok(());
     }

@@ -361,6 +361,7 @@ dependencies = [
  "futures-util",
  "libc",
  "mime_guess",
+ "nix",
  "reqwest",
  "serde",
  "serde_json",

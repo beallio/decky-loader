@@ -838,7 +838,7 @@ mod tests {
                 plugin_root,
                 directory.0.clone(),
                 user.clone(),
-                (unsafe { libc::geteuid() }, unsafe { libc::getegid() }),
+                crate::platform::effective_user_ids(),
                 events,
                 shutdown_rx,
             )
