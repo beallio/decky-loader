@@ -2223,7 +2223,7 @@ def main() -> int:
     install.add_argument('--listen', default=DEFAULT_LISTEN, metavar='ADDRESS')
     install.add_argument('--cef-url', default=DEFAULT_CEF_URL, metavar='URL')
     install.add_argument('--inject-frontend', choices=('true', 'false'), default='true')
-    install.add_argument('--worker-mode', choices=('exec', 'fork'), default='exec', help='separate workers by default; fork is an explicit opt-in')
+    install.add_argument('--worker-mode', choices=('exec', 'fork'), default='fork', help='forked plugin processes by default; exec starts each Python worker independently')
     rollback = subparsers.add_parser('rollback', help='restore the previous recoverable binary, unit, and activation state')
     _add_common(rollback)
     status = subparsers.add_parser('status', help='report selected service and recoverable installer state')

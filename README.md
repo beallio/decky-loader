@@ -133,9 +133,9 @@ The installer keeps the selected address and port when an upstream update replac
 
 Worker builds can use one executable or a shared runtime folder. Set `DECKY_WORKER_ONEDIR=1` when building `backend/worker.spec` for the shared-folder build. Keep the worker executable and its `_internal` folder together; bundle setup checks both.
 
-The installer defaults to a separate Python worker process for each plugin (`exec`). Shared-launcher mode requires `--worker-mode fork`. It still gives each plugin its own process, but those processes inherit the launcher's loaded Python and native-library state. If that launcher fails, the backend exits so the service can restart it and its plugins. Both modes clean up their owned worker process groups on failure and shutdown.
+The Rust runtime and installer default to forked Python workers (`fork`). A dedicated Python parent loads the common SDK once, then creates a separate child process for each plugin. Plugin code runs in the children, not in one shared interpreter. Use `--worker-mode exec` to start Python independently for each plugin instead. If the fork parent fails, the backend exits so the service can restart it and its plugins. Both modes clean up their owned worker process groups on failure and shutdown.
 
-Separate workers start Python independently and can use more memory than the current backend's forked workers. Forked workers can share Python state that the parent loaded before startup. Rust does not remove the Python runtime from Python plugins.
+`exec` workers start Python independently and can use more memory than forked workers. Forked workers can share Python state that the parent loaded before startup. Rust does not remove the Python runtime from Python plugins.
 
 The VM checks cover the installed plugins and the public plugin APIs, not every third-party plugin. Plugins with unusual Python libraries, process-name checks, or direct access to private loader internals need separate checks. Shared-launcher mode also needs checks for native-library fork safety.
 
