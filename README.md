@@ -129,9 +129,13 @@ The private Rust test build keeps Python plugins and the existing Decky interfac
 
 The test bundle uses the `v3.2.10` baseline. Setup checks the Python plugin support code and frontend against that version. The packaged Python worker must report the same version.
 
+The installer keeps the selected address and port when an upstream update replaces the backend and service file. These settings take precedence over conflicting service environment values. Other environment settings and user files stay in place. A failed activation restores the previous backend and service file.
+
 Worker builds can use one executable or a shared runtime folder. Set `DECKY_WORKER_ONEDIR=1` when building `backend/worker.spec` for the shared-folder build. Keep the worker executable and its `_internal` folder together; bundle setup checks both.
 
 The installer defaults to a separate Python worker process for each plugin (`exec`). Shared-launcher mode requires `--worker-mode fork`. It still gives each plugin its own process, but those processes inherit the launcher's loaded Python and native-library state. If that launcher fails, the backend exits so the service can restart it and its plugins. Both modes clean up their owned worker process groups on failure and shutdown.
+
+Separate workers start Python independently and can use more memory than the current backend's forked workers. Forked workers can share Python state that the parent loaded before startup. Rust does not remove the Python runtime from Python plugins.
 
 The VM checks cover the installed plugins and the public plugin APIs, not every third-party plugin. Plugins with unusual Python libraries, process-name checks, or direct access to private loader internals need separate checks. Shared-launcher mode also needs checks for native-library fork safety.
 

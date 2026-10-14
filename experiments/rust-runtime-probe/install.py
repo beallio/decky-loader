@@ -754,6 +754,19 @@ def _environment_keys(lines: list[str]) -> set[str]:
     return keys
 
 
+def _listener_configuration(environment: list[str], listen: str) -> tuple[list[str], list[str]]:
+    host, port = _listen_endpoint(listen)
+    assignments = [f'SERVER_HOST={host}', f'SERVER_PORT={port}']
+    environment = [
+        line for line in environment
+        if not line.startswith(('Environment=SERVER_HOST=', 'Environment=SERVER_PORT='))
+    ]
+    environment.extend(f'Environment={assignment}' for assignment in assignments)
+    # EnvironmentFile and drop-ins can override Environment. Set the selected
+    # endpoint immediately before exec, matching Rust's explicit --listen.
+    return environment, ['/usr/bin/env', *assignments]
+
+
 def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_name: str, listen: str, cef_url: str, inject_frontend: bool, worker_mode: str) -> bytes:
     environment = _service_environment(paths)
     present = _environment_keys(environment)
@@ -765,7 +778,9 @@ def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_na
     for key, value in defaults.items():
         if key not in present:
             environment.append(f'Environment={key}={value}')
+    environment, command_prefix = _listener_configuration(environment, listen)
     arguments = [
+        *command_prefix,
         str(paths['binary']),
         '--worker', str(runtime / WORKER_EXECUTABLE),
         '--worker-mode', worker_mode,
@@ -825,7 +840,7 @@ def _stage_bytes(data: bytes, directory: Path, prefix: str, mode: int = 0o644) -
         raise
 
 
-def _validate_service_template(source: Path, paths: dict[str, Path]) -> bytes:
+def _validate_service_template(source: Path, paths: dict[str, Path], *, prepare: bool = True) -> bytes:
     info = _lstat_regular_or_absent(source)
     if info is None:
         _fail(f'service template is missing: {source}')
@@ -880,11 +895,15 @@ def _validate_service_template(source: Path, paths: dict[str, Path]) -> bytes:
     for _, value, _ in sections['Install']:
         if value != 'multi-user.target':
             _fail('service template may only install the selected service into multi-user.target')
+    if not prepare:
+        # The queued helper must validate the original upstream template, not
+        # revalidate a unit already modified with this install's environment.
+        return raw
     previous_environment = _service_environment(paths)
     existing_lines = [line for key, _, line in sections['Service'] if key == 'Environment']
-    have_keys = _environment_keys(existing_lines)
     preserved = [line for line in previous_environment if line.startswith(('Environment=', 'EnvironmentFile='))]
     merged = existing_lines + [line for line in preserved if line not in existing_lines]
+    merged, command_prefix = _listener_configuration(merged, _configured_listen(paths))
     section_lines: list[str] = []
     emitted_environment = False
     for section in ('Unit', 'Service', 'Install'):
@@ -894,6 +913,9 @@ def _validate_service_template(source: Path, paths: dict[str, Path]) -> bytes:
                 if not emitted_environment:
                     section_lines.extend(merged)
                     emitted_environment = True
+                continue
+            if section == 'Service' and key == 'ExecStart':
+                section_lines.append('ExecStart=' + ' '.join(_systemd_quote(argument) for argument in [*command_prefix, *command]))
                 continue
             section_lines.append(line)
         if section == 'Service' and not emitted_environment:
@@ -1913,7 +1935,7 @@ def _prepare_activation_handoff(args: argparse.Namespace, paths: dict[str, Path]
         if _lstat_regular_or_absent(service_source) is None:
             _fail(f'service template is missing: {service_source}')
         service_source = service_source.resolve(strict=True)
-        template_data = _validate_service_template(service_source, paths)
+        template_data = _validate_service_template(service_source, paths, prepare=False)
     _cleanup_completed_handoffs(paths)
     _assert_no_pending_handoff(paths)
     request_id = _new_transaction_id()
