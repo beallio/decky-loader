@@ -85,7 +85,8 @@ pub struct PluginRegistry {
     worker_executable: PathBuf,
     worker_mode: WorkerMode,
     worker_bootstrap: WorkerBootstrap,
-    fork_launcher: Option<Arc<ForkLauncher>>,
+    fork_launcher: Mutex<Option<Arc<ForkLauncher>>>,
+    launcher_failure: Option<(watch::Sender<bool>, watch::Receiver<bool>)>,
     plugin_root: PathBuf,
     loader_settings_path: PathBuf,
     homebrew: PathBuf,
@@ -315,55 +316,39 @@ impl PluginRegistry {
         let disabled = read_disabled_plugins(&loader_settings_path);
         let metadata = discover_plugins(&plugin_root, &disabled)?;
         let socket_directory = create_socket_directory(user_ids)?;
-        let fork_launcher = if worker_mode == WorkerMode::Fork {
-            match ForkLauncher::spawn(
-                &worker_executable,
-                worker_bootstrap.as_str(),
-                &plugin_root,
-                &homebrew,
-                &user,
-                &mut shutdown,
-                LauncherEnvironment {
-                    auth_token: &auth_token,
-                    server_host: &server_host,
-                    server_port,
-                    chown_plugin_path,
-                },
-            )
-            .await
-            {
-                Ok(launcher) => Some(Arc::new(launcher)),
-                Err(LauncherStartError::Failed(error)) => {
-                    let _ = fs::remove_dir_all(&socket_directory);
-                    return Err(anyhow::anyhow!(error));
-                }
-                Err(LauncherStartError::Interrupted) => {
-                    let _ = fs::remove_dir_all(&socket_directory);
-                    return Err(anyhow::anyhow!("Plugin startup interrupted by shutdown"));
-                }
-            }
-        } else {
-            None
-        };
-        let launch_config = WorkerLaunchConfig {
-            worker_executable: &worker_executable,
+        let launcher_failure = (worker_mode == WorkerMode::Fork).then(|| watch::channel(false));
+        let mut registry = Self {
+            plugins: tokio::sync::RwLock::new(HashMap::with_capacity(metadata.len())),
+            mutations: Mutex::new(()),
+            worker_executable,
             worker_mode,
             worker_bootstrap,
-            fork_launcher: fork_launcher.as_ref(),
-            plugin_root: &plugin_root,
-            homebrew: &homebrew,
-            user: &user,
-            auth_token: &auth_token,
-            server_host: &server_host,
+            fork_launcher: Mutex::new(None),
+            launcher_failure,
+            plugin_root,
+            loader_settings_path,
+            homebrew,
+            user,
+            user_ids,
+            auth_token,
+            server_host,
             server_port,
             chown_plugin_path,
-            socket_directory: &socket_directory,
+            socket_directory,
+            events,
+            shutdown: shutdown.clone(),
+            shutting_down: AtomicBool::new(false),
+            live_reload_task: Mutex::new(None),
+            live_reload_paused: AtomicUsize::new(0),
+            live_reload_resync: AtomicBool::new(false),
+            live_reload_notify: Arc::new(Notify::new()),
+            active_install_transactions: AtomicUsize::new(0),
+            install_transactions_changed: Notify::new(),
         };
-        let mut plugins = HashMap::with_capacity(metadata.len());
 
         for plugin in metadata.into_values() {
             if shutdown_requested(&shutdown) {
-                cleanup_plugins(&plugins, &socket_directory, fork_launcher.as_ref()).await;
+                registry.shutdown().await;
                 return Err(anyhow::anyhow!("Plugin startup interrupted by shutdown"));
             }
 
@@ -378,69 +363,71 @@ impl PluginRegistry {
 
             if !entry.metadata.passive && !entry.disabled.load(Ordering::Relaxed) {
                 let mut runtime = entry.runtime.lock().await;
-                let plugin_directory = plugin_root.join(&entry.metadata.directory);
+                let plugin_directory = registry.plugin_root.join(&entry.metadata.directory);
                 match set_plugin_permissions_inner(
                     &plugin_directory,
                     entry.metadata.requires_root,
-                    user_ids,
-                    chown_plugin_path,
+                    registry.user_ids,
+                    registry.chown_plugin_path,
                 ) {
                     Err(error) => runtime.start_error = Some(error.to_string()),
-                    Ok(()) => match launch_worker(
-                        &launch_config,
-                        &entry.metadata,
-                        events.clone(),
-                        &mut shutdown,
-                    )
-                    .await
-                    {
-                        Ok(worker) => runtime.worker = Some(worker),
-                        Err(WorkerLaunchError::Failed(error)) => runtime.start_error = Some(error),
-                        Err(WorkerLaunchError::Interrupted) => {
-                            drop(runtime);
-                            cleanup_plugins(&plugins, &socket_directory, fork_launcher.as_ref())
-                                .await;
-                            return Err(anyhow::anyhow!("Plugin startup interrupted by shutdown"));
+                    Ok(()) => {
+                        let fork_launcher = if registry.worker_mode == WorkerMode::Fork {
+                            match registry.ensure_fork_launcher(&mut shutdown).await {
+                                Ok(launcher) => Some(launcher),
+                                Err(WorkerError::Error(error)) => {
+                                    drop(runtime);
+                                    registry.shutdown().await;
+                                    return Err(anyhow::anyhow!(error));
+                                }
+                                Err(WorkerError::Stopped) => {
+                                    drop(runtime);
+                                    registry.shutdown().await;
+                                    return Err(anyhow::anyhow!(
+                                        "Plugin startup interrupted by shutdown"
+                                    ));
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let launch_config = registry.launch_config(fork_launcher.as_ref());
+                        match launch_worker(
+                            &launch_config,
+                            &entry.metadata,
+                            registry.events.clone(),
+                            &mut shutdown,
+                        )
+                        .await
+                        {
+                            Ok(worker) => runtime.worker = Some(worker),
+                            Err(WorkerLaunchError::Failed(error)) => {
+                                runtime.start_error = Some(error)
+                            }
+                            Err(WorkerLaunchError::Interrupted) => {
+                                drop(runtime);
+                                registry.shutdown().await;
+                                return Err(anyhow::anyhow!(
+                                    "Plugin startup interrupted by shutdown"
+                                ));
+                            }
                         }
-                    },
+                    }
                 }
             }
 
-            plugins.insert(entry.metadata.name.clone(), entry);
+            registry
+                .plugins
+                .get_mut()
+                .insert(entry.metadata.name.clone(), entry);
         }
 
         if shutdown_requested(&shutdown) {
-            cleanup_plugins(&plugins, &socket_directory, fork_launcher.as_ref()).await;
+            registry.shutdown().await;
             return Err(anyhow::anyhow!("Plugin startup interrupted by shutdown"));
         }
 
-        Ok(Self {
-            plugins: tokio::sync::RwLock::new(plugins),
-            mutations: Mutex::new(()),
-            worker_executable,
-            worker_mode,
-            worker_bootstrap,
-            fork_launcher,
-            plugin_root,
-            loader_settings_path,
-            homebrew,
-            user,
-            user_ids,
-            auth_token,
-            server_host,
-            server_port,
-            chown_plugin_path,
-            socket_directory,
-            events,
-            shutdown,
-            shutting_down: AtomicBool::new(false),
-            live_reload_task: Mutex::new(None),
-            live_reload_paused: AtomicUsize::new(0),
-            live_reload_resync: AtomicBool::new(false),
-            live_reload_notify: Arc::new(Notify::new()),
-            active_install_transactions: AtomicUsize::new(0),
-            install_transactions_changed: Notify::new(),
-        })
+        Ok(registry)
     }
 
     pub fn pause_live_reload(&self) -> LiveReloadPause<'_> {
@@ -457,9 +444,9 @@ impl PluginRegistry {
     }
 
     pub fn essential_failure(&self) -> Option<watch::Receiver<bool>> {
-        self.fork_launcher
+        self.launcher_failure
             .as_ref()
-            .map(|launcher| launcher.failure())
+            .map(|(_, receiver)| receiver.clone())
     }
 
     pub fn emit(&self, event: &str, args: Vec<Value>) {
@@ -723,7 +710,12 @@ impl PluginRegistry {
         if metadata.passive || metadata.disabled {
             return Ok(None);
         }
-        let config = self.launch_config();
+        let fork_launcher = if self.worker_mode == WorkerMode::Fork {
+            Some(self.ensure_fork_launcher(shutdown).await?)
+        } else {
+            None
+        };
+        let config = self.launch_config(fork_launcher.as_ref());
         match launch_worker(&config, metadata, self.events.clone(), shutdown).await {
             Ok(worker) => Ok(Some(worker)),
             Err(WorkerLaunchError::Failed(error)) => Err(WorkerError::Error(error)),
@@ -1006,12 +998,8 @@ impl PluginRegistry {
         }
         let _mutation = self.mutations.lock().await;
         let plugins = self.plugins.read().await.clone();
-        cleanup_plugins(
-            &plugins,
-            &self.socket_directory,
-            self.fork_launcher.as_ref(),
-        )
-        .await;
+        let fork_launcher = self.fork_launcher.lock().await.clone();
+        cleanup_plugins(&plugins, &self.socket_directory, fork_launcher.as_ref()).await;
     }
 
     pub fn set_plugin_permissions(
@@ -1045,12 +1033,60 @@ impl PluginRegistry {
         Ok(())
     }
 
-    fn launch_config(&self) -> WorkerLaunchConfig<'_> {
+    async fn ensure_fork_launcher(
+        &self,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> std::result::Result<Arc<ForkLauncher>, WorkerError> {
+        if self.shutting_down.load(Ordering::Acquire) || shutdown_requested(shutdown) {
+            return Err(WorkerError::Stopped);
+        }
+        let mut current = self.fork_launcher.lock().await;
+        if let Some(launcher) = current.as_ref() {
+            return Ok(Arc::clone(launcher));
+        }
+        let launcher = ForkLauncher::spawn(
+            &self.worker_executable,
+            self.worker_bootstrap.as_str(),
+            &self.plugin_root,
+            &self.homebrew,
+            &self.user,
+            shutdown,
+            LauncherEnvironment {
+                auth_token: &self.auth_token,
+                server_host: &self.server_host,
+                server_port: self.server_port,
+                chown_plugin_path: self.chown_plugin_path,
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            LauncherStartError::Failed(error) => WorkerError::Error(error),
+            LauncherStartError::Interrupted => WorkerError::Stopped,
+        })?;
+        let launcher = Arc::new(launcher);
+        if self.shutting_down.load(Ordering::Acquire) || shutdown_requested(shutdown) {
+            launcher.shutdown().await;
+            return Err(WorkerError::Stopped);
+        }
+        let failure = &self
+            .launcher_failure
+            .as_ref()
+            .expect("fork failure watch")
+            .0;
+        monitor_launcher_failure(launcher.failure(), failure.clone());
+        *current = Some(Arc::clone(&launcher));
+        Ok(launcher)
+    }
+
+    fn launch_config<'a>(
+        &'a self,
+        fork_launcher: Option<&'a Arc<ForkLauncher>>,
+    ) -> WorkerLaunchConfig<'a> {
         WorkerLaunchConfig {
             worker_executable: &self.worker_executable,
             worker_mode: self.worker_mode,
             worker_bootstrap: self.worker_bootstrap,
-            fork_launcher: self.fork_launcher.as_ref(),
+            fork_launcher,
             plugin_root: &self.plugin_root,
             homebrew: &self.homebrew,
             user: &self.user,
@@ -1061,6 +1097,23 @@ impl PluginRegistry {
             socket_directory: &self.socket_directory,
         }
     }
+}
+
+fn monitor_launcher_failure(
+    mut launcher_failure: watch::Receiver<bool>,
+    registry_failure: watch::Sender<bool>,
+) {
+    drop(tokio::spawn(async move {
+        loop {
+            if *launcher_failure.borrow() {
+                registry_failure.send_replace(true);
+                return;
+            }
+            if launcher_failure.changed().await.is_err() {
+                return;
+            }
+        }
+    }));
 }
 
 fn shutdown_requested(shutdown: &watch::Receiver<bool>) -> bool {
