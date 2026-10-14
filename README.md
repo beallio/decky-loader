@@ -129,7 +129,7 @@ The private Rust test build keeps Python plugins and the existing Decky interfac
 
 The test bundle uses the `v3.2.10` baseline. Setup checks the Python plugin support code and frontend against that version. The packaged Python worker must report the same version.
 
-The installer keeps the selected address and port when an upstream update replaces the backend and service file. These settings take precedence over conflicting service environment values. Other environment settings and user files stay in place. A failed activation restores the previous backend and service file. For a running installation, rollback waits for the restored backend to own its listener and answer authenticated requests.
+The installer keeps the selected address and port when an upstream update replaces the backend and service file. These settings take precedence over conflicting service environment values. Other environment settings and user files stay in place, including settings stored together on one service configuration line. A failed activation restores the previous backend and service file. For a running installation, rollback waits for the restored backend to own its listener and answer authenticated requests.
 
 Worker builds can use one executable or a shared runtime folder. Set `DECKY_WORKER_ONEDIR=1` when building `backend/worker.spec` for the shared-folder build. Keep the worker executable and its `_internal` folder together; bundle setup checks both.
 

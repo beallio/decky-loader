@@ -757,10 +757,6 @@ def _environment_keys(lines: list[str]) -> set[str]:
 def _listener_configuration(environment: list[str], listen: str) -> tuple[list[str], list[str]]:
     host, port = _listen_endpoint(listen)
     assignments = [f'SERVER_HOST={host}', f'SERVER_PORT={port}']
-    environment = [
-        line for line in environment
-        if not line.startswith(('Environment=SERVER_HOST=', 'Environment=SERVER_PORT='))
-    ]
     environment.extend(f'Environment={assignment}' for assignment in assignments)
     # EnvironmentFile and drop-ins can override Environment. Set the selected
     # endpoint immediately before exec, matching Rust's explicit --listen.
