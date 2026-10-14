@@ -106,6 +106,8 @@ There is no complete plugin development documentation yet. However a good starti
 
 Please consult [the wiki page regarding development](https://wiki.deckbrew.xyz/en/loader-dev/development) for more information on installing development versions of Decky Loader. You can also install the Steam Deck UI on a Windows or Linux computer for testing by following [this YouTube guide](https://youtu.be/1IAbZte8e7E?t=112).
 
+For Rust work in OMP, install `rust-analyzer` and the standard-library source for the pinned Rust 1.98.1 toolchain. The project configuration in `.omp/lsp.json` selects the runtime in `experiments/rust-runtime-probe` when OMP starts at the repository root. Reload the LSP configuration after installation. Code navigation and native diagnostics are enabled; save-triggered Cargo checks are disabled, so run the normal build and checks before submitting changes.
+
 1. Clone the repository using the latest commit to main before starting your PR.
 1. In your clone of the repository, run these commands.
    ```bash

@@ -1,0 +1,18 @@
+{
+  "servers": {
+    "rust-analyzer": {
+      "command": "rust-analyzer",
+      "rootMarkers": ["experiments/rust-runtime-probe/Cargo.toml"],
+      "initOptions": {
+        "linkedProjects": ["experiments/rust-runtime-probe/Cargo.toml"],
+        "checkOnSave": false
+      },
+      "settings": {
+        "rust-analyzer": {
+          "linkedProjects": ["experiments/rust-runtime-probe/Cargo.toml"],
+          "checkOnSave": false
+        }
+      }
+    }
+  }
+}
