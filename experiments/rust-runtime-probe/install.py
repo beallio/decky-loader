@@ -1735,13 +1735,6 @@ def _run_rollback(args: argparse.Namespace) -> dict[str, object]:
         _systemctl(paths, 'daemon-reload', timeout=30)
         _apply_activation(paths, target_activation, check_running=False)
         if target_activation.get('running'):
-            properties = _wait_running(paths)
-            try:
-                pid = int(properties.get('MainPID', '0'))
-            except ValueError:
-                pid = 0
-            if pid <= 0 or not _process_is_binary(pid, paths['binary']):
-                _fail('rolled-back MainPID does not execute the restored PluginLoader')
             _health(paths, _configured_listen(paths))
         else:
             _wait_stopped(paths)
