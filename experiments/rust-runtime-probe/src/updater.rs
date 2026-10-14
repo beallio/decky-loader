@@ -1,8 +1,9 @@
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::{Component, Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::Duration,
@@ -25,7 +26,8 @@ use crate::backend::{Backend, RpcError, exact, string};
 const INITIAL_CHECK_DELAY: Duration = Duration::from_secs(30);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const FALLBACK_DOWNLOAD_SIZE: u64 = 25 * 1024 * 1024;
-const LINUX_EXECUTABLE: &str = "PluginLoader";
+const RUST_BUNDLE_ASSET: &str = "decky-rust-runtime-linux-x86_64.zip";
+const RUST_TESTING_ARTIFACT: &str = "decky-rust-runtime-linux-x86_64";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 
 #[derive(Default)]
@@ -217,52 +219,20 @@ impl Updater {
             .and_then(Value::as_str)
             .filter(|tag| !tag.is_empty())
             .ok_or_else(|| RpcError::failure("selected release has no tag_name"))?;
-        let asset = remote
-            .get("assets")
-            .and_then(Value::as_array)
-            .and_then(|assets| {
-                assets.iter().find(|asset| {
-                    asset.get("name").and_then(Value::as_str) == Some(LINUX_EXECUTABLE)
-                })
-            })
-            .ok_or_else(|| RpcError::failure(format!("release has no {LINUX_EXECUTABLE} asset")))?;
+        let asset = rust_bundle_asset(&remote).ok_or_else(|| {
+            RpcError::failure(format!(
+                "release has no {RUST_BUNDLE_ASSET} Rust bundle asset"
+            ))
+        })?;
         let download_url = asset
             .get("browser_download_url")
             .and_then(Value::as_str)
             .filter(|url| !url.is_empty())
-            .ok_or_else(|| RpcError::failure("release executable asset has no download URL"))?;
+            .ok_or_else(|| RpcError::failure("Rust bundle asset has no download URL"))?;
         let size = asset.get("size").and_then(Value::as_u64);
-        let branch = self.selected_branch(backend).await?;
-        let service_template = if backend.config.keep_systemd_service {
-            None
-        } else {
-            Some(self.fetch_service_template(backend, branch).await?)
-        };
-        self.download_and_handoff_release(backend, download_url, version, size, service_template)
+        self.download_bundle_and_handoff(backend, download_url, version, size)
             .await?;
         Ok(Value::Null)
-    }
-
-    async fn fetch_service_template(
-        &self,
-        backend: &Backend,
-        branch: i64,
-    ) -> Result<String, RpcError> {
-        let template_url = if branch == 0 {
-            &backend.config.service_release_url
-        } else {
-            &backend.config.service_prerelease_url
-        };
-        let url = Url::parse(template_url)
-            .map_err(|error| RpcError::failure(format!("invalid service template URL: {error}")))?;
-        let response = backend.client.get(url).send().await.map_err(|error| {
-            RpcError::failure(format!("service template request failed: {error}"))
-        })?;
-        let response = checked_response(response, "service template request").await?;
-        let template = response.text().await.map_err(|error| {
-            RpcError::failure(format!("reading service template failed: {error}"))
-        })?;
-        Ok(template.replace("${HOMEBREW_FOLDER}", &backend.homebrew.to_string_lossy()))
     }
 
     async fn get_testing_versions(&self, backend: &Backend) -> Result<Value, RpcError> {
@@ -348,19 +318,20 @@ impl Updater {
                 "Workflow run has no downloadable artifacts.",
             ));
         }
-        let artifact_id = artifacts
+        let artifact = artifacts
             .get("artifacts")
             .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .and_then(|artifact| artifact.get("id"))
+            .and_then(|items| rust_testing_artifact(items))
+            .ok_or_else(|| {
+                RpcError::failure(format!(
+                    "Workflow run has no {RUST_TESTING_ARTIFACT} Rust bundle artifact."
+                ))
+            })?;
+        let artifact_id = artifact
+            .get("id")
             .and_then(Value::as_u64)
-            .ok_or_else(|| RpcError::failure("GitHub workflow artifact has no valid id"))?;
-        let artifact_size = artifacts
-            .get("artifacts")
-            .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .and_then(|artifact| artifact.get("size_in_bytes"))
-            .and_then(Value::as_u64);
+            .ok_or_else(|| RpcError::failure("Rust testing artifact has no valid id"))?;
+        let artifact_size = artifact.get("size_in_bytes").and_then(Value::as_u64);
 
         // Keep the original anonymous artifact download route rather than GitHub's auth-only ZIP API.
         let repository = backend.config.release_repository.trim_matches('/');
@@ -368,28 +339,17 @@ impl Updater {
             "{}/{repository}/actions/artifacts/{artifact_id}.zip",
             backend.config.testing_download_url.trim_end_matches('/')
         );
-        self.download_zip_and_handoff(backend, &archive_url, &format!("PR-{pr_id}"), artifact_size)
-            .await?;
+        self.download_bundle_and_handoff(
+            backend,
+            &archive_url,
+            &format!("PR-{pr_id}"),
+            artifact_size,
+        )
+        .await?;
         Ok(Value::Null)
     }
 
-    async fn download_and_handoff_release(
-        &self,
-        backend: &Backend,
-        download_url: &str,
-        version: &str,
-        size: Option<u64>,
-        service_template: Option<String>,
-    ) -> Result<(), RpcError> {
-        let mut temporary = UpdateFiles::new(backend).await?;
-        let binary = temporary.reserve("binary").await?;
-        download_to_file(backend, download_url, &binary, size).await?;
-        set_executable(&binary).await?;
-        self.handoff_activation(backend, &mut temporary, &binary, version, service_template)
-            .await
-    }
-
-    async fn download_zip_and_handoff(
+    async fn download_bundle_and_handoff(
         &self,
         backend: &Backend,
         download_url: &str,
@@ -399,33 +359,12 @@ impl Updater {
         let mut temporary = UpdateFiles::new(backend).await?;
         let archive = temporary.reserve("zip").await?;
         download_to_file(backend, download_url, &archive, size).await?;
-        let binary = temporary.reserve("binary").await?;
-        extract_linux_executable(archive.clone(), binary.clone()).await?;
+        let bundle = temporary.reserve_directory("bundle").await?;
+        extract_bundle_archive(archive.clone(), bundle.clone()).await?;
         tokio::fs::remove_file(&archive)
             .await
-            .map_err(|error| io_failure("removing extracted testing artifact", error))?;
-        self.handoff_activation(backend, &mut temporary, &binary, version, None)
-            .await
-    }
-
-    async fn handoff_activation(
-        &self,
-        backend: &Backend,
-        temporary: &mut UpdateFiles,
-        binary: &Path,
-        version: &str,
-        service_template: Option<String>,
-    ) -> Result<(), RpcError> {
-        let service_file = if let Some(template) = service_template {
-            let path = temporary.reserve("service").await?;
-            tokio::fs::write(&path, template)
-                .await
-                .map_err(|error| io_failure("writing staged service template", error))?;
-            Some(path)
-        } else {
-            None
-        };
-        queue_activation(backend, binary, version, service_file.as_deref()).await
+            .map_err(|error| io_failure("removing downloaded bundle archive", error))?;
+        queue_install_bundle(backend, &bundle, version).await
     }
 }
 
@@ -442,6 +381,22 @@ async fn wait_or_stop(duration: Duration, stopped: &mut oneshot::Receiver<()>) -
     }
 }
 
+fn rust_bundle_asset(release: &Value) -> Option<&Value> {
+    release.get("assets")?.as_array()?.iter().find(|asset| {
+        asset.get("name").and_then(Value::as_str) == Some(RUST_BUNDLE_ASSET)
+            && asset
+                .get("browser_download_url")
+                .and_then(Value::as_str)
+                .is_some_and(|url| !url.is_empty())
+    })
+}
+
+fn rust_testing_artifact(artifacts: &[Value]) -> Option<&Value> {
+    artifacts.iter().find(|artifact| {
+        artifact.get("name").and_then(Value::as_str) == Some(RUST_TESTING_ARTIFACT)
+    })
+}
+
 fn filter_releases(releases: Vec<Value>, branch: i64) -> Result<Vec<Value>, RpcError> {
     if branch != 0 && branch != 1 {
         return Err(RpcError::invalid("no valid release branch found"));
@@ -452,7 +407,7 @@ fn filter_releases(releases: Vec<Value>, branch: i64) -> Result<Vec<Value>, RpcE
             let Some(tag) = release.get("tag_name").and_then(Value::as_str) else {
                 return false;
             };
-            if !tag.starts_with('v') {
+            if !tag.starts_with('v') || rust_bundle_asset(release).is_none() {
                 return false;
             }
             branch == 1
@@ -514,6 +469,17 @@ impl UpdateFiles {
         tokio::fs::create_dir_all(&directory)
             .await
             .map_err(|error| io_failure("creating updater staging directory", error))?;
+        let metadata = tokio::fs::symlink_metadata(&directory)
+            .await
+            .map_err(|error| io_failure("inspecting updater staging directory", error))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != 0 {
+            return Err(RpcError::failure(
+                "updater staging directory must be a root-owned real directory",
+            ));
+        }
+        tokio::fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|error| io_failure("securing updater staging directory", error))?;
         Ok(Self {
             directory,
             paths: Vec::new(),
@@ -544,12 +510,44 @@ impl UpdateFiles {
             "could not reserve a unique updater staging file",
         ))
     }
+    async fn reserve_directory(&mut self, suffix: &str) -> Result<PathBuf, RpcError> {
+        for _ in 0..4 {
+            let path = self
+                .directory
+                .join(format!("decky-update-{}.{}", Uuid::new_v4(), suffix));
+            match tokio::fs::create_dir(&path).await {
+                Ok(()) => {
+                    if let Err(error) =
+                        tokio::fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).await
+                    {
+                        let _ = tokio::fs::remove_dir(&path).await;
+                        return Err(io_failure("securing staged bundle directory", error));
+                    }
+                    self.paths.push(path.clone());
+                    return Ok(path);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(io_failure("creating updater staging directory", error)),
+            }
+        }
+        Err(RpcError::failure(
+            "could not reserve a unique updater staging directory",
+        ))
+    }
 }
 
 impl Drop for UpdateFiles {
     fn drop(&mut self) {
         for path in &self.paths {
-            let _ = fs::remove_file(path);
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_dir() => {
+                    let _ = fs::remove_dir_all(path);
+                }
+                Ok(_) => {
+                    let _ = fs::remove_file(path);
+                }
+                Err(_) => {}
+            }
         }
     }
 }
@@ -614,80 +612,130 @@ async fn download_to_file(
     Ok(())
 }
 
-async fn set_executable(path: &Path) -> Result<(), RpcError> {
-    tokio::fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .await
-        .map_err(|error| io_failure("setting downloaded executable permissions", error))
-}
-
-async fn extract_linux_executable(archive: PathBuf, binary: PathBuf) -> Result<(), RpcError> {
+async fn extract_bundle_archive(archive: PathBuf, bundle: PathBuf) -> Result<(), RpcError> {
     tokio::task::spawn_blocking(move || -> Result<(), String> {
+        if !fs::metadata(&bundle).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err("bundle staging path is not a directory".into());
+        }
         let file = File::open(&archive).map_err(|error| error.to_string())?;
         let mut zip = ZipArchive::new(file).map_err(|error| error.to_string())?;
-        let mut executable = zip
-            .by_name(LINUX_EXECUTABLE)
-            .map_err(|error| format!("testing artifact has no {LINUX_EXECUTABLE}: {error}"))?;
-        if !executable.is_file() {
-            return Err(format!(
-                "testing artifact member {LINUX_EXECUTABLE} is not a file"
-            ));
+        let mut members = HashSet::new();
+        for index in 0..zip.len() {
+            let mut member = zip.by_index(index).map_err(|error| error.to_string())?;
+            let name = member.name().map_err(|error| error.to_string())?;
+            let relative = member
+                .enclosed_name()
+                .ok_or_else(|| format!("bundle archive contains an unsafe path: {name}"))?;
+            if relative.as_os_str().is_empty()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return Err(format!("bundle archive contains an unsafe path: {}", name));
+            }
+            if !members.insert(relative.clone()) {
+                return Err(format!(
+                    "bundle archive contains a duplicate member: {}",
+                    name
+                ));
+            }
+            let mode = member
+                .unix_mode()
+                .unwrap_or(if member.is_dir() { 0o755 } else { 0o644 });
+            let file_type = mode & 0o170000;
+            if mode & 0o7022 != 0 {
+                return Err(format!(
+                    "bundle archive member has unsafe permissions: {}",
+                    name
+                ));
+            }
+            let target = bundle.join(&relative);
+            if member.is_dir() {
+                if file_type != 0 && file_type != 0o040000 {
+                    return Err(format!(
+                        "bundle archive directory has an invalid type: {}",
+                        name
+                    ));
+                }
+                fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
+                    .map_err(|error| error.to_string())?;
+            } else {
+                if file_type != 0 && file_type != 0o100000 {
+                    return Err(format!(
+                        "bundle archive member is not a regular file: {}",
+                        name
+                    ));
+                }
+                let parent = target
+                    .parent()
+                    .ok_or_else(|| format!("bundle archive member has no parent: {name}"))?;
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)
+                    .map_err(|error| error.to_string())?;
+                io::copy(&mut member, &mut output).map_err(|error| error.to_string())?;
+                output.flush().map_err(|error| error.to_string())?;
+                output.sync_all().map_err(|error| error.to_string())?;
+                fs::set_permissions(&target, fs::Permissions::from_mode(mode & 0o777))
+                    .map_err(|error| error.to_string())?;
+            }
         }
-        let mut output = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&binary)
-            .map_err(|error| error.to_string())?;
-        io::copy(&mut executable, &mut output).map_err(|error| error.to_string())?;
-        output.flush().map_err(|error| error.to_string())?;
-        output.sync_all().map_err(|error| error.to_string())?;
-        if fs::metadata(&binary)
-            .map_err(|error| error.to_string())?
-            .len()
-            == 0
-        {
-            return Err(format!(
-                "testing artifact member {LINUX_EXECUTABLE} is empty"
-            ));
-        }
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
-            .map_err(|error| error.to_string())?;
         Ok(())
     })
     .await
-    .map_err(|error| RpcError::failure(format!("extracting testing artifact failed: {error}")))?
-    .map_err(|error| RpcError::failure(format!("extracting testing artifact failed: {error}")))
+    .map_err(|error| RpcError::failure(format!("extracting Rust bundle archive failed: {error}")))?
+    .map_err(|error| RpcError::failure(format!("extracting Rust bundle archive failed: {error}")))
 }
 
-async fn queue_activation(
+async fn queue_install_bundle(
     backend: &Backend,
-    binary: &Path,
+    bundle: &Path,
     version: &str,
-    service_file: Option<&Path>,
 ) -> Result<(), RpcError> {
     let installer = backend.config.installer.as_deref().ok_or_else(|| {
-        RpcError::failure("installer is not configured; refusing unsafe binary replacement")
+        RpcError::failure("installer is not configured; refusing an unsafe Rust bundle update")
     })?;
     let mut command = Command::new("python3");
     command
         .arg(installer)
-        .arg("queue-activate-binary")
-        .arg("--binary")
-        .arg(binary)
+        .arg("queue-install-bundle")
+        .arg("--bundle")
+        .arg(bundle)
         .arg("--version")
         .arg(version)
         .arg("--homebrew")
         .arg(&backend.homebrew)
         .arg("--service-name")
         .arg(&backend.config.service_name)
+        .arg("--user")
+        .arg(&backend.user)
+        .arg("--listen")
+        .arg(&backend.config.listen)
+        .arg("--cef-url")
+        .arg(&backend.config.cef_url)
+        .arg("--inject-frontend")
+        .arg(if backend.config.inject_frontend {
+            "true"
+        } else {
+            "false"
+        })
+        .arg("--worker-mode")
+        .arg(&backend.config.worker_mode)
+        .arg("--github-api")
+        .arg(&backend.config.github_api)
+        .arg("--release-repository")
+        .arg(&backend.config.release_repository)
+        .arg("--testing-download-url")
+        .arg(&backend.config.testing_download_url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(service_file) = service_file {
-        command.arg("--service-file").arg(service_file);
-    }
     let output = command.output().await.map_err(|error| {
         RpcError::failure(format!(
-            "starting installer queue-activate-binary failed: {error}"
+            "starting installer queue-install-bundle failed: {error}"
         ))
     })?;
     if !output.status.success() {
@@ -699,7 +747,7 @@ async fn queue_activation(
             stderr.trim()
         };
         return Err(RpcError::failure(format!(
-            "installer queue-activate-binary failed ({}): {}",
+            "installer queue-install-bundle failed ({}): {}",
             output.status,
             if details.is_empty() {
                 "no diagnostic output"
@@ -710,12 +758,12 @@ async fn queue_activation(
     }
     let accepted: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
         RpcError::failure(format!(
-            "installer returned invalid handoff acknowledgement: {error}"
+            "installer returned invalid Rust bundle handoff acknowledgement: {error}"
         ))
     })?;
     if accepted.get("accepted").and_then(Value::as_bool) != Some(true) {
         return Err(RpcError::failure(
-            "installer did not confirm durable update handoff",
+            "installer did not confirm durable Rust bundle handoff",
         ));
     }
     let request_id = accepted
@@ -723,7 +771,7 @@ async fn queue_activation(
         .and_then(Value::as_str)
         .filter(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .ok_or_else(|| {
-            RpcError::failure("installer returned an invalid update handoff identifier")
+            RpcError::failure("installer returned an invalid Rust bundle handoff identifier")
         })?;
 
     backend.emit("updater/finish_download", Vec::new());
@@ -825,23 +873,41 @@ fn io_failure(operation: &str, error: io::Error) -> RpcError {
 
 #[cfg(test)]
 mod tests {
-    use super::filter_releases;
+    use super::{
+        RUST_BUNDLE_ASSET, RUST_TESTING_ARTIFACT, filter_releases, rust_bundle_asset,
+        rust_testing_artifact,
+    };
     use crate::backend::RpcError;
-    use serde_json::json;
+    use serde_json::{Value, json};
+
+    fn rust_asset() -> Value {
+        json!({
+            "name": RUST_BUNDLE_ASSET,
+            "size": 512,
+            "browser_download_url": "https://github.com/beallio/decky-loader/releases/download/v1.0.0/decky-rust-runtime-linux-x86_64.zip"
+        })
+    }
 
     #[test]
-    fn release_channels_keep_the_original_tag_and_prerelease_filters() {
+    fn release_discovery_only_exposes_versions_with_the_rust_bundle() {
         let releases = vec![
-            json!({"tag_name":"v3.2.10", "prerelease":false}),
-            json!({"tag_name":"v3.2.11-pre1", "prerelease":true}),
-            json!({"tag_name":"v3.2.9", "prerelease":true}),
-            json!({"tag_name":"3.2.12", "prerelease":false}),
-            json!({"tag_name":"dev", "prerelease":false}),
+            json!({"tag_name":"v3.2.10", "prerelease":false, "assets":[rust_asset()]}),
+            json!({"tag_name":"v3.2.11-pre1", "prerelease":true, "assets":[rust_asset()]}),
+            json!({"tag_name":"v3.2.9", "prerelease":true, "assets":[rust_asset()]}),
+            json!({"tag_name":"v3.2.12", "prerelease":false, "assets":[{"name":"PluginLoader", "browser_download_url":"https://example.invalid/PluginLoader"}]}),
+            json!({"tag_name":"v3.2.13", "prerelease":false, "assets":[{"name":RUST_BUNDLE_ASSET, "browser_download_url":""}]}),
+            json!({"tag_name":"3.2.14", "prerelease":false, "assets":[rust_asset()]}),
         ];
 
         let stable = filter_releases(releases.clone(), 0).expect("stable branch is valid");
-        assert_eq!(stable.len(), 1);
-        assert_eq!(stable[0]["tag_name"], "v3.2.10");
+        assert_eq!(
+            stable
+                .iter()
+                .map(|release| release["tag_name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["v3.2.10"]
+        );
+        assert!(rust_bundle_asset(&stable[0]).is_some());
 
         let prerelease = filter_releases(releases, 1).expect("prerelease branch is valid");
         assert_eq!(
@@ -854,13 +920,24 @@ mod tests {
     }
 
     #[test]
-    fn testing_branch_is_not_a_release_discovery_branch() {
-        let error = filter_releases(vec![], 2).expect_err("testing is not a release branch");
-        match error {
-            RpcError::Error { message, .. } => {
-                assert_eq!(message, "no valid release branch found");
-            }
-            RpcError::Stopped => panic!("invalid branch must not stop the RPC"),
-        }
+    fn testing_download_selects_only_the_rust_bundle_artifact() {
+        let artifacts = vec![
+            json!({"id":1, "name":"PluginLoader"}),
+            json!({"id":2, "name":"decky-loader-linux"}),
+            json!({"id":3, "name":RUST_TESTING_ARTIFACT}),
+        ];
+        assert_eq!(
+            rust_testing_artifact(&artifacts).and_then(|artifact| artifact["id"].as_u64()),
+            Some(3)
+        );
+        assert!(rust_testing_artifact(&artifacts[..2]).is_none());
+    }
+
+    #[test]
+    fn release_discovery_rejects_unsupported_branches() {
+        assert!(matches!(
+            filter_releases(vec![], 2),
+            Err(RpcError::Error { name, .. }) if name == "ValueError"
+        ));
     }
 }

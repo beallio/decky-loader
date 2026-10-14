@@ -19,7 +19,7 @@ use tokio::{
 use backend::{Backend, RuntimeConfig};
 use workers::{PluginRegistry, WorkerBootstrap, WorkerConfiguration, WorkerMode};
 
-const HELP: &str = "Decky Rust backend (private SteamOS validation build)\n\nRequired:\n  --worker PATH              Packaged DeckyPluginWorker executable\n  --plugin-root PATH         Installed plugin directory\n  --homebrew PATH            Unprivileged settings/data/logs root\n  --user USER                Host user identity for normal plugins\n  --assets PATH              Existing Decky frontend bundles\n  --locales PATH             Existing Decky locale JSON directory\n\nOptional:\n  --worker-mode MODE         Worker supervision: fork or exec (default fork)\n  --worker-bootstrap MODE    Runtime preload: full or lean (default lean)\n  --listen ADDRESS           Loopback address (default 127.0.0.1:1339)\n  --auth-file PATH           Read token from a private file\n  --service-name NAME        Loader systemd service (default plugin_loader)\n  --cef-url URL              Steam CEF debugger (default http://127.0.0.1:8080)\n  --inject-frontend BOOL     Run native frontend injector (default false)\n  --installer PATH           Transactional installer used for loader updates\n  --github-api URL           GitHub API origin\n  --release-repository NAME  Release repository (default SteamDeckHomebrew/decky-loader)\n  --service-release-url URL  Stable update service template\n  --service-prerelease-url URL Prerelease update service template\n  --testing-download-url URL Testing artifact service (default https://nightly.link)\n\nUses the unchanged v3.2.10 frontend and packaged Python SDK. Supports plugin\nmanagement, utilities, native CEF integration and transactional loader updates.\nPhysical Steam Deck validation and public distribution are not complete.\n";
+const HELP: &str = "Decky Rust backend (private SteamOS validation build)\n\nRequired:\n  --worker PATH              Packaged DeckyPluginWorker executable\n  --plugin-root PATH         Installed plugin directory\n  --homebrew PATH            Unprivileged settings/data/logs root\n  --user USER                Host user identity for normal plugins\n  --assets PATH              Existing Decky frontend bundles\n  --locales PATH             Existing Decky locale JSON directory\n\nOptional:\n  --worker-mode MODE         Worker supervision: fork or exec (default fork)\n  --worker-bootstrap MODE    Runtime preload: full or lean (default lean)\n  --listen ADDRESS           Loopback address (default 127.0.0.1:1339)\n  --auth-file PATH           Read token from a private file\n  --service-name NAME        Loader systemd service (default plugin_loader)\n  --cef-url URL              Steam CEF debugger (default http://127.0.0.1:8080)\n  --inject-frontend BOOL     Run native frontend injector (default false)\n  --installer PATH           Transactional installer used for loader updates\n  --github-api URL           GitHub API origin\n  --release-repository NAME  Rust release repository (default beallio/decky-loader)\n  --testing-download-url URL Rust testing artifact service (default https://nightly.link)\n\nUses the unchanged v3.2.10 frontend and packaged Python SDK. Supports plugin\nmanagement, utilities, native CEF integration and transactional loader updates.\nPhysical Steam Deck validation and public distribution are not complete.\n";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -47,8 +47,6 @@ async fn main() -> anyhow::Result<()> {
             "--installer",
             "--github-api",
             "--release-repository",
-            "--service-release-url",
-            "--service-prerelease-url",
             "--testing-download-url",
         ]
         .contains(&key.as_str())
@@ -63,7 +61,10 @@ async fn main() -> anyhow::Result<()> {
         }
         options.insert(key, value);
     }
-    let worker_mode = match options.remove("--worker-mode").as_deref().unwrap_or("fork") {
+    let worker_mode_name = options
+        .remove("--worker-mode")
+        .unwrap_or_else(|| "fork".to_owned());
+    let worker_mode = match worker_mode_name.as_str() {
         "exec" => WorkerMode::Exec,
         "fork" => WorkerMode::Fork,
         value => bail!("invalid --worker-mode {value:?}; expected exec or fork"),
@@ -106,22 +107,17 @@ async fn main() -> anyhow::Result<()> {
             value => bail!("invalid --inject-frontend {value:?}; expected true or false"),
         },
         installer: options.remove("--installer").map(PathBuf::from),
+        listen: address.to_string(),
+        worker_mode: worker_mode_name,
         github_api: options
             .remove("--github-api")
             .unwrap_or(defaults.github_api),
         release_repository: options
             .remove("--release-repository")
             .unwrap_or(defaults.release_repository),
-        service_release_url: options
-            .remove("--service-release-url")
-            .unwrap_or(defaults.service_release_url),
-        service_prerelease_url: options
-            .remove("--service-prerelease-url")
-            .unwrap_or(defaults.service_prerelease_url),
         testing_download_url: options
             .remove("--testing-download-url")
             .unwrap_or(defaults.testing_download_url),
-        keep_systemd_service: std::env::var("KEEP_SYSTEMD_SERVICE").is_ok_and(|value| value == "1"),
         chown_plugin_path: std::env::var("CHOWN_PLUGIN_PATH").map_or(true, |value| value == "1"),
     };
     if config.inject_frontend && address.port() != 1337 {

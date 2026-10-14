@@ -56,12 +56,11 @@ pub(crate) struct RuntimeConfig {
     pub cef_url: String,
     pub inject_frontend: bool,
     pub installer: Option<PathBuf>,
+    pub listen: String,
+    pub worker_mode: String,
     pub github_api: String,
     pub release_repository: String,
-    pub service_release_url: String,
-    pub service_prerelease_url: String,
     pub testing_download_url: String,
-    pub keep_systemd_service: bool,
     pub chown_plugin_path: bool,
 }
 
@@ -72,12 +71,11 @@ impl Default for RuntimeConfig {
             cef_url: "http://127.0.0.1:8080".into(),
             inject_frontend: false,
             installer: None,
+            listen: "127.0.0.1:1339".into(),
+            worker_mode: "fork".into(),
             github_api: "https://api.github.com".into(),
-            release_repository: "SteamDeckHomebrew/decky-loader".into(),
-            service_release_url: "https://raw.githubusercontent.com/SteamDeckHomebrew/decky-loader/main/dist/plugin_loader-release.service".into(),
-            service_prerelease_url: "https://raw.githubusercontent.com/SteamDeckHomebrew/decky-loader/main/dist/plugin_loader-prerelease.service".into(),
+            release_repository: "beallio/decky-loader".into(),
             testing_download_url: "https://nightly.link".into(),
-            keep_systemd_service: false,
             chown_plugin_path: true,
         }
     }

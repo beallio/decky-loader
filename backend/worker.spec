@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from PyInstaller.building.api import COLLECT, EXE, PYZ
 from PyInstaller.building.build_main import Analysis
@@ -42,6 +43,15 @@ hiddenimports = [
 
 for package in runtime_packages:
     package_datas, package_binaries, package_hiddenimports = collect_all(package)
+    if package == "decky_loader":
+        # Match SDK source data to Analysis.pathex, not a stale installed wheel.
+        sdk_root = Path(backend_root) / "decky_loader"
+        package_datas = [
+            (str(path), str(Path("decky_loader") / path.parent.relative_to(sdk_root)))
+            for path in sorted(sdk_root.rglob("*"))
+            if path.is_file() and "__pycache__" not in path.parts
+            and path.suffix not in (".pyc", ".pyo")
+        ]
     datas += package_datas
     binaries += package_binaries
     hiddenimports += package_hiddenimports

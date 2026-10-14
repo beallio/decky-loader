@@ -24,6 +24,8 @@ import traceback
 import uuid
 from urllib.parse import quote
 
+from process_observer import cgroup_processes
+
 HOME_BREW = Path('/home/deck/homebrew')
 NORMAL_SERVICE = 'plugin_loader.service'
 NORMAL_BINARY = HOME_BREW / 'services/PluginLoader'
@@ -362,16 +364,11 @@ def validate_control_group(control_group: str | None) -> Path:
 def cgroup_members(control_group: str | None) -> list[int]:
     if not control_group:
         return []
-    root = validate_control_group(control_group)
-    if not root.exists():
-        return []
-    members: set[int] = set()
-    for process_file in root.rglob('cgroup.procs'):
-        try:
-            members.update(int(value) for value in process_file.read_text().split())
-        except FileNotFoundError:
-            continue
-    return sorted(members)
+    validate_control_group(control_group)
+    try:
+        return list(cgroup_processes(control_group))
+    except (OSError, ValueError) as error:
+        raise BenchmarkError(f'cannot observe owned processes for {control_group}: {error}') from error
 
 
 def cgroup_usage_usec(control_group: str | None) -> int:
@@ -392,25 +389,36 @@ def cgroup_pss(control_group: str | None) -> dict[str, object]:
     private_dirty_kib = 0
     processes = []
     skipped_vanished = 0
-    for pid in cgroup_members(control_group):
-        identity = process_identity(pid)
-        if identity is None:
-            skipped_vanished += 1
+    validate_control_group(control_group)
+    try:
+        members = cgroup_processes(control_group)
+    except (OSError, ValueError) as error:
+        raise BenchmarkError(f'cannot observe owned processes for {control_group}: {error}') from error
+    for pid, record in members.items():
+        details = {
+            'pid': pid, 'start_ticks': record.start_ticks, 'ppid': record.ppid,
+            'pgrp': record.pgrp, 'session': record.session, 'comm': record.comm,
+            'kernel_state': record.state, 'cgroups': list(record.cgroups),
+            'state': 'zombie' if record.state == 'Z' else 'live',
+        }
+        if record.state == 'Z':
+            processes.append(details)
             continue
-        process_dir = Path('/proc') / str(pid)
         try:
-            comm = process_dir.joinpath('comm').read_text().strip()
-            status = process_dir.joinpath('status').read_text().splitlines()
-            ppid = next((int(line.split()[1]) for line in status if line.startswith('PPid:')), None)
-            if identity[1] == 'Z':
-                processes.append({'pid': pid, 'ppid': ppid, 'comm': comm, 'state': 'zombie'})
-                continue
-            smaps = process_dir.joinpath('smaps_rollup').read_text().splitlines()
-        except FileNotFoundError:
+            smaps = (Path('/proc') / str(pid) / 'smaps_rollup').read_text().splitlines()
+        except (FileNotFoundError, ProcessLookupError):
             skipped_vanished += 1
             continue
         except OSError as error:
-            raise BenchmarkError(f'cannot read memory details for cgroup process {pid}: {error}') from error
+            raise BenchmarkError(f'cannot read memory details for owned process {pid}: {error}') from error
+        identity = process_identity(pid)
+        if identity is None or identity[0] != record.start_ticks:
+            skipped_vanished += 1
+            continue
+        if identity[1] == 'Z':
+            details.update(state='zombie', kernel_state='Z')
+            processes.append(details)
+            continue
         values = {}
         for line in smaps:
             key, separator, value = line.partition(':')
@@ -420,17 +428,15 @@ def cgroup_pss(control_group: str | None) -> dict[str, object]:
             raise BenchmarkError(f'process {pid} smaps_rollup has no Pss or Private_Dirty entry')
         pss_kib += values['Pss']
         private_dirty_kib += values['Private_Dirty']
-        processes.append({
-            'pid': pid,
-            'ppid': ppid,
-            'comm': comm,
-            'pss_mib': values['Pss'] / 1024,
-            'private_dirty_mib': values['Private_Dirty'] / 1024,
-        })
+        details.update(pss_mib=values['Pss'] / 1024, private_dirty_mib=values['Private_Dirty'] / 1024)
+        processes.append(details)
     return {
         'pss_mib': pss_kib / 1024,
         'private_dirty_mib': private_dirty_kib / 1024,
         'process_count': len(processes),
+        'live_process_count': sum(process['state'] == 'live' for process in processes),
+        'zombie_count': sum(process['state'] == 'zombie' for process in processes),
+        'discovery': '/proc cgroup membership, tracked PID/start-tick identities, ancestry and anchored process groups',
         'vanished_during_sample': skipped_vanished,
         'processes': processes,
     }

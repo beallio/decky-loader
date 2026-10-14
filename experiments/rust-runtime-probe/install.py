@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import base64
 import fcntl
 import hashlib
@@ -28,6 +29,11 @@ import urllib.parse
 import urllib.request
 import uuid
 
+# Importing installer helpers must not add unlisted files to a checksummed bundle.
+sys.dont_write_bytecode = True
+
+from process_observer import cgroup_processes
+
 
 KIND = 'decky-rust-runtime-probe'
 BASELINE_TAG = 'v3.2.10'
@@ -35,6 +41,9 @@ UNIT_DIRECTORY = Path('/etc/systemd/system')
 SYSTEMCTL_CANDIDATES = (Path('/usr/bin/systemctl'), Path('/bin/systemctl'))
 DEFAULT_LISTEN = '127.0.0.1:1337'
 DEFAULT_CEF_URL = 'http://127.0.0.1:8080'
+DEFAULT_GITHUB_API = 'https://api.github.com'
+DEFAULT_RELEASE_REPOSITORY = 'beallio/decky-loader'
+DEFAULT_TESTING_DOWNLOAD_URL = 'https://nightly.link'
 RUST_EXECUTABLE = 'decky-rust-runtime-probe'
 WORKER_EXECUTABLE = 'DeckyPluginWorker'
 MAX_HTTP_HEADERS = 65536
@@ -612,6 +621,7 @@ def _make_runtime(bundle: Path, manifest: dict[str, Any], paths: dict[str, Path]
         shutil.copy2(bundle / WORKER_EXECUTABLE, staging / WORKER_EXECUTABLE)
         installer = staging / 'install.py'
         shutil.copy2(bundle / 'install.py', installer)
+        shutil.copy2(bundle / 'process_observer.py', staging / 'process_observer.py')
         os.chmod(installer, 0o755)
         for name in ('assets', 'locales'):
             _copytree_checked(bundle / name, staging / name)
@@ -634,7 +644,7 @@ def _make_runtime(bundle: Path, manifest: dict[str, Any], paths: dict[str, Path]
         for relative, expected in hashes.items():
             if relative == RUST_EXECUTABLE:
                 continue
-            if relative == WORKER_EXECUTABLE or relative == 'install.py' or relative.startswith(('assets/', 'locales/', '_internal/')):
+            if relative in (WORKER_EXECUTABLE, 'install.py', 'process_observer.py') or relative.startswith(('assets/', 'locales/', '_internal/')):
                 copied = staging / relative
                 if not copied.is_file() or _digest(copied) != expected:
                     _fail(f'copied runtime checksum mismatch: {relative}')
@@ -763,7 +773,7 @@ def _listener_configuration(environment: list[str], listen: str) -> tuple[list[s
     return environment, ['/usr/bin/env', *assignments]
 
 
-def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_name: str, listen: str, cef_url: str, inject_frontend: bool, worker_mode: str) -> bytes:
+def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_name: str, listen: str, cef_url: str, inject_frontend: bool, worker_mode: str, github_api: str, release_repository: str, testing_download_url: str) -> bytes:
     environment = _service_environment(paths)
     present = _environment_keys(environment)
     defaults = {
@@ -791,6 +801,9 @@ def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_na
         '--cef-url', cef_url,
         '--inject-frontend', 'true' if inject_frontend else 'false',
         '--installer', str(runtime / 'install.py'),
+        '--github-api', github_api,
+        '--release-repository', release_repository,
+        '--testing-download-url', testing_download_url,
     ]
     command = ' '.join(_systemd_quote(argument) for argument in arguments)
     lines = [
@@ -834,91 +847,6 @@ def _stage_bytes(data: bytes, directory: Path, prefix: str, mode: int = 0o644) -
             pass
         temporary.unlink(missing_ok=True)
         raise
-
-
-def _validate_service_template(source: Path, paths: dict[str, Path], *, prepare: bool = True) -> bytes:
-    info = _lstat_regular_or_absent(source)
-    if info is None:
-        _fail(f'service template is missing: {source}')
-    try:
-        raw = source.read_bytes()
-        text = raw.decode('utf-8')
-    except (OSError, UnicodeError) as error:
-        raise InstallerError(f'cannot read service template: {error}') from error
-    if '\x00' in text:
-        _fail('service template contains NUL bytes')
-    text = text.replace('${HOMEBREW_FOLDER}', str(paths['homebrew']))
-    sections: dict[str, list[tuple[str, str, str]]] = {}
-    current = ''
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith(('#', ';')):
-            continue
-        if line.startswith('[') and line.endswith(']'):
-            current = line[1:-1]
-            if current not in ('Unit', 'Service', 'Install'):
-                _fail(f'unsupported section in service template: {current}')
-            sections.setdefault(current, [])
-            continue
-        if current not in ('Unit', 'Service', 'Install') or '=' not in line:
-            _fail('malformed or out-of-section service template directive')
-        key, value = line.split('=', 1)
-        sections[current].append((key, value, line))
-    if not all(section in sections for section in ('Unit', 'Service', 'Install')):
-        _fail('service template must contain Unit, Service, and Install sections')
-    allowed = {
-        'Unit': {'Description', 'After'},
-        'Service': {'Type', 'User', 'Restart', 'KillMode', 'TimeoutStopSec', 'ExecStart', 'WorkingDirectory', 'Environment'},
-        'Install': {'WantedBy'},
-    }
-    for section, directives in sections.items():
-        if any(key not in allowed[section] for key, _, _ in directives):
-            _fail(f'service template contains unsupported directives in [{section}]')
-    starts = [value for key, value, _ in sections['Service'] if key == 'ExecStart']
-    if len(starts) != 1:
-        _fail('service template must define exactly one ExecStart')
-    try:
-        command = shlex.split(starts[0], posix=True)
-    except ValueError as error:
-        raise InstallerError(f'invalid ExecStart in service template: {error}') from error
-    if command != [str(paths['binary'])]:
-        _fail('service template ExecStart must name only the selected services/PluginLoader executable')
-    service_values = {key: value for key, value, _ in sections['Service']}
-    if service_values.get('Type') != 'simple' or service_values.get('User') != 'root' or service_values.get('WorkingDirectory') != str(paths['services']):
-        _fail('service template has an unsupported execution identity or working directory')
-    if service_values.get('Restart', 'always') != 'always' or service_values.get('KillMode', 'process') != 'process':
-        _fail('service template changes the managed service restart or process-isolation policy')
-    for _, value, _ in sections['Install']:
-        if value != 'multi-user.target':
-            _fail('service template may only install the selected service into multi-user.target')
-    if not prepare:
-        # The queued helper must validate the original upstream template, not
-        # revalidate a unit already modified with this install's environment.
-        return raw
-    previous_environment = _service_environment(paths)
-    existing_lines = [line for key, _, line in sections['Service'] if key == 'Environment']
-    preserved = [line for line in previous_environment if line.startswith(('Environment=', 'EnvironmentFile='))]
-    merged = existing_lines + [line for line in preserved if line not in existing_lines]
-    merged, command_prefix = _listener_configuration(merged, _configured_listen(paths))
-    section_lines: list[str] = []
-    emitted_environment = False
-    for section in ('Unit', 'Service', 'Install'):
-        section_lines.append(f'[{section}]')
-        for key, _, line in sections[section]:
-            if section == 'Service' and key == 'Environment':
-                if not emitted_environment:
-                    section_lines.extend(merged)
-                    emitted_environment = True
-                continue
-            if section == 'Service' and key == 'ExecStart':
-                section_lines.append('ExecStart=' + ' '.join(_systemd_quote(argument) for argument in [*command_prefix, *command]))
-                continue
-            section_lines.append(line)
-        if section == 'Service' and not emitted_environment:
-            section_lines.extend(merged)
-            emitted_environment = True
-        section_lines.append('')
-    return ('\n'.join(section_lines)).encode('utf-8')
 
 
 def _stop_service(paths: dict[str, Path]) -> None:
@@ -1007,23 +935,11 @@ def _service_cgroup_pids(properties: dict[str, str], main_pid: int) -> set[int]:
         raise InstallerError(f'cannot resolve selected-service cgroup: {error}') from error
     if not group.is_dir():
         _fail('selected-service ControlGroup is not a directory')
-    pids: set[int] = set()
-    candidates = [group]
     try:
-        candidates.extend(path for path in group.rglob('*') if path.is_dir() and not path.is_symlink())
-    except OSError as error:
-        raise InstallerError(f'cannot enumerate selected-service cgroup: {error}') from error
-    for directory in candidates:
-        try:
-            entries = (directory / 'cgroup.procs').read_text(encoding='ascii').split()
-        except FileNotFoundError:
-            continue
-        except (OSError, UnicodeError) as error:
-            raise InstallerError(f'cannot read selected-service cgroup membership: {error}') from error
-        for entry in entries:
-            if not entry.isdecimal():
-                _fail('selected-service cgroup contains an invalid process identifier')
-            pids.add(int(entry))
+        processes = cgroup_processes(control_group)
+    except (OSError, ValueError) as error:
+        raise InstallerError(f'cannot observe selected-service processes: {error}') from error
+    pids = set(processes)
     if main_pid not in pids:
         _fail('selected service MainPID is not in its reported ControlGroup')
     return pids
@@ -1630,6 +1546,10 @@ def _run_install(args: argparse.Namespace) -> dict[str, object]:
     _listen_endpoint(listen)
     cef_url = _validate_cef_url(args.cef_url)
     inject_frontend = args.inject_frontend == 'true'
+    worker_mode = args.worker_mode
+    version = args.version or str(manifest['runtime']['decky_version'])
+    if not version or any(ord(character) < 32 or ord(character) == 127 for character in version):
+        _fail('--version must be a non-empty printable release identifier')
     plugin_root = homebrew / 'plugins'
     if not plugin_root.exists():
         plugin_root.mkdir(mode=0o755)
@@ -1650,14 +1570,26 @@ def _run_install(args: argparse.Namespace) -> dict[str, object]:
         _verify_runtime(runtime_stage, manifest, user, binary_stage)
         if not binary_stage.stat().st_mode & 0o111:
             _fail('staged Rust runtime is not executable')
-        unit_data = _generated_unit(paths, runtime_final, user.pw_name, _normalize_service_name(args.service_name)[0], listen, cef_url, inject_frontend, args.worker_mode)
+        unit_data = _generated_unit(
+            paths,
+            runtime_final,
+            user.pw_name,
+            _normalize_service_name(args.service_name)[0],
+            listen,
+            cef_url,
+            inject_frontend,
+            worker_mode,
+            args.github_api,
+            args.release_repository,
+            args.testing_download_url,
+        )
         unit_stage = _stage_bytes(unit_data, paths['unit_dir'], f'.{service_file}.{transaction_id}.')
         active_stage = _stage_bytes((json.dumps({'listen': listen}, sort_keys=True) + '\n').encode(), paths['state'], f'.active.{transaction_id}.', 0o644)
         prior = _capture_activation(paths)
         activation = dict(prior)
         if prior.get('load_state') == 'not-found':
             activation.update({'running': True, 'enabled': True, 'enabled_scope': 'persistent'})
-        transaction, record, captured = _snapshot_transaction(paths, transaction_id, 'install', str(manifest['runtime']['decky_version']))
+        transaction, record, captured = _snapshot_transaction(paths, transaction_id, 'install', version)
         stage_values: dict[str, Path | str | None] = {
             'binary_stage': binary_stage,
             'unit_stage': unit_stage,
@@ -1685,7 +1617,7 @@ def _run_install(args: argparse.Namespace) -> dict[str, object]:
             'binary': str(paths['binary']),
             'runtime': str(runtime_final),
             'listen': listen,
-            'version': manifest['runtime']['decky_version'],
+            'version': version,
             'rollback_available': True,
             'previous_history': parent,
             'enabled': bool(activation.get('enabled')),
@@ -1764,80 +1696,6 @@ def _run_rollback(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
-def _validate_binary(source_value: str) -> Path:
-    source = Path(source_value)
-    info = _lstat_regular_or_absent(source)
-    if info is None:
-        _fail(f'updater binary does not exist: {source}')
-    source = source.resolve(strict=True)
-    mode = stat.S_IMODE(info.st_mode)
-    if not mode & 0o111 or mode & 0o6000 or mode & 0o022:
-        _fail(f'updater binary has unsafe executable permissions: {source}')
-    return source
-
-
-def _run_activate_binary(args: argparse.Namespace) -> dict[str, object]:
-    _require_root()
-    _, service_file = _normalize_service_name(args.service_name)
-    if not args.version or any(ord(character) < 32 for character in args.version):
-        _fail('--version must be a non-empty printable release identifier')
-    paths = _paths(_homebrew_path(args.homebrew), args.service_name)
-    _recover(paths)
-    prior = _capture_activation(paths)
-    if prior.get('load_state') != 'loaded':
-        _fail('activate-binary requires an existing loaded selected service')
-    if _lstat_regular_or_absent(paths['binary']) is None:
-        _fail('activate-binary requires an installed services/PluginLoader executable')
-    binary_source = _validate_binary(args.binary)
-    template_data: bytes | None = None
-    if args.service_file:
-        template_path = Path(args.service_file)
-        if _lstat_regular_or_absent(template_path) is None:
-            _fail(f'service template is missing: {template_path}')
-        template_data = _validate_service_template(template_path, paths)
-    listen = _configured_listen(paths)
-    transaction_id = _new_transaction_id()
-    binary_stage: Path | None = None
-    unit_stage: Path | None = None
-    try:
-        binary_stage = _copy_stage_file(binary_source, paths['services'], f'.PluginLoader.{transaction_id}.')
-        if template_data is not None:
-            unit_stage = _stage_bytes(template_data, paths['unit_dir'], f'.{service_file}.{transaction_id}.')
-        _, record, activation = _snapshot_transaction(paths, transaction_id, 'activate-binary', args.version)
-        stage_values: dict[str, Path | str | None] = {
-            'binary_stage': binary_stage,
-            'unit_stage': unit_stage,
-            'active_stage': None,
-            'runtime_stage': None,
-        }
-        journal = _begin_journal(paths, transaction_id, 'activate-binary', record, stage_values, transaction_id, None, listen)
-        try:
-            _activate_stages(paths, journal, activation, listen, template_data is not None, binary_stage=binary_stage, unit_stage=unit_stage)
-            _commit(paths, journal)
-        except BaseException as error:
-            try:
-                _recover(paths)
-            except BaseException as rollback_error:
-                raise InstallerError(f'binary activation failed ({error}); recovery is pending ({rollback_error})') from error
-            raise InstallerError(f'binary activation failed and was rolled back: {error}') from error
-        return {
-            'ok': True,
-            'command': 'activate-binary',
-            'service': service_file,
-            'binary': str(paths['binary']),
-            'version': args.version,
-            'service_template_updated': template_data is not None,
-            'rollback_available': True,
-            'enabled': bool(activation.get('enabled')),
-            'active': bool(activation.get('running')),
-        }
-    finally:
-        for stage in (binary_stage, unit_stage):
-            if stage is not None:
-                stage.unlink(missing_ok=True)
-
-
-
 def _systemd_run_path() -> str:
     for candidate in (Path('/usr/bin/systemd-run'), Path('/bin/systemd-run')):
         if candidate.is_file() and os.access(candidate, os.X_OK):
@@ -1902,104 +1760,120 @@ def _assert_no_pending_handoff(paths: dict[str, Path]) -> None:
             _fail('another updater activation handoff is still pending')
         message = 'independent updater activation helper exited before completing its handoff'
         _write_json(result_path, {'schema': 1, 'id': directory.name, 'ok': False, 'error': message})
-        (directory / 'PluginLoader').unlink(missing_ok=True)
-        (directory / 'service').unlink(missing_ok=True)
-        _fsync_directory(directory)
+        _cleanup_handoff_payloads(directory)
 
-
-
-
-def _remove_updater_temporary(paths: dict[str, Path], source: Path) -> None:
-    update_directory = paths['homebrew'] / '.updates'
-    if source.parent != update_directory or not re.fullmatch(
-        r'decky-update-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:binary|service)',
-        source.name,
-    ):
-        return
+def _cleanup_handoff_payloads(directory: Path) -> None:
+    bundle = directory / 'bundle'
     try:
-        info = source.lstat()
+        info = bundle.lstat()
     except FileNotFoundError:
-        return
-    if not stat.S_ISREG(info.st_mode):
-        _fail(f'refusing to remove non-regular updater temporary input: {source}')
-    source.unlink()
-    _fsync_directory(update_directory)
-def _prepare_activation_handoff(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, object]:
-    if not args.version or any(ord(character) < 32 for character in args.version):
+        info = None
+    if info is not None:
+        if stat.S_ISDIR(info.st_mode):
+            shutil.rmtree(bundle)
+        else:
+            bundle.unlink()
+    _fsync_directory(directory)
+
+
+def _start_queued_activation(paths: dict[str, Path], request_id: str) -> dict[str, object]:
+    unit = f'decky-updater-{request_id}'
+    command = [
+        _systemd_run_path(),
+        '--system',
+        '--no-block',
+        '--collect',
+        '--unit', unit,
+        '--property=Type=oneshot',
+        '--property=KillMode=control-group',
+        '--property=TimeoutStartSec=infinity',
+        sys.executable,
+        str(Path(__file__).resolve(strict=True)),
+        'activate-queued',
+        '--homebrew', str(paths['homebrew']),
+        '--service-name', paths['unit'].stem,
+        '--request-id', request_id,
+    ]
+    try:
+        started = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise InstallerError(f'cannot start independent updater activation service: {error}') from error
+    if started.returncode:
+        detail = started.stderr.strip() or started.stdout.strip() or f'exit status {started.returncode}'
+        _fail(f'systemd-run could not queue updater activation: {detail}')
+    return {'request_id': request_id, 'unit': f'{unit}.service'}
+
+def _sync_bundle_tree(bundle: Path) -> None:
+    entries = sorted(bundle.rglob('*'), key=lambda path: len(path.parts), reverse=True)
+    for path in (*entries, bundle):
+        info = path.lstat()
+        if stat.S_ISREG(info.st_mode):
+            _fsync_file(path)
+        elif stat.S_ISDIR(info.st_mode):
+            _fsync_directory(path)
+        else:
+            _fail(f'bundle contains an unsupported filesystem object: {path}')
+
+
+def _prepare_install_handoff(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, object]:
+    _normalize_service_name(args.service_name)
+    if not args.version or any(ord(character) < 32 or ord(character) == 127 for character in args.version):
         _fail('--version must be a non-empty printable release identifier')
-    binary_source = _validate_binary(args.binary)
+    user = pwd.getpwnam(args.user)
+    if user.pw_uid == 0:
+        _fail('--user must resolve to a non-root service account')
+    if args.user != user.pw_name:
+        _fail('pass the resolved Unix account name with --user')
+    bundle, manifest = _validate_bundle(args.bundle, user)
+    _listen_endpoint(args.listen)
+    cef_url = _validate_cef_url(args.cef_url)
     was_running = bool(_capture_activation(paths)['running'])
-    template_data = None
-    service_source = None
-    if args.service_file:
-        service_source = Path(args.service_file)
-        if _lstat_regular_or_absent(service_source) is None:
-            _fail(f'service template is missing: {service_source}')
-        service_source = service_source.resolve(strict=True)
-        template_data = _validate_service_template(service_source, paths, prepare=False)
     _cleanup_completed_handoffs(paths)
     _assert_no_pending_handoff(paths)
     request_id = _new_transaction_id()
     directory = paths['queue'] / request_id
     directory.mkdir(mode=0o700)
     try:
-        binary = directory / 'PluginLoader'
-        _copy_regular(binary_source, binary)
-        os.chown(binary, 0, 0)
-        os.chmod(binary, 0o755)
-        _fsync_file(binary)
-        service = None
-        if template_data is not None:
-            service = directory / 'service'
-            _write_atomic(service, template_data, 0o644)
-            os.chown(service, 0, 0)
-            _fsync_file(service)
+        payload = directory / 'bundle'
+        try:
+            os.rename(bundle, payload)
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+            _copytree_checked(bundle, payload)
+            _sync_bundle_tree(payload)
+            shutil.rmtree(bundle)
+            _fsync_directory(bundle.parent)
+        _sync_bundle_tree(payload)
+        _, copied_manifest = _validate_bundle(str(payload), user)
+        if copied_manifest != manifest:
+            _fail('queued Rust bundle manifest changed while staging')
         _write_json(directory / 'request.json', {
             'schema': 1,
             'id': request_id,
+            'kind': 'install-bundle',
             'service': paths['unit'].name,
             'homebrew': str(paths['homebrew']),
             'version': args.version,
             'was_running': was_running,
-            'service_file': service is not None,
+            'user': user.pw_name,
+            'listen': args.listen,
+            'cef_url': cef_url,
+            'inject_frontend': args.inject_frontend,
+            'worker_mode': args.worker_mode,
+            'github_api': args.github_api,
+            'release_repository': args.release_repository,
+            'testing_download_url': args.testing_download_url,
             'created_at': int(time.time()),
         })
         _fsync_directory(directory)
-        _remove_updater_temporary(paths, binary_source)
-        if service_source is not None:
-            _remove_updater_temporary(paths, service_source)
         _fsync_directory(paths['queue'])
-        unit = f'decky-updater-{request_id}'
-        command = [
-            _systemd_run_path(),
-            '--system',
-            '--no-block',
-            '--collect',
-            '--unit', unit,
-            '--property=Type=oneshot',
-            '--property=KillMode=control-group',
-            '--property=TimeoutStartSec=infinity',
-            sys.executable,
-            str(Path(__file__).resolve(strict=True)),
-            'activate-queued',
-            '--homebrew', str(paths['homebrew']),
-            '--service-name', paths['unit'].stem,
-            '--request-id', request_id,
-        ]
-        try:
-            started = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False)
-        except (OSError, subprocess.SubprocessError) as error:
-            raise InstallerError(f'cannot start independent updater activation service: {error}') from error
-        if started.returncode:
-            detail = started.stderr.strip() or started.stdout.strip() or f'exit status {started.returncode}'
-            _fail(f'systemd-run could not queue updater activation: {detail}')
-        return {'request_id': request_id, 'unit': f'{unit}.service'}
+        return _start_queued_activation(paths, request_id)
     except BaseException:
         shutil.rmtree(directory, ignore_errors=True)
         raise
 
-
-def _wait_for_handoff(paths: dict[str, Path], request_id: str, unit: str) -> dict[str, object]:
+def _wait_for_handoff(paths: dict[str, Path], request_id: str, unit: str, command: str = 'queue-install-bundle') -> dict[str, object]:
     directory = _request_directory(paths, request_id)
     accepted = directory / 'accepted.json'
     deadline = time.monotonic() + 30
@@ -2008,7 +1882,7 @@ def _wait_for_handoff(paths: dict[str, Path], request_id: str, unit: str) -> dic
             acknowledgement = _read_json(accepted)
             if acknowledgement.get('schema') != 1 or acknowledgement.get('id') != request_id:
                 _fail('updater handoff returned an invalid durable acknowledgement')
-            return {'ok': True, 'accepted': True, 'command': 'queue-activate-binary', 'request_id': request_id, 'unit': unit}
+            return {'ok': True, 'accepted': True, 'command': command, 'request_id': request_id, 'unit': unit}
         result = directory / 'result.json'
         if result.exists():
             value = _read_json(result)
@@ -2059,9 +1933,7 @@ def _release_activation_handoff(args: argparse.Namespace, paths: dict[str, Path]
     if helper_state.get('LoadState') != 'loaded' or helper_state.get('ActiveState') not in ('activating', 'active'):
         message = 'independent updater activation helper is no longer running'
         _write_json(directory / 'result.json', {'schema': 1, 'id': request_id, 'ok': False, 'error': message})
-        (directory / 'PluginLoader').unlink(missing_ok=True)
-        (directory / 'service').unlink(missing_ok=True)
-        _fsync_directory(directory)
+        _cleanup_handoff_payloads(directory)
         _fail(message)
     decision = {'schema': 1, 'id': request_id, 'state': 'released', 'released_at': int(time.time())}
     if not _write_json_exclusive(decision_path, decision):
@@ -2076,10 +1948,10 @@ def _release_activation_handoff(args: argparse.Namespace, paths: dict[str, Path]
 def _run_queued_activation(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, object]:
     request_id = args.request_id
     directory = _request_directory(paths, request_id)
-    binary = directory / 'PluginLoader'
-    service_file = None
+    bundle = directory / 'bundle'
     try:
         request = _read_json(directory / 'request.json')
+        kind = request.get('kind')
         if (
             request.get('schema') != 1
             or request.get('id') != request_id
@@ -2087,14 +1959,34 @@ def _run_queued_activation(args: argparse.Namespace, paths: dict[str, Path]) -> 
             or request.get('homebrew') != str(paths['homebrew'])
             or not isinstance(request.get('version'), str)
             or not request.get('version')
-            or not isinstance(request.get('service_file'), bool)
+            or any(ord(character) < 32 or ord(character) == 127 for character in request['version'])
             or not isinstance(request.get('was_running'), bool)
         ):
             _fail('updater handoff request metadata is invalid')
-        _validate_binary(str(binary))
-        service_file = directory / 'service' if request['service_file'] else None
-        if service_file is not None and _lstat_regular_or_absent(service_file) is None:
-            _fail('updater handoff service template is missing')
+        if kind != 'install-bundle':
+            _fail('updater handoff request has an unsupported operation')
+        config = (
+            request.get('user'),
+            request.get('listen'),
+            request.get('cef_url'),
+            request.get('inject_frontend'),
+            request.get('worker_mode'),
+            request.get('github_api'),
+            request.get('release_repository'),
+            request.get('testing_download_url'),
+        )
+        if not all(isinstance(value, str) and value for value in config):
+            _fail('Rust bundle handoff configuration is incomplete')
+        if request['inject_frontend'] not in ('true', 'false') or request['worker_mode'] not in ('fork', 'exec'):
+            _fail('Rust bundle handoff configuration is unsupported')
+        user = pwd.getpwnam(request['user'])
+        if user.pw_uid == 0 or user.pw_name != request['user']:
+            _fail('Rust bundle handoff has an invalid service account')
+        _listen_endpoint(request['listen'])
+        _validate_cef_url(request['cef_url'])
+        if bundle.is_symlink() or not bundle.is_dir():
+            _fail('updater Rust bundle payload is missing or unsafe')
+        _validate_bundle(str(bundle), user)
         decision_path = directory / 'decision.json'
         if decision_path.exists():
             decision = _read_json(decision_path)
@@ -2134,12 +2026,19 @@ def _run_queued_activation(args: argparse.Namespace, paths: dict[str, Path]) -> 
                 # Restart=always can still be activating after the caller is killed.
                 # Wait for that transition before taking the rollback snapshot.
                 _wait_running(paths, timeout=45)
-            result = _run_activate_binary(argparse.Namespace(
-                binary=str(binary),
+            result = _run_install(argparse.Namespace(
+                bundle=str(bundle),
                 version=request['version'],
                 homebrew=str(paths['homebrew']),
+                user=request['user'],
                 service_name=paths['unit'].stem,
-                service_file=str(service_file) if service_file is not None else None,
+                listen=request['listen'],
+                cef_url=request['cef_url'],
+                inject_frontend=request['inject_frontend'],
+                worker_mode=request['worker_mode'],
+                github_api=request['github_api'],
+                release_repository=request['release_repository'],
+                testing_download_url=request['testing_download_url'],
             ))
             _write_json(directory / 'result.json', {'schema': 1, 'id': request_id, 'ok': True, 'result': result})
             return {'ok': True, 'command': 'activate-queued', 'request_id': request_id}
@@ -2151,10 +2050,7 @@ def _run_queued_activation(args: argparse.Namespace, paths: dict[str, Path]) -> 
             _write_json(directory / 'result.json', {'schema': 1, 'id': request_id, 'ok': False, 'error': str(error)})
         raise
     finally:
-        binary.unlink(missing_ok=True)
-        if service_file is not None:
-            service_file.unlink(missing_ok=True)
-        _fsync_directory(directory)
+        _cleanup_handoff_payloads(directory)
 
 def _run_status(args: argparse.Namespace) -> dict[str, object]:
     _require_root()
@@ -2224,22 +2120,27 @@ def main() -> int:
     install.add_argument('--cef-url', default=DEFAULT_CEF_URL, metavar='URL')
     install.add_argument('--inject-frontend', choices=('true', 'false'), default='true')
     install.add_argument('--worker-mode', choices=('exec', 'fork'), default='fork', help='forked plugin processes by default; exec starts each Python worker independently')
+    install.add_argument('--version', metavar='STRING')
+    install.add_argument('--github-api', default=DEFAULT_GITHUB_API, metavar='URL')
+    install.add_argument('--release-repository', default=DEFAULT_RELEASE_REPOSITORY, metavar='OWNER/REPOSITORY')
+    install.add_argument('--testing-download-url', default=DEFAULT_TESTING_DOWNLOAD_URL, metavar='URL')
     rollback = subparsers.add_parser('rollback', help='restore the previous recoverable binary, unit, and activation state')
     _add_common(rollback)
     status = subparsers.add_parser('status', help='report selected service and recoverable installer state')
     _add_common(status)
-    activate = subparsers.add_parser('activate-binary', help='transactionally replace the selected service executable')
-    activate.add_argument('--binary', required=True, metavar='FILE')
-    activate.add_argument('--version', required=True, metavar='STRING')
-    activate.add_argument('--homebrew', required=True, metavar='DIR')
-    activate.add_argument('--service-name', required=True, metavar='NAME')
-    activate.add_argument('--service-file', metavar='FILE')
-    queue = subparsers.add_parser('queue-activate-binary', help='durably hand off an update to an independent activation service')
-    queue.add_argument('--binary', required=True, metavar='FILE')
-    queue.add_argument('--version', required=True, metavar='STRING')
-    queue.add_argument('--homebrew', required=True, metavar='DIR')
-    queue.add_argument('--service-name', required=True, metavar='NAME')
-    queue.add_argument('--service-file', metavar='FILE')
+    install_bundle = subparsers.add_parser('queue-install-bundle', help='durably hand off a verified Rust bundle installation')
+    install_bundle.add_argument('--bundle', required=True, metavar='DIR')
+    install_bundle.add_argument('--version', required=True, metavar='STRING')
+    install_bundle.add_argument('--homebrew', required=True, metavar='DIR')
+    install_bundle.add_argument('--service-name', required=True, metavar='NAME')
+    install_bundle.add_argument('--user', required=True, metavar='USER')
+    install_bundle.add_argument('--listen', required=True, metavar='ADDRESS')
+    install_bundle.add_argument('--cef-url', required=True, metavar='URL')
+    install_bundle.add_argument('--inject-frontend', choices=('true', 'false'), required=True)
+    install_bundle.add_argument('--worker-mode', choices=('exec', 'fork'), required=True)
+    install_bundle.add_argument('--github-api', default=DEFAULT_GITHUB_API, metavar='URL')
+    install_bundle.add_argument('--release-repository', default=DEFAULT_RELEASE_REPOSITORY, metavar='OWNER/REPOSITORY')
+    install_bundle.add_argument('--testing-download-url', default=DEFAULT_TESTING_DOWNLOAD_URL, metavar='URL')
     queued = subparsers.add_parser('activate-queued', help=argparse.SUPPRESS)
     _add_common(queued)
     queued.add_argument('--request-id', required=True)
@@ -2256,14 +2157,19 @@ def main() -> int:
                 _fail('--user must resolve to a non-root service account')
             _validate_bundle(args.bundle, user)
         paths = _paths(_homebrew_path(args.homebrew, create=args.command == 'install'), args.service_name)
-        if args.command == 'queue-activate-binary':
+        if args.command == 'queue-install-bundle':
             descriptor = _locked(paths)
             try:
-                handoff = _prepare_activation_handoff(args, paths)
+                handoff = _prepare_install_handoff(args, paths)
             finally:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
                 os.close(descriptor)
-            output = _wait_for_handoff(paths, str(handoff['request_id']), str(handoff['unit']))
+            output = _wait_for_handoff(
+                paths,
+                str(handoff['request_id']),
+                str(handoff['unit']),
+                args.command,
+            )
         elif args.command == 'release-queued':
             output = _release_activation_handoff(args, paths)
         elif args.command == 'activate-queued':
@@ -2279,7 +2185,7 @@ def main() -> int:
                 elif args.command == 'status':
                     output = _run_status(args)
                 else:
-                    output = _run_activate_binary(args)
+                    _fail('unsupported installer command')
             finally:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
                 os.close(descriptor)

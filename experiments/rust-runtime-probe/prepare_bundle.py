@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Prepare an isolated private-test bundle, not a distributable Decky release.
 
-The tracked SDK and frontend must match the v3.2.10 tag. Use a CPython 3.11
+The SDK and frontend use v3.2.10. Use a CPython 3.11
 environment with the backend dependencies and PyInstaller 6.22.3 installed.
 Install the backend with POETRY_DYNAMIC_VERSIONING_BYPASS=3.2.10 so that its
 package metadata reports the verified SDK baseline, not the probe branch's
@@ -63,6 +63,8 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path)
         'tag': BASELINE_TAG, 'commit': commit,
         'backend_tree': backend_tree, 'frontend_tree': frontend_tree,
     }
+    helper_path = REPO / 'backend/decky_loader/helpers.py'
+    helper_sha256 = digest(helper_path)
     onedir_runtime = worker.parent / '_internal'
     worker_packaging = 'onedir' if onedir_runtime.is_dir() else 'onefile'
     if worker_packaging == 'onedir' and not any(onedir_runtime.rglob('*')):
@@ -72,6 +74,9 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path)
         raise ValueError('the private probe requires a frozen CPython 3.11 worker')
     if runtime['decky_version'] != BASELINE_TAG:
         raise ValueError(f'worker version {runtime["decky_version"]} does not match {BASELINE_TAG}; rebuild its package metadata')
+    helper = runtime.get('sdk_sources', {}).get('decky_loader.helpers', {})
+    if helper.get('sha256') != helper_sha256 or helper.get('code_matches_source') is not True:
+        raise ValueError('worker helper source/code does not match this checkout; rebuild the worker')
     subprocess.run([str(rust), '--help'], check=True, stdout=subprocess.DEVNULL, timeout=10)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.decky-private-bundle-', dir=output.parent) as temporary:
@@ -83,6 +88,7 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path)
             shutil.copytree(onedir_runtime, bundle / '_internal')
         shutil.copy2(rust, bundle / 'decky-rust-runtime-probe')
         shutil.copy2(HERE / 'install.py', bundle / 'install.py')
+        shutil.copy2(HERE / 'process_observer.py', bundle / 'process_observer.py')
         shutil.copytree(assets, bundle / 'assets')
         shutil.copytree(locales, bundle / 'locales')
         manifest = {
@@ -113,6 +119,7 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path)
             (plugin / 'package.json').write_text(json.dumps(package))
         for script in ('verify.py', 'validate_root.py'):
             shutil.copy2(HERE / script, staging / script)
+        shutil.copy2(HERE / 'process_observer.py', staging / 'process_observer.py')
         staging.rename(output)
     return {'output': str(output), 'files': len(manifest['sha256']), 'runtime': runtime, 'source_baseline': source_baseline, 'private_only': True}
 

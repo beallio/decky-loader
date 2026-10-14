@@ -17,6 +17,8 @@ import time
 import uuid
 import urllib.request
 
+from process_observer import cgroup_processes
+
 BASE = Path('/home/deck/.local/share/decky-rust-runtime-probe')
 BUNDLE = BASE / 'bundle'
 NORMAL = Path('/home/deck/homebrew')
@@ -72,15 +74,7 @@ def owned_processes() -> dict[int, int]:
     group = command('systemctl', 'show', SERVICE, '--property=ControlGroup', '--value')
     if not group:
         raise RuntimeError('the active Decky service has no control group')
-    root = Path('/sys/fs/cgroup') / group.lstrip('/')
-    result = {}
-    for path in root.rglob('cgroup.procs'):
-        for value in path.read_text().split():
-            pid = int(value)
-            state = identity(pid)
-            if state is not None:
-                result[pid] = state[0]
-    return result
+    return {pid: process.start_ticks for pid, process in cgroup_processes(group).items()}
 
 
 def stop_remaining(processes: dict[int, int]) -> None:
@@ -124,17 +118,7 @@ def cgroup_members(control_group: str | None) -> list[int]:
     relative = Path(control_group.lstrip('/'))
     if not control_group.startswith('/system.slice/') or '..' in relative.parts:
         raise RuntimeError(f'probe unit has an unexpected control group: {control_group}')
-    root = CGROUP_ROOT / relative
-    if not root.exists():
-        return []
-    members = set()
-    for process_file in root.rglob('cgroup.procs'):
-        try:
-            values = process_file.read_text().split()
-        except FileNotFoundError:
-            continue
-        members.update(int(value) for value in values)
-    return sorted(members)
+    return list(cgroup_processes(control_group))
 
 
 def rust_exitcode(properties: dict[str, str], started: bool) -> int | None:

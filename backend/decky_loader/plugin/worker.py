@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import importlib
 from importlib.abc import Loader, MetaPathFinder
 from importlib.machinery import ModuleSpec
@@ -12,7 +13,7 @@ import platform
 import sys
 import sysconfig
 from pathlib import Path
-from types import ModuleType
+from types import CodeType, ModuleType
 from typing import Any, Callable, Coroutine, Sequence, cast
 
 
@@ -80,6 +81,29 @@ def prepare_runtime(bootstrap: str) -> None:
     _prepared_bootstraps.add(bootstrap)
 
 
+def _normalize_code(code: CodeType) -> CodeType:
+    return code.replace(
+        co_filename="",
+        co_consts=tuple(_normalize_code(value) if isinstance(value, CodeType) else value
+                        for value in code.co_consts),
+    )
+
+
+def _helper_source_description() -> dict[str, Any]:
+    from decky_loader import helpers
+
+    source = Path(helpers.__file__).read_bytes()
+    loader = helpers.__loader__
+    code = loader.get_code(helpers.__name__)
+    compiled = compile(source, helpers.__file__, "exec", dont_inherit=True, optimize=0)
+    if not isinstance(code, CodeType) or _normalize_code(code) != _normalize_code(compiled):
+        raise WorkerError("packaged helper source differs from its loaded Python code")
+    return {
+        "sha256": hashlib.sha256(source).hexdigest(),
+        "code_matches_source": True,
+    }
+
+
 def _runtime_description() -> dict[str, Any]:
     from decky_loader.helpers import get_loader_version
 
@@ -90,6 +114,7 @@ def _runtime_description() -> dict[str, Any]:
         "frozen": bool(getattr(sys, "frozen", False)),
         "executable": sys.executable,
         "decky_version": get_loader_version(),
+        "sdk_sources": {"decky_loader.helpers": _helper_source_description()},
     }
 
 
