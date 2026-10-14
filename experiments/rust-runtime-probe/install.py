@@ -1273,7 +1273,7 @@ def _api_health(paths: dict[str, Path], listen: str) -> None:
         _websocket_send(connection, 8, b'')
 
 
-def _health(paths: dict[str, Path], listen: str, timeout: float = 45) -> None:
+def _health(paths: dict[str, Path], listen: str | None = None, timeout: float = 45) -> None:
     deadline = time.monotonic() + timeout
     last_error = 'service has not become ready'
     while time.monotonic() < deadline:
@@ -1285,11 +1285,12 @@ def _health(paths: dict[str, Path], listen: str, timeout: float = 45) -> None:
                 _fail('systemd returned an invalid MainPID')
             if pid > 0 and _process_is_binary(pid, paths['binary']):
                 try:
-                    if not _service_owns_listener(properties, pid, listen):
+                    checked_listen = _configured_listen(paths) if listen is None else listen
+                    if not _service_owns_listener(properties, pid, checked_listen):
                         last_error = 'the configured TCP listener is not owned by the selected service MainPID or its descendants'
                         time.sleep(0.35)
                         continue
-                    _api_health(paths, listen)
+                    _api_health(paths, checked_listen)
                 except (InstallerError, OSError, urllib.error.URLError) as error:
                     last_error = str(error)
                     time.sleep(0.35)
@@ -1304,7 +1305,7 @@ def _health(paths: dict[str, Path], listen: str, timeout: float = 45) -> None:
                     and after.get('SubState') == 'running'
                     and same_pid
                     and _process_is_binary(pid, paths['binary'])
-                    and _service_owns_listener(after, pid, listen)
+                    and _service_owns_listener(after, pid, checked_listen)
                 ):
                     return
                 last_error = 'service MainPID or listener ownership changed during health validation'
@@ -1322,7 +1323,7 @@ def _apply_activation(paths: dict[str, Path], activation: dict[str, object], che
         _systemctl(paths, 'start', paths['unit'].name, timeout=45)
         _wait_running(paths)
         if check_running:
-            _health(paths, _configured_listen(paths))
+            _health(paths)
     else:
         _stop_service(paths)
 
@@ -1353,6 +1354,27 @@ def _configured_listen(paths: dict[str, Path]) -> str:
                     return arguments[index + 1]
     except InstallerError:
         pass
+    properties = _unit_properties(paths)
+    try:
+        pid = int(properties.get('MainPID', '0') or '0')
+    except ValueError:
+        _fail('systemd returned an invalid MainPID while determining the listener')
+    if pid > 0 and _process_is_binary(pid, paths['binary']):
+        try:
+            entries = Path(f'/proc/{pid}/environ').read_bytes().split(b'\0')
+            environment: dict[str, str] = {}
+            for entry in entries:
+                key, separator, value = entry.partition(b'=')
+                if separator and key in (b'SERVER_HOST', b'SERVER_PORT'):
+                    environment[key.decode('ascii')] = value.decode('utf-8')
+        except (OSError, UnicodeError) as error:
+            raise InstallerError(f'cannot read the selected backend listener environment: {error}') from error
+        host, port = _listen_endpoint(DEFAULT_LISTEN)
+        host = environment.get('SERVER_HOST', host)
+        port_text = environment.get('SERVER_PORT', str(port))
+        listen = f'[{host}]:{port_text}' if ':' in host else f'{host}:{port_text}'
+        _listen_endpoint(listen)
+        return listen
     return DEFAULT_LISTEN
 
 
@@ -1441,17 +1463,7 @@ def _restore_transaction(paths: dict[str, Path], transaction_id: str, record: di
         assert isinstance(state, dict)
         _restore_file(target, transaction / 'before' / key, state)
     _systemctl(paths, 'daemon-reload', timeout=30)
-    _apply_activation(paths, activation, check_running=False)
-    if activation.get('running'):
-        properties = _wait_running(paths)
-        try:
-            pid = int(properties.get('MainPID', '0'))
-        except ValueError:
-            _fail('systemd returned an invalid restored MainPID')
-        if pid <= 0 or not _process_is_binary(pid, paths['binary']):
-            _fail('restored service MainPID does not execute the restored PluginLoader')
-    else:
-        _wait_stopped(paths)
+    _apply_activation(paths, activation)
 
 
 def _remove_runtime_from_journal(paths: dict[str, Path], journal: dict[str, object]) -> None:
@@ -1731,7 +1743,7 @@ def _run_rollback(args: argparse.Namespace) -> dict[str, object]:
         _systemctl(paths, 'daemon-reload', timeout=30)
         _apply_activation(paths, target_activation, check_running=False)
         if target_activation.get('running'):
-            _health(paths, _configured_listen(paths))
+            _health(paths)
         else:
             _wait_stopped(paths)
         _commit(paths, journal)
