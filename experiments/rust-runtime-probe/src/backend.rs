@@ -89,6 +89,7 @@ pub struct Backend {
     pub(crate) user: String,
     pub(crate) user_home: String,
     pub(crate) version: String,
+    pub(crate) sdk_version: String,
     pub(crate) client: reqwest::Client,
     pub(crate) config: RuntimeConfig,
     pub(crate) cef: Cef,
@@ -104,6 +105,7 @@ impl Backend {
         user: String,
         user_home: String,
         version: String,
+        sdk_version: String,
     ) -> anyhow::Result<Self> {
         let settings_path = registry
             .plugin_root()
@@ -133,6 +135,7 @@ impl Backend {
             user,
             user_home,
             version,
+            sdk_version,
             client,
             config,
             cef,

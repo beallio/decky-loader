@@ -40,7 +40,9 @@ def digest(path: Path) -> str:
     return result.hexdigest()
 
 
-def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path) -> dict:
+def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path, release_version: str) -> dict:
+    if not release_version or any(ord(character) < 32 or ord(character) == 127 for character in release_version):
+        raise ValueError('release version must be a non-empty printable identifier')
     for executable in (worker, rust):
         if not executable.is_file():
             raise ValueError(f'missing executable: {executable}')
@@ -86,6 +88,10 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path)
         shutil.copy2(worker, bundle / 'DeckyPluginWorker')
         if worker_packaging == 'onedir':
             shutil.copytree(onedir_runtime, bundle / '_internal')
+            # Match the frozen SDK bootstrap before recording the immutable payload.
+            (bundle / '_internal').chmod(0o755)
+            for path in (bundle / '_internal').rglob('*'):
+                path.chmod(0o755)
         shutil.copy2(rust, bundle / 'decky-rust-runtime-probe')
         shutil.copy2(HERE / 'install.py', bundle / 'install.py')
         shutil.copy2(HERE / 'process_observer.py', bundle / 'process_observer.py')
@@ -93,6 +99,7 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path)
         shutil.copytree(locales, bundle / 'locales')
         manifest = {
             'kind': 'decky-rust-runtime-probe',
+            'release_version': release_version,
             'private_only': True,
             'distribution_approved': False,
             'worker_packaging': worker_packaging,
@@ -131,8 +138,9 @@ def main() -> None:
     parser.add_argument('--assets', type=Path, default=REPO / 'backend/decky_loader/static')
     parser.add_argument('--locales', type=Path, default=REPO / 'backend/decky_loader/locales')
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--release-version', default='dev', help='Rust release identity, separate from the packaged SDK baseline')
     args = parser.parse_args()
-    print(json.dumps(prepare(args.worker.resolve(), args.rust.resolve(), args.assets.resolve(), args.locales.resolve(), args.output.resolve())))
+    print(json.dumps(prepare(args.worker.resolve(), args.rust.resolve(), args.assets.resolve(), args.locales.resolve(), args.output.resolve(), args.release_version)))
 
 
 if __name__ == '__main__':

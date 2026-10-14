@@ -19,7 +19,7 @@ use tokio::{
 use backend::{Backend, RuntimeConfig};
 use workers::{PluginRegistry, WorkerBootstrap, WorkerConfiguration, WorkerMode};
 
-const HELP: &str = "Decky Rust backend (private SteamOS validation build)\n\nRequired:\n  --worker PATH              Packaged DeckyPluginWorker executable\n  --plugin-root PATH         Installed plugin directory\n  --homebrew PATH            Unprivileged settings/data/logs root\n  --user USER                Host user identity for normal plugins\n  --assets PATH              Existing Decky frontend bundles\n  --locales PATH             Existing Decky locale JSON directory\n\nOptional:\n  --worker-mode MODE         Worker supervision: fork or exec (default fork)\n  --worker-bootstrap MODE    Runtime preload: full or lean (default lean)\n  --listen ADDRESS           Loopback address (default 127.0.0.1:1339)\n  --auth-file PATH           Read token from a private file\n  --service-name NAME        Loader systemd service (default plugin_loader)\n  --cef-url URL              Steam CEF debugger (default http://127.0.0.1:8080)\n  --inject-frontend BOOL     Run native frontend injector (default false)\n  --installer PATH           Transactional installer used for loader updates\n  --github-api URL           GitHub API origin\n  --release-repository NAME  Rust release repository (default beallio/decky-loader)\n  --testing-download-url URL Rust testing artifact service (default https://nightly.link)\n\nUses the unchanged v3.2.10 frontend and packaged Python SDK. Supports plugin\nmanagement, utilities, native CEF integration and transactional loader updates.\nPhysical Steam Deck validation and public distribution are not complete.\n";
+const HELP: &str = "Decky Rust backend (private SteamOS validation build)\n\nRequired:\n  --worker PATH              Packaged DeckyPluginWorker executable\n  --plugin-root PATH         Installed plugin directory\n  --homebrew PATH            Unprivileged settings/data/logs root\n  --user USER                Host user identity for normal plugins\n  --assets PATH              Existing Decky frontend bundles\n  --locales PATH             Existing Decky locale JSON directory\n\nOptional:\n  --worker-mode MODE         Worker supervision: fork or exec (default fork)\n  --worker-bootstrap MODE    Runtime preload: full or lean (default lean)\n  --release-version STRING  Installed Rust release identity (default dev)\n  --listen ADDRESS           Loopback address (default 127.0.0.1:1339)\n  --auth-file PATH           Read token from a private file\n  --service-name NAME        Loader systemd service (default plugin_loader)\n  --cef-url URL              Steam CEF debugger (default http://127.0.0.1:8080)\n  --inject-frontend BOOL     Run native frontend injector (default false)\n  --installer PATH           Transactional installer used for loader updates\n  --github-api URL           GitHub API origin\n  --release-repository NAME  Rust release repository (default beallio/decky-loader)\n  --testing-download-url URL Rust testing artifact service (default https://nightly.link)\n\nUses the unchanged v3.2.10 frontend and packaged Python SDK. Supports plugin\nmanagement, utilities, native CEF integration and transactional loader updates.\nPhysical Steam Deck validation and public distribution are not complete.\n";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
             "--worker",
             "--worker-mode",
             "--worker-bootstrap",
+            "--release-version",
             "--plugin-root",
             "--homebrew",
             "--user",
@@ -163,10 +164,20 @@ async fn main() -> anyhow::Result<()> {
     {
         bail!("probe requires the CPython 3.11 release-compatibility runtime, received {runtime}");
     }
-    let version = runtime["decky_version"]
+    let sdk_version = runtime["decky_version"]
         .as_str()
         .context("worker description is missing decky_version")?
         .to_owned();
+    let version = options
+        .remove("--release-version")
+        .unwrap_or_else(|| "dev".to_owned());
+    if version.is_empty()
+        || version
+            .chars()
+            .any(|character| character.is_ascii_control())
+    {
+        bail!("--release-version must be a non-empty printable release identifier");
+    }
     let account = Command::new("getent")
         .args(["passwd", &user])
         .output()
@@ -239,7 +250,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let backend = tokio::select! {
-        result = Backend::new(registry.clone(), homebrew, user, user_home, version) => {
+        result = Backend::new(registry.clone(), homebrew, user, user_home, version, sdk_version) => {
             match result {
                 Ok(backend) => Arc::new(backend.with_config(config)),
                 Err(error) => {

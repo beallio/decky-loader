@@ -852,6 +852,7 @@ mod tests {
                 user,
                 directory.0.to_string_lossy().into_owned(),
                 "dev".into(),
+                "v3.2.10".into(),
             )
             .await
             .unwrap(),

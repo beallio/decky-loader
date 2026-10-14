@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import platform
 import pwd
+import random
 import shlex
 import shutil
 import signal
@@ -38,6 +39,12 @@ PLUGIN_DIRECTORY = 'DeckyRuntimeBenchmark'
 EXPECTED_ARITHMETIC = 2048 * 2049 * 4097 // 6
 EXPECTED_ACTIVE_PLUGINS = ('CSS Loader', 'Decky Metadata', 'SDH-Ludusavi')
 EXPECTED_PASSIVE_PLUGINS = ('HLTB for Deck',)
+SCALING_PLUGIN_COUNTS = (0, 4, 8, 12)
+SCALING_VARIANTS = ('python-installed', 'rust-lean-fork')
+SCALING_EXPECTED_INSTALLED_PLUGINS = (*EXPECTED_ACTIVE_PLUGINS, *EXPECTED_PASSIVE_PLUGINS)
+SCALING_FIXTURE_NAME_PREFIX = 'Decky Runtime Scaling Fixture'
+SCALING_FIXTURE_DIRECTORY_PREFIX = 'DeckyRuntimeScalingFixture'
+SDK_VERSION = 'v3.2.10'
 INPUT_DIRECTORIES = ('plugins', 'settings', 'data', 'themes')
 STOP_TIMEOUT_SECONDS = 55
 UNIT_STOP_SECONDS = 45
@@ -98,11 +105,18 @@ def _hash_record(hasher, value: object) -> None:
     hasher.update(encoded)
 
 
-def tree_digest(root: Path) -> dict[str, object]:
+
+def stable_fingerprint(value: object) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def tree_digest(root: Path, *, include_inventory: bool = False) -> dict[str, object]:
     """Hash paths, file contents, modes, and symlink targets without following links."""
     root = root.resolve(strict=True)
     hasher = hashlib.sha256()
     entries = 0
+    inventory = []
     pending = [root]
     while pending:
         directory = pending.pop()
@@ -121,8 +135,13 @@ def tree_digest(root: Path) -> dict[str, object]:
             else:
                 raise BenchmarkError(f'unsupported special file in benchmark input: {child}')
             _hash_record(hasher, record)
+            if include_inventory:
+                inventory.append(record)
             entries += 1
-    return {'sha256': hasher.hexdigest(), 'entries': entries}
+    result = {'sha256': hasher.hexdigest(), 'entries': entries}
+    if include_inventory:
+        result['inventory'] = inventory
+    return result
 
 
 def inputs_digest(homebrew: Path) -> dict[str, object]:
@@ -239,8 +258,8 @@ def worker_description(path: Path, temp_dir: Path) -> dict[str, object]:
         raise BenchmarkError(f'{path} --describe returned a non-object')
     if not str(description.get('python', '')).startswith('3.11.'):
         raise BenchmarkError(f'{path} is not the required CPython 3.11 worker: {description}')
-    if description.get('decky_version') != 'v3.2.10' or description.get('frozen') is not True:
-        raise BenchmarkError(f'{path} does not describe the frozen Decky v3.2.10 worker: {description}')
+    if description.get('decky_version') != SDK_VERSION or description.get('frozen') is not True:
+        raise BenchmarkError(f'{path} does not describe the frozen Decky {SDK_VERSION} worker: {description}')
     return description
 
 
@@ -332,7 +351,124 @@ def copy_snapshot(source: Path, snapshot: Path) -> dict[str, object]:
         else:
             destination.mkdir()
             source_info[name] = {'source': str(source_path), 'present': False}
+    for name in INPUT_DIRECTORIES:
+        inventory = tree_digest(snapshot / name, include_inventory=True)
+        source_info[name]['snapshot_sha256'] = inventory['sha256']
+        source_info[name]['snapshot_entries'] = inventory['entries']
+        source_info[name]['snapshot_inventory'] = inventory['inventory']
     return source_info
+
+
+def scaling_fixture_name(index: int) -> str:
+    return f'{SCALING_FIXTURE_NAME_PREFIX} {index:03d}'
+
+
+def scaling_fixture_directory(index: int) -> str:
+    return f'{SCALING_FIXTURE_DIRECTORY_PREFIX}{index:03d}'
+
+
+def create_scaling_fixture_plugins(plugin_root: Path, fixture_count: int) -> list[str]:
+    names = []
+    for index in range(1, fixture_count + 1):
+        name = scaling_fixture_name(index)
+        directory = plugin_root / scaling_fixture_directory(index)
+        if name in installed_plugin_catalog(plugin_root) or directory.exists():
+            raise BenchmarkError(f'scaling fixture already exists in the captured plugin catalog: {name}')
+        directory.mkdir()
+        metadata = dict(PLUGIN_METADATA, name=name)
+        (directory / 'plugin.json').write_text(json.dumps(metadata, sort_keys=True) + '\n')
+        package = {'name': f'decky-runtime-scaling-fixture-{index:03d}', 'version': '0.0.0', 'type': 'module'}
+        (directory / 'package.json').write_text(json.dumps(package, sort_keys=True) + '\n')
+        (directory / 'main.py').write_text(PLUGIN_SOURCE)
+        names.append(name)
+    return names
+
+
+def runtime_catalog(plugin_root: Path) -> dict[str, dict[str, object]]:
+    catalog = installed_plugin_catalog(plugin_root)
+    result = {}
+    for name, entry in catalog.items():
+        package_path = plugin_root / str(entry['directory']) / 'package.json'
+        package_version = None
+        load_type = 0
+        if package_path.is_file():
+            try:
+                package = json.loads(package_path.read_text())
+            except (OSError, json.JSONDecodeError) as error:
+                raise BenchmarkError(f'invalid package metadata {package_path}: {error}') from error
+            if not isinstance(package, dict):
+                raise BenchmarkError(f'package metadata must be an object: {package_path}')
+            package_version = package.get('version')
+            load_type = 1 if package.get('type') == 'module' else 0
+        result[name] = {
+            'directory': entry['directory'],
+            'version': entry['version'],
+            'package_version': package_version,
+            'api_version': entry['api_version'],
+            'passive': entry['passive'],
+            'load_type': load_type,
+            'flags': entry['metadata'].get('flags'),
+        }
+    return result
+
+
+def create_scaling_snapshots(snapshot: Path, work_root: Path) -> dict[int, dict[str, object]]:
+    source_catalog = runtime_catalog(snapshot / 'plugins')
+    if set(source_catalog) != set(SCALING_EXPECTED_INSTALLED_PLUGINS):
+        raise BenchmarkError(
+            'plugin-count scaling requires exactly the four installed backend plugins; '
+            f'found {sorted(source_catalog)}'
+        )
+    if any(name.startswith(SCALING_FIXTURE_NAME_PREFIX) for name in source_catalog):
+        raise BenchmarkError('installed plugin catalog conflicts with reserved scaling fixture names')
+
+    snapshots: dict[int, dict[str, object]] = {}
+    for plugin_count in SCALING_PLUGIN_COUNTS:
+        fixture_count = max(0, plugin_count - len(source_catalog))
+        destination = work_root / 'plugin-count-snapshots' / f'count-{plugin_count:02d}'
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(snapshot, destination, symlinks=True)
+        plugin_root = destination / 'plugins'
+        fixture_names: list[str] = []
+        if plugin_count == 0:
+            for child in plugin_root.iterdir():
+                if child.is_symlink() or not child.is_dir():
+                    child.unlink()
+                else:
+                    shutil.rmtree(child)
+        elif fixture_count:
+            fixture_names = create_scaling_fixture_plugins(plugin_root, fixture_count)
+
+        catalog = runtime_catalog(plugin_root)
+        if len(catalog) != plugin_count:
+            raise BenchmarkError(
+                f'plugin-count snapshot {plugin_count} contains {len(catalog)} catalog entries'
+            )
+        active_count = sum(not bool(entry['passive']) for entry in catalog.values())
+        passive_count = len(catalog) - active_count
+        if plugin_count == 0 and (active_count or passive_count):
+            raise BenchmarkError('empty plugin-count snapshot unexpectedly contains catalog entries')
+        if plugin_count >= 4:
+            for name in SCALING_EXPECTED_INSTALLED_PLUGINS:
+                if name not in catalog:
+                    raise BenchmarkError(f'plugin-count snapshot lost installed plugin {name!r}')
+            if set(catalog).intersection(SCALING_EXPECTED_INSTALLED_PLUGINS) != set(SCALING_EXPECTED_INSTALLED_PLUGINS):
+                raise BenchmarkError('plugin-count snapshot does not preserve the installed plugin catalog')
+
+        input_inventory = tree_digest(destination, include_inventory=True)
+        digest = inputs_digest(destination)
+        if input_inventory['entries'] < digest['entries']:
+            raise BenchmarkError(f'plugin-count snapshot {plugin_count} inventory is incomplete')
+        snapshots[plugin_count] = {
+            'path': destination,
+            'digest': digest,
+            'source_inventory': input_inventory,
+            'catalog': catalog,
+            'active_plugin_count': active_count,
+            'passive_plugin_count': passive_count,
+            'fixture_names': fixture_names,
+        }
+    return snapshots
 
 
 def chown_tree(path: Path, uid: int, gid: int) -> None:
@@ -647,12 +783,14 @@ def _rust_command(
     locales: Path,
     mode: str,
     bootstrap: str,
+    release_version: str,
 ) -> list[str]:
     return [
         str(rust_executable),
         '--listen', LISTEN,
-        '--inject-frontend', 'true',
+        '--inject-frontend', 'false',
         '--worker', str(worker),
+        '--release-version', release_version,
         '--worker-mode', mode,
         '--worker-bootstrap', bootstrap,
         '--plugin-root', str(homebrew / 'plugins'),
@@ -758,6 +896,9 @@ def run_trial(
     variant: str,
     replication: int,
     order_position: int,
+    profile: str,
+    plugin_count: int | None,
+    fixture_names: list[str],
     snapshot: Path,
     expected_snapshot_digest: dict[str, object],
     account: pwd.struct_passwd,
@@ -768,6 +909,9 @@ def run_trial(
     worker: Path,
     assets: Path,
     locales: Path,
+    release_version: str,
+    python_inventory_fingerprint: str,
+    rust_bundle_fingerprint: str,
     startup_timeout: float,
     rpc_timeout: float,
     idle_seconds: float,
@@ -785,6 +929,16 @@ def run_trial(
         'unit': unit,
         'description': description,
         'variant': variant,
+        'profile': profile,
+        'plugin_count': plugin_count,
+        'rust_bundle_fingerprint': rust_bundle_fingerprint if variant != 'python-installed' else None,
+        'python_source_inventory_fingerprint': (
+            stable_fingerprint({
+                'python_executable_inventory': python_inventory_fingerprint,
+                'input_snapshot_sha256': expected_snapshot_digest['sha256'],
+            })
+            if variant == 'python-installed' else None
+        ),
         'replication': replication,
         'order_position': order_position,
         'started_at_utc': utc_now(),
@@ -812,19 +966,40 @@ def run_trial(
                 f'clone differs from immutable input snapshot: expected {expected_snapshot_digest}, got {copied_inputs}'
             )
         (homebrew / 'logs').mkdir(exist_ok=True)
-        plugin_digest = create_benchmark_plugin(homebrew / 'plugins')
-        trial['benchmark_plugin_sha256'] = plugin_digest['sha256']
+        if profile == 'standard':
+            plugin_digest = create_benchmark_plugin(homebrew / 'plugins')
+            trial['benchmark_plugin_sha256'] = plugin_digest['sha256']
+        elif profile != 'plugin-count-scaling':
+            raise BenchmarkError(f'unknown benchmark profile: {profile}')
+        if profile == 'plugin-count-scaling':
+            if plugin_count not in SCALING_PLUGIN_COUNTS:
+                raise BenchmarkError(f'invalid scaling plugin count: {plugin_count}')
+            if len(runtime_catalog(homebrew / 'plugins')) != plugin_count:
+                raise BenchmarkError(f'plugin-count clone does not contain exactly {plugin_count} entries')
+        expected_catalog = runtime_catalog(homebrew / 'plugins')
+        if profile == 'plugin-count-scaling' and set(expected_catalog).intersection(fixture_names) != set(fixture_names):
+            raise BenchmarkError('fixture names do not match the plugin-count clone catalog')
+        trial['expected_catalog_active_plugin_count'] = sum(
+            not bool(entry['passive']) for entry in expected_catalog.values()
+        )
+        trial['expected_catalog_passive_plugin_count'] = sum(
+            bool(entry['passive']) for entry in expected_catalog.values()
+        )
+        trial['expected_catalog_entry_count'] = len(expected_catalog)
         chown_tree(homebrew, account.pw_uid, account.pw_gid)
 
         variant_config = next((entry for entry in VARIANTS if entry[0] == variant), None)
         if variant_config is None:
             raise BenchmarkError(f'unknown benchmark variant: {variant}')
         _, worker_mode, worker_bootstrap = variant_config
+        expected_current_version = SDK_VERSION if worker_mode is None else release_version
+        expected_sdk_version = None if worker_mode is None else SDK_VERSION
         if worker_mode is None:
             service_command = _normal_service_command(python_executable)
         else:
             service_command = _rust_command(
-                rust_executable, worker, homebrew, assets, locales, worker_mode, worker_bootstrap
+                rust_executable, worker, homebrew, assets, locales, worker_mode, worker_bootstrap,
+                release_version,
             )
 
         existing = systemctl_properties(unit)
@@ -855,22 +1030,32 @@ def run_trial(
                 'startup_timeout': startup_timeout,
                 'rpc_timeout': rpc_timeout,
                 'expected_arithmetic': EXPECTED_ARITHMETIC,
-                'active_plugins': list(EXPECTED_ACTIVE_PLUGINS),
-                'passive_plugins': list(EXPECTED_PASSIVE_PLUGINS),
-                'benchmark_plugin': PLUGIN_NAME,
+                'expected_catalog': expected_catalog,
+                'expected_current_version': expected_current_version,
+                'expected_sdk_version': expected_sdk_version,
+                'benchmark_plugin': PLUGIN_NAME if profile == 'standard' else None,
+                'real_plugin_rpc': profile == 'standard' or (plugin_count is not None and plugin_count >= 4),
+                'fixture_plugins': fixture_names,
             },
-            startup_timeout + 6 * rpc_timeout + 10,
+            startup_timeout + (8 + len(fixture_names)) * rpc_timeout + 10,
         )
         trial['startup'] = startup
         if startup.get('ok') is not True:
             raise BenchmarkError(f'auth/plugin/backend startup readiness failed: {startup.get("error", startup)}')
         trial['startup_to_readiness_seconds'] = startup['startup_seconds']
+        trial['catalog_active_plugin_count'] = startup['catalog_active_plugin_count']
+        trial['catalog_passive_plugin_count'] = startup['catalog_passive_plugin_count']
+        trial['catalog_entry_count'] = startup['catalog_entry_count']
+        trial['catalog_plugin_names'] = startup['catalog_plugin_names']
+        trial['plugin_load_errors'] = startup['plugin_load_errors']
         assert_service_unchanged(_ACTIVE_BASELINE)
 
         pss = cgroup_pss(control_group)
         trial['pss_after_readiness_mib'] = pss['pss_mib']
         trial['private_dirty_after_readiness_mib'] = pss['private_dirty_mib']
         trial['process_count_after_readiness'] = pss['process_count']
+        trial['live_process_count_after_readiness'] = pss['live_process_count']
+        trial['zombie_count_after_readiness'] = pss['zombie_count']
         trial['pss_sample'] = pss
 
         cpu_before = cgroup_usage_usec(control_group)
@@ -890,35 +1075,79 @@ def run_trial(
         current = systemctl_properties(unit)
         if current.get('Description') != description or int(current.get('MainPID') or 0) <= 0:
             raise BenchmarkError(f'benchmark unit exited before loaded RPC measurement: {current}')
+        if profile == 'plugin-count-scaling':
+            operation_plan = [{
+                'name': 'backend_ping',
+                'route': 'updater/get_version_info',
+                'args': [],
+                'validation': {
+                    'kind': 'version',
+                    'expected_current': expected_current_version,
+                    'expected_sdk_version': expected_sdk_version,
+                },
+            }]
+            if plugin_count is not None and plugin_count >= 4:
+                operation_plan.append({
+                    'name': 'common_real_plugin',
+                    'route': 'loader/call_legacy_plugin_method',
+                    'args': ['CSS Loader', 'get_backend_version', {}],
+                    'validation': {'kind': 'css_version'},
+                })
+            if fixture_names:
+                operation_plan.append({
+                    'name': 'fixture_plugin',
+                    'route': 'loader/call_plugin_method',
+                    'args': [fixture_names[0], 'sum_squares'],
+                    'validation': {'kind': 'arithmetic', 'expected': EXPECTED_ARITHMETIC},
+                    'plugin_name': fixture_names[0],
+                })
+        else:
+            operation_plan = [{
+                'name': 'benchmark_arithmetic',
+                'route': 'loader/call_plugin_method',
+                'args': [PLUGIN_NAME, 'sum_squares'],
+                'validation': {'kind': 'arithmetic', 'expected': EXPECTED_ARITHMETIC},
+                'plugin_name': PLUGIN_NAME,
+            }]
         measurement = run_client_helper(
             int(current['MainPID']),
             {
                 'mode': 'measure',
                 'base_url': BASE_URL,
-                'plugin_name': PLUGIN_NAME,
-                'expected_arithmetic': EXPECTED_ARITHMETIC,
+                'operations': operation_plan,
                 'rpc_timeout': rpc_timeout,
                 'warmup_calls': 10,
                 'rpc_calls': 200,
                 'cgroup_path': cgroup_path_string(control_group),
             },
-            max(120, rpc_timeout * 200 + 30),
+            max(120, (rpc_timeout * (210 * len(operation_plan) + 1)) + 30),
         )
-        trial['rpc_measurement'] = measurement
+        trial['rpc_measurements'] = measurement.get('measurements', {})
+        if profile == 'standard':
+            arithmetic = trial['rpc_measurements'].get('benchmark_arithmetic')
+            if arithmetic is not None:
+                trial['rpc_measurement'] = arithmetic
+        else:
+            trial['rpc_measurement_status'] = {
+                'ok': measurement.get('ok'),
+                'failed_operations': measurement.get('failed_operations', []),
+            }
         if measurement.get('ok') is not True:
-            raise BenchmarkError(f'loaded arithmetic RPC measurement failed: {measurement.get("error", measurement)}')
-        trial['rpc'] = {
-            'warmup_calls': measurement['warmup_calls'],
-            'planned_calls': measurement['planned_calls'],
-            'completed_calls': measurement['completed_calls'],
-            'latency_ms': measurement['latency_ms'],
-            'latency_p50_ms': measurement['latency_p50_ms'],
-            'latency_p95_ms': measurement['latency_p95_ms'],
-            'throughput_calls_per_second': measurement['throughput_calls_per_second'],
-            'loaded_wall_seconds': measurement['loaded_wall_seconds'],
-            'loaded_cpu_usage_usec': measurement['loaded_cpu_usage_usec'],
-            'loaded_cpu_usec_per_completed_call': measurement['loaded_cpu_usec_per_completed_call'],
-        }
+            raise BenchmarkError(f'loaded RPC measurement failed: {measurement.get("error", measurement)}')
+        if profile == 'standard':
+            arithmetic = trial['rpc_measurements']['benchmark_arithmetic']
+            trial['rpc'] = {
+                'warmup_calls': arithmetic['warmup_calls'],
+                'planned_calls': arithmetic['planned_calls'],
+                'completed_calls': arithmetic['completed_calls'],
+                'latency_ms': arithmetic['latency_ms'],
+                'latency_p50_ms': arithmetic['latency_p50_ms'],
+                'latency_p95_ms': arithmetic['latency_p95_ms'],
+                'throughput_calls_per_second': arithmetic['throughput_calls_per_second'],
+                'loaded_wall_seconds': arithmetic['loaded_wall_seconds'],
+                'loaded_cpu_usage_usec': arithmetic['loaded_cpu_usage_usec'],
+                'loaded_cpu_usec_per_completed_call': arithmetic['loaded_cpu_usec_per_completed_call'],
+            }
     except BaseException as error:
         trial_error = error
         trial['error'] = f'{type(error).__name__}: {error}'
@@ -1017,7 +1246,423 @@ def describe(values: list[float]) -> dict[str, object]:
     }
 
 
+def bootstrap_mean_interval(
+    values: list[float],
+    seed_key: str,
+    *,
+    paired: bool = False,
+    resamples: int = 10000,
+) -> dict[str, object] | None:
+    if len(values) < 2:
+        return None
+    seed = int(hashlib.sha256(seed_key.encode('utf-8')).hexdigest()[:16], 16)
+    generator = random.Random(seed)
+    count = len(values)
+    means = [
+        sum(values[generator.randrange(count)] for _ in range(count)) / count
+        for _ in range(resamples)
+    ]
+    return {
+        'confidence_level': 0.95,
+        'method': ('paired ' if paired else '') + 'percentile bootstrap of the mean',
+        'resamples': resamples,
+        'seed': seed,
+        'lower': percentile(means, 2.5),
+        'upper': percentile(means, 97.5),
+    }
+
+
+def scaling_metric_value(trial: dict[str, object], metric: str) -> float | None:
+    direct = {
+        'startup_to_readiness_seconds': trial.get('startup_to_readiness_seconds'),
+        'pss_after_readiness_mib': trial.get('pss_after_readiness_mib'),
+        'private_dirty_after_readiness_mib': trial.get('private_dirty_after_readiness_mib'),
+        'process_count_after_readiness': trial.get('process_count_after_readiness'),
+        'live_process_count_after_readiness': trial.get('live_process_count_after_readiness'),
+        'catalog_entry_count': trial.get('catalog_entry_count'),
+        'catalog_active_plugin_count': trial.get('catalog_active_plugin_count'),
+        'catalog_passive_plugin_count': trial.get('catalog_passive_plugin_count'),
+        'idle_cpu_percent_of_one_core': (trial.get('idle_cpu') or {}).get('percent_of_one_core'),
+        'shutdown_latency_seconds': trial.get('shutdown_latency_seconds'),
+    }
+    if metric in direct:
+        value = direct[metric]
+    elif metric.startswith('rpc.'):
+        _, operation_name, field = metric.split('.', 2)
+        value = (trial.get('rpc_measurements') or {}).get(operation_name, {}).get(field)
+    else:
+        raise KeyError(f'unknown scaling metric {metric!r}')
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def scaling_metric_summary(values: list[float], key: str, *, paired: bool = False) -> dict[str, object]:
+    return {
+        **describe(values),
+        'ci95_mean': bootstrap_mean_interval(values, key, paired=paired),
+    }
+
+
+def summarize_scaling(raw: dict[str, object]) -> dict[str, object]:
+    trials = raw.get('trials', [])
+    configuration = raw.get('configuration', {})
+    expected_iterations = int(configuration.get('iterations_per_variant_and_count', 0))
+    base_metrics = (
+        'startup_to_readiness_seconds',
+        'pss_after_readiness_mib',
+        'private_dirty_after_readiness_mib',
+        'process_count_after_readiness',
+        'live_process_count_after_readiness',
+        'catalog_entry_count',
+        'catalog_active_plugin_count',
+        'catalog_passive_plugin_count',
+        'idle_cpu_percent_of_one_core',
+        'shutdown_latency_seconds',
+    )
+    operation_fields = (
+        'latency_p50_ms',
+        'latency_p95_ms',
+        'throughput_calls_per_second',
+        'loaded_cpu_usec_per_completed_call',
+        'loaded_cpu_usage_usec',
+    )
+
+    summary: dict[str, object] = {
+        'schema_version': 2,
+        'created_at_utc': utc_now(),
+        'raw_file': 'raw.json',
+        'profile': 'plugin-count-scaling',
+        'comparability_limitation': raw.get('comparability_limitation'),
+        'memory_sharing_note': raw.get('memory_sharing_note'),
+        'trial_count': len(trials),
+        'successful_trial_count': sum(trial.get('status') == 'success' for trial in trials),
+        'failed_trial_count': sum(trial.get('status') != 'success' for trial in trials),
+        'drained_trial_count': sum((trial.get('containment') or {}).get('drained') is True for trial in trials),
+        'expected_iterations_per_variant_and_count': expected_iterations,
+        'cells': [],
+        'comparison_table': [],
+        'paired_comparisons': [],
+        'per_added_plugin_memory_slopes': [],
+        'failed_trials': [
+            {
+                'trial_uuid': trial.get('trial_uuid'),
+                'plugin_count': trial.get('plugin_count'),
+                'variant': trial.get('variant'),
+                'replication': trial.get('replication'),
+                'error': trial.get('error') or trial.get('cleanup_error') or trial.get('normal_service_check_error'),
+                'cleanup': trial.get('containment'),
+            }
+            for trial in trials if trial.get('status') != 'success'
+        ],
+    }
+    cells = summary['cells']
+    comparison_table = summary['comparison_table']
+    paired_comparisons = summary['paired_comparisons']
+    assert isinstance(cells, list) and isinstance(comparison_table, list) and isinstance(paired_comparisons, list)
+
+    count_operation_names = {
+        count: ['backend_ping']
+        + (['common_real_plugin'] if count >= 4 else [])
+        + (['fixture_plugin'] if count >= 8 else [])
+        for count in SCALING_PLUGIN_COUNTS
+    }
+    for count in SCALING_PLUGIN_COUNTS:
+        for variant in SCALING_VARIANTS:
+            selected = [
+                trial for trial in trials
+                if trial.get('plugin_count') == count and trial.get('variant') == variant
+            ]
+            successful = [trial for trial in selected if trial.get('status') == 'success']
+            metrics = {}
+            names = list(base_metrics)
+            names.extend(
+                f'rpc.{operation}.{field}'
+                for operation in count_operation_names[count]
+                for field in operation_fields
+            )
+            for metric in names:
+                values = [
+                    value for trial in successful
+                    if (value := scaling_metric_value(trial, metric)) is not None
+                ]
+                metrics[metric] = scaling_metric_summary(
+                    values, f'cell:{variant}:{count}:{metric}'
+                )
+            cell = {
+                'plugin_count': count,
+                'variant': variant,
+                'trial_count': len(selected),
+                'successful_trial_count': len(successful),
+                'failed_trial_count': len(selected) - len(successful),
+                'drained_trial_count': sum((trial.get('containment') or {}).get('drained') is True for trial in selected),
+                'active_plugin_count': (
+                    successful[0].get('catalog_active_plugin_count') if successful else None
+                ),
+                'passive_plugin_count': (
+                    successful[0].get('catalog_passive_plugin_count') if successful else None
+                ),
+                'catalog_entry_count': successful[0].get('catalog_entry_count') if successful else None,
+                'metrics': metrics,
+            }
+            cells.append(cell)
+            table_row = {
+                'plugin_count': count,
+                'variant': variant,
+                'successful_trial_count': len(successful),
+                'active_plugin_count': cell['active_plugin_count'],
+                'passive_plugin_count': cell['passive_plugin_count'],
+                'catalog_entry_count': cell['catalog_entry_count'],
+                'metrics': {
+                    metric: {
+                        'mean': values['mean'],
+                        'ci95_mean': values['ci95_mean'],
+                    }
+                    for metric, values in metrics.items()
+                },
+            }
+            comparison_table.append(table_row)
+
+    for count in SCALING_PLUGIN_COUNTS:
+        by_variant = {}
+        for variant in SCALING_VARIANTS:
+            by_variant[variant] = {
+                int(trial['replication']): trial
+                for trial in trials
+                if trial.get('plugin_count') == count and trial.get('variant') == variant
+                and trial.get('status') == 'success'
+            }
+        python_trials = by_variant['python-installed']
+        rust_trials = by_variant['rust-lean-fork']
+        paired_reps = sorted(set(python_trials).intersection(rust_trials))
+        metrics = list(base_metrics)
+        metrics.extend(
+            f'rpc.{operation}.{field}'
+            for operation in count_operation_names[count]
+            for field in operation_fields
+        )
+        paired_rows = []
+        differences_by_metric: dict[str, list[tuple[int, float]]] = {metric: [] for metric in metrics}
+        python_values_by_metric: dict[str, list[tuple[int, float]]] = {metric: [] for metric in metrics}
+        rust_values_by_metric: dict[str, list[tuple[int, float]]] = {metric: [] for metric in metrics}
+        for replication in paired_reps:
+            python_trial = python_trials[replication]
+            rust_trial = rust_trials[replication]
+            differences = {}
+            python_values = {}
+            rust_values = {}
+            for metric in metrics:
+                python_value = scaling_metric_value(python_trial, metric)
+                rust_value = scaling_metric_value(rust_trial, metric)
+                if python_value is None or rust_value is None:
+                    continue
+                difference = rust_value - python_value
+                differences[metric] = difference
+                python_values[metric] = python_value
+                rust_values[metric] = rust_value
+                differences_by_metric[metric].append((replication, difference))
+                python_values_by_metric[metric].append((replication, python_value))
+                rust_values_by_metric[metric].append((replication, rust_value))
+            paired_rows.append({
+                'replication': replication,
+                'python_trial_uuid': python_trial.get('trial_uuid'),
+                'rust_trial_uuid': rust_trial.get('trial_uuid'),
+                'python_order_position': python_trial.get('order_position'),
+                'rust_order_position': rust_trial.get('order_position'),
+                'python_values': python_values,
+                'rust_values': rust_values,
+                'rust_minus_python': differences,
+            })
+        paired_metrics = {}
+        for metric, values in differences_by_metric.items():
+            differences = [difference for _, difference in values]
+            python_values = [value for _, value in python_values_by_metric[metric]]
+            rust_values = [value for _, value in rust_values_by_metric[metric]]
+            relative_changes = [
+                (rust_value - python_value) * 100 / python_value
+                for python_value, rust_value in zip(python_values, rust_values)
+                if python_value != 0
+            ]
+            lower_is_better = not metric.endswith('throughput_calls_per_second')
+            paired_metrics[metric] = {
+                'direction': 'rust-lean-fork minus python-installed',
+                'lower_is_better': lower_is_better,
+                'n_pairs': len(differences),
+                'python_mean': statistics.mean(python_values) if python_values else None,
+                'rust_mean': statistics.mean(rust_values) if rust_values else None,
+                'mean_difference': statistics.mean(differences) if differences else None,
+                'ci95_mean_difference': bootstrap_mean_interval(
+                    differences, f'paired:count:{count}:{metric}', paired=True
+                ),
+                'mean_relative_change_percent': (
+                    statistics.mean(relative_changes) if relative_changes else None
+                ),
+                'ci95_mean_relative_change_percent': bootstrap_mean_interval(
+                    relative_changes, f'paired-relative:count:{count}:{metric}', paired=True
+                ),
+                'replication_differences': [
+                    {'replication': replication, 'difference': difference}
+                    for replication, difference in values
+                ],
+            }
+        comparison = {
+            'plugin_count': count,
+            'matched_successful_pair_count': len(paired_reps),
+            'paired_trials': paired_rows,
+            'metrics': paired_metrics,
+        }
+        paired_comparisons.append(comparison)
+
+    slope_rows = summary['per_added_plugin_memory_slopes']
+    assert isinstance(slope_rows, list)
+    for variant in SCALING_VARIANTS:
+        for lower_count, upper_count in zip(SCALING_PLUGIN_COUNTS, SCALING_PLUGIN_COUNTS[1:]):
+            lower_trials = {
+                int(trial['replication']): trial
+                for trial in trials
+                if trial.get('plugin_count') == lower_count and trial.get('variant') == variant
+                and trial.get('status') == 'success'
+            }
+            upper_trials = {
+                int(trial['replication']): trial
+                for trial in trials
+                if trial.get('plugin_count') == upper_count and trial.get('variant') == variant
+                and trial.get('status') == 'success'
+            }
+            slopes = {'pss_after_readiness_mib': [], 'private_dirty_after_readiness_mib': []}
+            for replication in sorted(set(lower_trials).intersection(upper_trials)):
+                for metric in slopes:
+                    lower_value = scaling_metric_value(lower_trials[replication], metric)
+                    upper_value = scaling_metric_value(upper_trials[replication], metric)
+                    if lower_value is not None and upper_value is not None:
+                        slopes[metric].append({
+                            'replication': replication,
+                            'slope_mib_per_added_plugin': (
+                                upper_value - lower_value
+                            ) / (upper_count - lower_count),
+                        })
+            slope_metrics = {}
+            for metric, observations in slopes.items():
+                values = [item['slope_mib_per_added_plugin'] for item in observations]
+                slope_metrics[metric] = {
+                    'n_matched_replications': len(values),
+                    'mean_mib_per_added_plugin': statistics.mean(values) if values else None,
+                    'ci95_mean_mib_per_added_plugin': bootstrap_mean_interval(
+                        values, f'slope:{variant}:{lower_count}-{upper_count}:{metric}', paired=True
+                    ),
+                    'replication_slopes': observations,
+                }
+            slope_rows.append({
+                'variant': variant,
+                'from_plugin_count': lower_count,
+                'to_plugin_count': upper_count,
+                'added_plugins': upper_count - lower_count,
+                'added_plugin_composition': (
+                    'four installed plugins' if lower_count == 0
+                    else 'deterministic scaling fixtures'
+                ),
+                'metrics': slope_metrics,
+            })
+
+    incomplete_cells = [
+        (cell['plugin_count'], cell['variant'])
+        for cell in cells
+        if cell['trial_count'] != expected_iterations or cell['successful_trial_count'] != expected_iterations
+    ]
+    all_drained = all(
+        (trial.get('containment') or {}).get('drained') is True for trial in trials
+    )
+    memory_nonregression = True
+    cpu_nonregression = True
+    memory_benefit = False
+    startup_rpc_wins = []
+    cpu_metrics = {'idle_cpu_percent_of_one_core'}
+    for count in SCALING_PLUGIN_COUNTS:
+        cpu_metrics.update(
+            f'rpc.{operation}.loaded_cpu_usec_per_completed_call'
+            for operation in count_operation_names[count]
+        )
+    for comparison in paired_comparisons:
+        for metric in ('pss_after_readiness_mib', 'private_dirty_after_readiness_mib'):
+            metric_result = comparison['metrics'][metric]
+            interval = metric_result['ci95_mean_difference']
+            if metric_result['n_pairs'] < expected_iterations or interval is None or interval['upper'] > 0:
+                memory_nonregression = False
+            if metric == 'pss_after_readiness_mib' and interval is not None and interval['upper'] < 0:
+                memory_benefit = True
+        for metric in cpu_metrics:
+            metric_result = comparison['metrics'].get(metric)
+            if metric_result is None:
+                continue
+            interval = metric_result['ci95_mean_difference']
+            if metric_result['n_pairs'] < expected_iterations or interval is None or interval['upper'] > 0:
+                cpu_nonregression = False
+        for metric, metric_result in comparison['metrics'].items():
+            is_startup_or_rpc = metric == 'startup_to_readiness_seconds' or metric.startswith('rpc.')
+            if not is_startup_or_rpc or metric_result['n_pairs'] < expected_iterations:
+                continue
+            interval = metric_result['ci95_mean_difference']
+            if interval is None:
+                continue
+            lower_is_better = metric_result['lower_is_better']
+            is_improvement = interval['upper'] < 0 if lower_is_better else interval['lower'] > 0
+            if not is_improvement:
+                continue
+            relative_change = metric_result['mean_relative_change_percent']
+            startup_rpc_wins.append({
+                'plugin_count': comparison['plugin_count'],
+                'metric': metric,
+                'n_pairs': metric_result['n_pairs'],
+                'mean_difference_rust_minus_python': metric_result['mean_difference'],
+                'ci95_mean_difference_rust_minus_python': interval,
+                'mean_relative_change_percent_rust_minus_python': relative_change,
+                'mean_improvement_percent': (
+                    -relative_change if relative_change is not None and lower_is_better
+                    else relative_change
+                ),
+                'improvement_direction': 'lower' if lower_is_better else 'higher',
+            })
+    recommendation_reasons = []
+    if raw.get('completion') != 'complete':
+        recommendation_reasons.append(
+            'campaign did not complete its snapshot, runtime-artifact, and normal-service integrity checks'
+        )
+    if incomplete_cells:
+        recommendation_reasons.append(f'not all variant/count cells completed {expected_iterations} successful trials: {incomplete_cells}')
+    if not all_drained:
+        recommendation_reasons.append('at least one owned transient service did not drain cleanly')
+    if not memory_nonregression:
+        recommendation_reasons.append(
+            'paired 95% intervals do not establish non-increasing PSS and Private_Dirty at every plugin count'
+        )
+    if not cpu_nonregression:
+        recommendation_reasons.append(
+            'paired 95% intervals do not establish non-increasing idle CPU and per-operation RPC CPU at every count'
+        )
+    if not memory_benefit:
+        recommendation_reasons.append('no plugin count establishes lower Rust PSS with a 95% paired interval')
+    summary['startup_rpc_repeatable_wins'] = startup_rpc_wins
+    summary['proceed_or_stop_recommendation'] = {
+        'decision': 'PROCEED' if not recommendation_reasons else 'STOP',
+        'gate': (
+            f'at least {expected_iterations} successful matched trials per variant/count; all owned units drained; '
+            'Rust-minus-Python paired 95% mean-difference intervals for PSS, Private_Dirty, idle CPU, and each '
+            'available operation’s cgroup CPU per call are non-positive at every count; at least one count shows '
+            'a PSS interval strictly below zero'
+        ),
+        'startup_rpc_interpretation': (
+            'No numeric speed threshold is assumed. startup_rpc_repeatable_wins lists only startup or RPC '
+            'metrics whose paired 95% interval supports an improvement; evaluate and report each measured '
+            'latency, throughput, or CPU result rather than claiming a generic speedup.'
+        ),
+        'reasons': recommendation_reasons,
+    }
+    return summary
+
+
 def summarize(raw: dict[str, object]) -> dict[str, object]:
+    if raw.get('profile') == 'plugin-count-scaling':
+        return summarize_scaling(raw)
     trials = raw.get('trials', [])
     summary: dict[str, object] = {
         'schema_version': 1,
@@ -1075,6 +1720,37 @@ def summarize(raw: dict[str, object]) -> dict[str, object]:
     return summary
 
 
+def build_schedule(profile: str, iterations: int) -> list[dict[str, object]]:
+    schedule = []
+    for replication_index in range(iterations):
+        replication = replication_index + 1
+        if profile == 'standard':
+            order = [VARIANTS[(replication_index + offset) % len(VARIANTS)][0] for offset in range(len(VARIANTS))]
+            for position, variant in enumerate(order, 1):
+                schedule.append({
+                    'replication': replication,
+                    'position': position,
+                    'variant': variant,
+                    'plugin_count': None,
+                })
+            continue
+        count_offset = replication_index % len(SCALING_PLUGIN_COUNTS)
+        counts = SCALING_PLUGIN_COUNTS[count_offset:] + SCALING_PLUGIN_COUNTS[:count_offset]
+        position = 1
+        for plugin_count in counts:
+            pair_start = (replication_index + SCALING_PLUGIN_COUNTS.index(plugin_count)) % len(SCALING_VARIANTS)
+            variants = SCALING_VARIANTS[pair_start:] + SCALING_VARIANTS[:pair_start]
+            for variant in variants:
+                schedule.append({
+                    'replication': replication,
+                    'position': position,
+                    'variant': variant,
+                    'plugin_count': plugin_count,
+                })
+                position += 1
+    return schedule
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--python-executable', required=True, help='installed Python backend executable (PluginLoader)')
@@ -1083,13 +1759,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--assets', required=True, help='existing Rust probe frontend assets directory')
     parser.add_argument('--locales', required=True, help='existing Rust probe locale directory')
     parser.add_argument('--output', required=True, help='new or empty output directory outside the repository')
-    parser.add_argument('--iterations', type=int, default=10, help='replications per variant; minimum 10 (default: 10)')
+    parser.add_argument(
+        '--profile', choices=('standard', 'plugin-count-scaling'), default='standard',
+        help='standard compatibility matrix or matched 0/4/8/12 plugin-count scaling',
+    )
+    parser.add_argument(
+        '--release-version', default=None,
+        help='Rust identity passed to the backend; required for scaling (standard default: dev)',
+    )
+    parser.add_argument(
+        '--iterations', type=int, default=10,
+        help='replications per variant (and per plugin count in scaling profile); minimum 10 (default: 10)',
+    )
     parser.add_argument('--startup-timeout', type=float, default=120.0, help='startup/readiness deadline in seconds')
     parser.add_argument('--rpc-timeout', type=float, default=15.0, help='timeout per WebSocket RPC in seconds')
     parser.add_argument('--idle-seconds', type=float, default=4.0, help='idle cgroup CPU sampling interval')
     args = parser.parse_args()
+    if args.profile == 'plugin-count-scaling' and args.release_version is None:
+        parser.error('plugin-count-scaling requires an explicit --release-version')
+    if args.release_version is None:
+        args.release_version = 'dev'
+    if not args.release_version.strip():
+        parser.error('--release-version must not be empty')
     if args.iterations < 10:
-        parser.error('--iterations must be at least 10 per variant')
+        parser.error('--iterations must be at least 10 per variant/count')
     if args.startup_timeout <= 0 or args.rpc_timeout <= 0 or args.idle_seconds <= 0:
         parser.error('startup, RPC, and idle timeouts must be positive')
     return args
@@ -1108,6 +1801,30 @@ def prepare_inputs(args: argparse.Namespace, work_root: Path) -> dict[str, objec
     assets = validate_path(args.assets, 'frontend assets', directory=True)
     locales = validate_path(args.locales, 'locale directory', directory=True)
     worker_info = worker_description(worker, work_root / 'worker-describe-tmp')
+    python_hash = sha256_file(python_executable)
+    rust_hash = sha256_file(rust_executable)
+    worker_hash = sha256_file(worker)
+    assets_digest = tree_digest(assets)
+    locales_digest = tree_digest(locales)
+    worker_internal_digest = tree_digest(worker.parent / '_internal')
+    python_inventory = {
+        'executable': str(python_executable),
+        'executable_sha256': python_hash,
+        'sdk_version': SDK_VERSION,
+        'homebrew_input_snapshot': 'recorded after one read-only capture',
+    }
+    rust_bundle = {
+        'release_version': args.release_version,
+        'sdk_version': SDK_VERSION,
+        'rust_executable': str(rust_executable),
+        'rust_executable_sha256': rust_hash,
+        'worker': str(worker),
+        'worker_sha256': worker_hash,
+        'worker_onedir_internal_tree': worker_internal_digest,
+        'assets_tree': assets_digest,
+        'locales_tree': locales_digest,
+        'worker_description': worker_info,
+    }
     return {
         'paths': {
             'python_executable': str(python_executable),
@@ -1118,14 +1835,18 @@ def prepare_inputs(args: argparse.Namespace, work_root: Path) -> dict[str, objec
             'live_homebrew_snapshot_source': str(HOME_BREW),
         },
         'binary_sha256': {
-            'python_executable': sha256_file(python_executable),
-            'rust_executable': sha256_file(rust_executable),
-            'worker': sha256_file(worker),
+            'python_executable': python_hash,
+            'rust_executable': rust_hash,
+            'worker': worker_hash,
         },
         'runtime_descriptions': {'worker': worker_info},
-        'assets_tree': tree_digest(assets),
-        'locales_tree': tree_digest(locales),
-        'worker_onedir_internal_tree': tree_digest(worker.parent / '_internal'),
+        'assets_tree': assets_digest,
+        'locales_tree': locales_digest,
+        'worker_onedir_internal_tree': worker_internal_digest,
+        'python_source_inventory': python_inventory,
+        'python_source_inventory_fingerprint': stable_fingerprint(python_inventory),
+        'rust_bundle_inventory': rust_bundle,
+        'rust_bundle_fingerprint': stable_fingerprint(rust_bundle),
     }
 
 
@@ -1139,17 +1860,24 @@ def run_benchmark(args: argparse.Namespace) -> int:
     temporary_root = Path(os.environ.get('TMPDIR') or '/var/tmp/omp-1000').expanduser().resolve()
     temporary_root.mkdir(mode=0o700, parents=True, exist_ok=True)
 
+    release_version = args.release_version
+    active_variants = (
+        VARIANTS if args.profile == 'standard'
+        else tuple(entry for entry in VARIANTS if entry[0] in SCALING_VARIANTS)
+    )
+
     raw: dict[str, object] = {
         'schema_version': 1,
+        'profile': args.profile,
+        'release_version': release_version,
         'started_at_utc': utc_now(),
         'output_directory': str(output),
         'comparability_limitation': (
-            'python-installed is the official installed Decky v3.2.10 Python backend. Rust runs the private '
-            'Linux/SteamOS backend build with the same plugin data and SDK/frontend baseline. Each trial '
-            'has a private network without Steam CEF, with both backends running their injector retry path; '
-            'these results do not establish full-product, '
-            'physical Steam Deck, or long-duration performance. Startup is process-cold only and does '
-            'not flush OS caches.'
+            'python-installed is the official installed Python backend, reporting its SDK loader version. Rust '
+            'runs the private Linux/SteamOS backend with the same packaged SDK/frontend baseline. Scaling cells '
+            'share the same selected plugin catalog per count; frontend injection is disabled and each unit uses '
+            'a private network with no live CEF. Results do not establish full-product, physical Steam Deck, or '
+            'long-duration performance. Startup is process-cold only and does not flush OS caches.'
         ),
         'memory_sharing_note': (
             'PSS apportions shared resident pages across mapped processes, while Private_Dirty reports pages private '
@@ -1157,35 +1885,51 @@ def run_benchmark(args: argparse.Namespace) -> int:
             'Use cgroup totals and per-process PSS/private-dirty together; do not add RSS values.'
         ),
         'measurement_definitions': {
-            'startup_to_readiness_seconds': 'monotonic time from before systemd-run until auth, plugin discovery, '
-            'the benchmark arithmetic RPC, installed backend RPCs, and v3.2.10 version check all succeed',
+            'startup_to_readiness_seconds': 'monotonic time from before systemd-run until authenticated WebSocket, '
+            'exact catalog discovery with no load errors, expected version identity, and the count-appropriate '
+            'read-only plugin checks succeed',
+            'catalog_active_plugin_count': 'discovered catalog entries classified active by the captured clone '
+            'having main.py; checked against the exact runtime name set',
+            'catalog_passive_plugin_count': 'discovered catalog entries classified passive by the captured clone '
+            'lacking main.py; checked against the exact runtime name set',
             'pss_after_readiness_mib': 'sum of Pss from /proc/<pid>/smaps_rollup for every live process in the '
-            'owned transient unit cgroup immediately after readiness',
-            'private_dirty_after_readiness_mib': 'sum of Private_Dirty from /proc/<pid>/smaps_rollup for every '
-            'live process in the owned transient unit cgroup at readiness; per-process PSS/private-dirty, comm, PID, '
-            'and PPID are in pss_sample.processes',
+            'owned transient unit cgroup immediately after readiness, including backend, worker launcher, and plugin workers',
+            'private_dirty_after_readiness_mib': 'sum of Private_Dirty from /proc/<pid>/smaps_rollup for every live '
+            'process in the owned transient unit cgroup; per-process PSS/private-dirty, PID, PPID, and comm are recorded',
             'idle_cpu_percent_of_one_core': 'owned cgroup cpu.stat usage_usec delta divided by wall interval; '
             '100 percent means one fully occupied CPU core',
-            'rpc_latency_ms': 'sequential arithmetic WebSocket CALL/REPLY latency per successful call after 10 warmups; '
-            'each reply is acknowledged with RECEIVED_RESPONSE and checked',
-            'rpc_throughput_calls_per_second': '200 sequential successful arithmetic RPCs divided by measured wall time',
-            'loaded_cpu_usec_per_completed_call': 'owned cgroup cpu.stat usage_usec delta during the measured RPC loop '
-            'divided by completed arithmetic calls',
-            'shutdown_latency_seconds': 'time from SIGTERM to the owned MainPID (matching the installed process-only '
-            'signal contract) until the unit is stopped and its cgroup is empty',
+            'rpc_latency_ms': 'sequential authenticated WebSocket CALL/REPLY latency after 10 warmups; every reply '
+            'is acknowledged and validated; scaling profile measures backend ping at every count and only present plugin RPCs',
+            'loaded_cpu_usec_per_completed_call': 'owned cgroup cpu.stat usage_usec delta during each measured RPC '
+            'loop divided by its completed calls',
+            'shutdown_latency_seconds': 'time from SIGTERM to the owned MainPID until the unit is stopped and its '
+            'cgroup is empty',
         },
         'configuration': {
+            'profile': args.profile,
             'iterations_per_variant': args.iterations,
+            'iterations_per_variant_and_count': args.iterations,
+            'release_version': release_version,
+            'sdk_version': SDK_VERSION,
+            'version_identity_contract': {
+                'python_current': SDK_VERSION,
+                'rust_current': release_version,
+                'rust_sdk_version': SDK_VERSION,
+            },
             'variants': [
                 {'name': name, 'worker_mode': mode, 'worker_bootstrap': bootstrap}
-                for name, mode, bootstrap in VARIANTS
+                for name, mode, bootstrap in active_variants
             ],
+            'plugin_counts': list(SCALING_PLUGIN_COUNTS) if args.profile == 'plugin-count-scaling' else None,
             'temporary_directory': str(temporary_root),
+            'rpc_calls_per_operation_per_trial': 200,
             'rpc_calls_per_trial': 200,
             'rpc_warmup_calls': 10,
             'idle_interval_seconds': args.idle_seconds,
             'listen': LISTEN,
             'private_network_for_every_trial': True,
+            'frontend_injection': False,
+            'no_live_cef_access': True,
             'no_plugin_loader_service_stop_or_reconfiguration': True,
             'unit_kill_mode': 'control-group',
             'inaccessible_paths': ['/run/systemd/private', '/run/dbus/system_bus_socket'],
@@ -1220,18 +1964,36 @@ def run_benchmark(args: argparse.Namespace) -> int:
         snapshot_digest = inputs_digest(snapshot)
         settings = parse_settings(snapshot / 'settings' / 'loader.json')
         installed_plugins = validate_installed_backends(snapshot, settings)
+        source_catalog = runtime_catalog(snapshot / 'plugins')
+        python_inventory = dict(preflight['python_source_inventory'])
+        python_inventory['homebrew_snapshot'] = snapshot_digest
+        python_inventory['homebrew_source_inventory'] = source_info
+        preflight['python_source_inventory'] = python_inventory
+        preflight['python_source_inventory_fingerprint'] = stable_fingerprint(python_inventory)
         raw['homebrew_snapshot'] = {
             'source_directories': source_info,
             'input_directories': list(INPUT_DIRECTORIES),
             'sha256': snapshot_digest,
             'installed_backends': installed_plugins,
+            'catalog': source_catalog,
             'captured_from_live_homebrew_once': True,
         }
-        raw['schedule'] = []
-        for replication in range(args.iterations):
-            order = [VARIANTS[(replication + offset) % len(VARIANTS)][0] for offset in range(len(VARIANTS))]
-            for position, variant in enumerate(order):
-                raw['schedule'].append({'replication': replication + 1, 'position': position + 1, 'variant': variant})
+        scaling_snapshots = {}
+        if args.profile == 'plugin-count-scaling':
+            scaling_snapshots = create_scaling_snapshots(snapshot, work_root)
+            raw['plugin_count_snapshots'] = [
+                {
+                    'plugin_count': count,
+                    'sha256': details['digest']['sha256'],
+                    'input_entries': details['digest']['entries'],
+                    'active_plugin_count': details['active_plugin_count'],
+                    'passive_plugin_count': details['passive_plugin_count'],
+                    'catalog': details['catalog'],
+                    'source_inventory': details['source_inventory'],
+                }
+                for count, details in scaling_snapshots.items()
+            ]
+        raw['schedule'] = build_schedule(args.profile, args.iterations)
 
         account = pwd.getpwnam('deck')
         path_map = preflight['paths']
@@ -1243,12 +2005,26 @@ def run_benchmark(args: argparse.Namespace) -> int:
 
         for schedule in raw['schedule']:
             assert_service_unchanged(baseline)
+            if args.profile == 'plugin-count-scaling':
+                count = int(schedule['plugin_count'])
+                cell = scaling_snapshots[count]
+                trial_snapshot = Path(cell['path'])
+                trial_snapshot_digest = cell['digest']
+                fixture_names = list(cell['fixture_names'])
+            else:
+                count = None
+                trial_snapshot = snapshot
+                trial_snapshot_digest = snapshot_digest
+                fixture_names = []
             trial, safe = run_trial(
                 variant=schedule['variant'],
                 replication=schedule['replication'],
                 order_position=schedule['position'],
-                snapshot=snapshot,
-                expected_snapshot_digest=snapshot_digest,
+                profile=args.profile,
+                plugin_count=count,
+                fixture_names=fixture_names,
+                snapshot=trial_snapshot,
+                expected_snapshot_digest=trial_snapshot_digest,
                 account=account,
                 output=output,
                 work_root=work_root,
@@ -1257,14 +2033,18 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 worker=worker,
                 assets=assets,
                 locales=locales,
+                release_version=release_version,
+                python_inventory_fingerprint=preflight['python_source_inventory_fingerprint'],
+                rust_bundle_fingerprint=preflight['rust_bundle_fingerprint'],
                 startup_timeout=args.startup_timeout,
                 rpc_timeout=args.rpc_timeout,
                 idle_seconds=args.idle_seconds,
             )
             raw['trials'].append(trial)
             atomic_json(output / 'raw.json', raw)
+            count_label = f" plugins={trial['plugin_count']}" if trial['plugin_count'] is not None else ''
             print(
-                f"{trial['variant']} replication {trial['replication']}: {trial['status']}"
+                f"{trial['variant']}{count_label} replication {trial['replication']}: {trial['status']}"
                 + (f" ({trial.get('error')})" if trial.get('error') else ''),
                 flush=True,
             )
@@ -1279,6 +2059,37 @@ def run_benchmark(args: argparse.Namespace) -> int:
         raw['homebrew_snapshot']['immutable_snapshot_unchanged'] = final_snapshot_digest == snapshot_digest
         if final_snapshot_digest != snapshot_digest:
             raise BenchmarkError('immutable captured homebrew snapshot changed during benchmark execution')
+        final_scaling_digests = []
+        for count, details in scaling_snapshots.items():
+            final_digest = inputs_digest(Path(details['path']))
+            unchanged = final_digest == details['digest']
+            final_scaling_digests.append({
+                'plugin_count': count,
+                'final_sha256': final_digest,
+                'unchanged': unchanged,
+            })
+            if not unchanged:
+                raise BenchmarkError(f'plugin-count snapshot {count} changed during benchmark execution')
+        if scaling_snapshots:
+            raw['plugin_count_snapshots_final'] = final_scaling_digests
+        postflight = prepare_inputs(args, work_root)
+        artifacts_unchanged = (
+            postflight['binary_sha256']['python_executable'] == preflight['binary_sha256']['python_executable']
+            and postflight['rust_bundle_fingerprint'] == preflight['rust_bundle_fingerprint']
+        )
+        raw['runtime_artifacts_final_check'] = {
+            'python_executable_sha256': postflight['binary_sha256']['python_executable'],
+            'python_executable_unchanged': (
+                postflight['binary_sha256']['python_executable'] == preflight['binary_sha256']['python_executable']
+            ),
+            'rust_bundle_fingerprint': postflight['rust_bundle_fingerprint'],
+            'rust_bundle_unchanged': (
+                postflight['rust_bundle_fingerprint'] == preflight['rust_bundle_fingerprint']
+            ),
+            'all_selected_runtime_artifacts_unchanged': artifacts_unchanged,
+        }
+        if not artifacts_unchanged:
+            raise BenchmarkError('selected runtime artifact contents changed during benchmark execution')
         assert_service_unchanged(baseline)
         raw['normal_service_final_check'] = {
             'unchanged': True,
@@ -1361,7 +2172,6 @@ async def _readiness_client(request: dict[str, object]) -> dict[str, object]:
     timeout = float(request['startup_timeout'])
     rpc_timeout = float(request['rpc_timeout'])
     deadline = time.monotonic() + timeout
-    stage = 'auth-token'
     session_timeout = aiohttp.ClientTimeout(total=None, connect=5, sock_connect=5, sock_read=rpc_timeout)
     async with aiohttp.ClientSession(timeout=session_timeout, auto_decompress=False) as session:
         token = None
@@ -1381,57 +2191,116 @@ async def _readiness_client(request: dict[str, object]) -> dict[str, object]:
 
         client = _WebSocketClient(session, base_url, token, rpc_timeout)
         try:
-            stage = 'websocket-auth'
             await client.connect()
-            stage = 'plugin-discovery'
-            expected = list(request['active_plugins']) + list(request['passive_plugins']) + [str(request['benchmark_plugin'])]
+            expected_catalog = request['expected_catalog']
+            expected_names = set(expected_catalog)
             while True:
                 plugins = await client.call('loader/get_plugins')
                 if not isinstance(plugins, list):
                     raise RuntimeError(f'loader/get_plugins returned non-list: {plugins!r}')
-                by_name = {plugin.get('name'): plugin for plugin in plugins if isinstance(plugin, dict)}
-                missing = [name for name in expected if name not in by_name]
+                by_name = {}
+                for plugin in plugins:
+                    if not isinstance(plugin, dict) or not isinstance(plugin.get('name'), str):
+                        raise RuntimeError(f'loader/get_plugins returned malformed plugin entry: {plugin!r}')
+                    name = plugin['name']
+                    if name in by_name:
+                        raise RuntimeError(f'loader/get_plugins returned duplicate plugin name: {name!r}')
+                    by_name[name] = plugin
+                errors = {
+                    name: plugin.get('error')
+                    for name, plugin in by_name.items()
+                    if plugin.get('error')
+                }
+                if errors:
+                    raise RuntimeError(f'plugin load errors: {errors}')
+                unexpected = sorted(set(by_name) - expected_names)
+                if unexpected:
+                    raise RuntimeError(f'loader catalog contains unexpected plugins: {unexpected}')
+                missing = sorted(expected_names - set(by_name))
                 if not missing:
                     break
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f'expected plugins did not finish discovery: {missing}')
                 await asyncio.sleep(0.05)
-            failed = {name: by_name[name].get('error') for name in expected if by_name[name].get('error')}
-            if failed:
-                raise RuntimeError(f'expected plugins reported startup errors: {failed}')
-            for name in expected:
-                if by_name[name].get('disabled') is True:
+
+            for name, expected in expected_catalog.items():
+                plugin = by_name[name]
+                if plugin.get('disabled') is True:
                     raise RuntimeError(f'expected plugin is disabled: {name}')
-            if by_name[str(request['benchmark_plugin'])].get('load_type') != 1:
-                raise RuntimeError('arithmetic fixture did not load as a modern API1 plugin')
+                if plugin.get('load_type') != expected['load_type']:
+                    raise RuntimeError(
+                        f'plugin {name!r} load_type mismatch: expected {expected["load_type"]}, '
+                        f'got {plugin.get("load_type")!r}'
+                    )
+                if plugin.get('version') != expected['package_version']:
+                    raise RuntimeError(
+                        f'plugin {name!r} package version mismatch: expected {expected["package_version"]!r}, '
+                        f'got {plugin.get("version")!r}'
+                    )
 
-            stage = 'loader-version-readiness'
+            active_names = sorted(name for name, entry in expected_catalog.items() if not entry['passive'])
+            passive_names = sorted(name for name, entry in expected_catalog.items() if entry['passive'])
+            active_count = len(active_names)
+            passive_count = len(passive_names)
+
             version = await client.call('updater/get_version_info')
-            if not isinstance(version, dict) or version.get('current') != 'v3.2.10':
-                raise RuntimeError(f'backend is not the required v3.2.10 baseline: {version!r}')
+            expected_current = str(request['expected_current_version'])
+            if not isinstance(version, dict) or version.get('current') != expected_current:
+                raise RuntimeError(f'backend current version mismatch: expected {expected_current!r}, got {version!r}')
+            expected_sdk = request.get('expected_sdk_version')
+            if expected_sdk is not None and version.get('sdk_version') != expected_sdk:
+                raise RuntimeError(
+                    f'backend SDK version mismatch: expected {expected_sdk!r}, got {version.get("sdk_version")!r}'
+                )
 
-            stage = 'metadata-readiness'
-            metadata = await client.call('loader/call_plugin_method', 'Decky Metadata', 'get_platform_capabilities')
-            if not isinstance(metadata, dict) or metadata.get('platform') != 'linux' or metadata.get('is_steamos') is not True:
-                raise RuntimeError(f'Decky Metadata did not report SteamOS Linux readiness: {metadata!r}')
+            metadata = None
+            if 'Decky Metadata' in expected_catalog:
+                metadata = await client.call(
+                    'loader/call_plugin_method', 'Decky Metadata', 'get_platform_capabilities'
+                )
+                if not isinstance(metadata, dict) or metadata.get('platform') != 'linux' or metadata.get('is_steamos') is not True:
+                    raise RuntimeError(f'Decky Metadata did not report SteamOS Linux readiness: {metadata!r}')
 
-            stage = 'ludusavi-readiness'
-            ludusavi = await client.call('loader/call_plugin_method', 'SDH-Ludusavi', 'get_settings')
-            if not isinstance(ludusavi, dict) or 'auto_sync_enabled' not in ludusavi:
-                raise RuntimeError(f'SDH-Ludusavi read-only settings RPC failed: {ludusavi!r}')
+            ludusavi = None
+            if 'SDH-Ludusavi' in expected_catalog:
+                ludusavi = await client.call('loader/call_plugin_method', 'SDH-Ludusavi', 'get_settings')
+                if not isinstance(ludusavi, dict) or 'auto_sync_enabled' not in ludusavi:
+                    raise RuntimeError(f'SDH-Ludusavi read-only settings RPC failed: {ludusavi!r}')
 
-            stage = 'css-loader-readiness'
-            css = await client.call('loader/call_legacy_plugin_method', 'CSS Loader', 'get_backend_version', {})
-            if not isinstance(css, dict) or css.get('success') is not True or not isinstance(css.get('result'), int):
-                raise RuntimeError(f'CSS Loader read-only backend RPC failed: {css!r}')
+            css = None
+            if request['real_plugin_rpc']:
+                css = await client.call(
+                    'loader/call_legacy_plugin_method', 'CSS Loader', 'get_backend_version', {}
+                )
+                if not isinstance(css, dict) or css.get('success') is not True or not isinstance(css.get('result'), int):
+                    raise RuntimeError(f'CSS Loader read-only backend RPC failed: {css!r}')
 
-            stage = 'benchmark-plugin-readiness'
-            arithmetic = await client.call(
-                'loader/call_plugin_method', str(request['benchmark_plugin']), 'sum_squares'
-            )
-            if type(arithmetic) is not int or arithmetic != int(request['expected_arithmetic']):
-                raise RuntimeError(f'benchmark arithmetic result mismatch: {arithmetic!r}')
-            runtime = await client.call('loader/call_plugin_method', str(request['benchmark_plugin']), 'runtime_info')
+            arithmetic = None
+            runtime = None
+            benchmark_plugin = request.get('benchmark_plugin')
+            if benchmark_plugin is not None:
+                arithmetic = await client.call(
+                    'loader/call_plugin_method', str(benchmark_plugin), 'sum_squares'
+                )
+                if type(arithmetic) is not int or arithmetic != int(request['expected_arithmetic']):
+                    raise RuntimeError(f'benchmark arithmetic result mismatch: {arithmetic!r}')
+                runtime = await client.call(
+                    'loader/call_plugin_method', str(benchmark_plugin), 'runtime_info'
+                )
+
+            fixture_plugins = request.get('fixture_plugins', [])
+            if not isinstance(fixture_plugins, list):
+                raise RuntimeError(f'fixture_plugins must be a list, got {fixture_plugins!r}')
+            fixture_results = {}
+            for fixture_plugin in fixture_plugins:
+                fixture_arithmetic = await client.call(
+                    'loader/call_plugin_method', str(fixture_plugin), 'sum_squares'
+                )
+                if type(fixture_arithmetic) is not int or fixture_arithmetic != int(request['expected_arithmetic']):
+                    raise RuntimeError(
+                        f'scaling fixture {fixture_plugin!r} arithmetic result mismatch: {fixture_arithmetic!r}'
+                    )
+                fixture_results[fixture_plugin] = fixture_arithmetic
 
             return {
                 'ok': True,
@@ -1442,20 +2311,52 @@ async def _readiness_client(request: dict[str, object]) -> dict[str, object]:
                         'version': item.get('version'),
                         'load_type': item.get('load_type'),
                         'disabled': item.get('disabled'),
+                        'error': item.get('error'),
                     }
-                    for item in plugins if isinstance(item, dict)
+                    for item in plugins
                 ],
+                'catalog_plugin_names': sorted(by_name),
+                'catalog_entry_count': len(by_name),
+                'catalog_active_plugin_count': active_count,
+                'catalog_passive_plugin_count': passive_count,
+                'active_plugins_discovered': active_names,
+                'passive_plugins_discovered': passive_names,
+                'plugin_load_errors': errors,
                 'version': version,
                 'metadata_capabilities': metadata,
-                'ludusavi_settings_read': True,
-                'css_backend_version': css['result'],
-                'passive_plugins_discovered': list(request['passive_plugins']),
+                'ludusavi_settings_read': ludusavi is not None,
+                'css_backend_version': css.get('result') if css else None,
                 'arithmetic_result': arithmetic,
                 'plugin_runtime': runtime,
+                'fixture_rpc_ready_names': sorted(fixture_results),
+                'fixture_arithmetic_results': fixture_results,
                 'websocket_events_observed': client.events,
             }
         finally:
             await client.close()
+
+
+def _validate_operation_result(result: object, validation: dict[str, object]) -> None:
+    kind = validation.get('kind')
+    if kind == 'arithmetic':
+        expected = int(validation['expected'])
+        if type(result) is not int or result != expected:
+            raise RuntimeError(f'arithmetic result mismatch: expected {expected}, got {result!r}')
+    elif kind == 'version':
+        expected_current = str(validation['expected_current'])
+        if not isinstance(result, dict) or result.get('current') != expected_current:
+            raise RuntimeError(f'backend version mismatch: expected {expected_current!r}, got {result!r}')
+        expected_sdk = validation.get('expected_sdk_version')
+        if expected_sdk is not None and result.get('sdk_version') != expected_sdk:
+            raise RuntimeError(f'backend SDK version mismatch: expected {expected_sdk!r}, got {result!r}')
+    elif kind == 'css_version':
+        if (
+            not isinstance(result, dict) or result.get('success') is not True
+            or not isinstance(result.get('result'), int) or isinstance(result.get('result'), bool)
+        ):
+            raise RuntimeError(f'CSS Loader read-only backend RPC failed: {result!r}')
+    else:
+        raise ValueError(f'unknown RPC result validation kind: {kind!r}')
 
 
 async def _measurement_client(request: dict[str, object]) -> dict[str, object]:
@@ -1465,8 +2366,15 @@ async def _measurement_client(request: dict[str, object]) -> dict[str, object]:
     rpc_timeout = float(request['rpc_timeout'])
     planned = int(request['rpc_calls'])
     warmups = int(request['warmup_calls'])
+    operations = request['operations']
     if planned < 200:
-        raise ValueError('measured arithmetic call count must be at least 200')
+        raise ValueError('measured RPC call count must be at least 200')
+    if not isinstance(operations, list) or not operations:
+        raise ValueError('measurement operations must be a non-empty list')
+    names = [str(operation.get('name')) for operation in operations if isinstance(operation, dict)]
+    if len(names) != len(operations) or len(set(names)) != len(names):
+        raise ValueError('measurement operations must have unique names')
+
     session_timeout = aiohttp.ClientTimeout(total=None, connect=5, sock_connect=5, sock_read=rpc_timeout)
     async with aiohttp.ClientSession(timeout=session_timeout, auto_decompress=False) as session:
         async with session.get(base_url + '/auth/token') as response:
@@ -1479,58 +2387,99 @@ async def _measurement_client(request: dict[str, object]) -> dict[str, object]:
         try:
             await client.connect()
             plugin_list = await client.call('loader/get_plugins')
-            by_name = {item.get('name'): item for item in plugin_list if isinstance(item, dict)}
-            plugin = str(request['plugin_name'])
-            if plugin not in by_name or by_name[plugin].get('error') or by_name[plugin].get('disabled') is True:
-                raise RuntimeError(f'benchmark plugin is not ready for loaded measurement: {by_name.get(plugin)!r}')
-            expected = int(request['expected_arithmetic'])
-            for _ in range(warmups):
-                result = await client.call('loader/call_plugin_method', plugin, 'sum_squares')
-                if type(result) is not int or result != expected:
-                    raise RuntimeError(f'warm-up arithmetic result mismatch: {result!r}')
+            if not isinstance(plugin_list, list):
+                raise RuntimeError(f'loader/get_plugins returned non-list before measurement: {plugin_list!r}')
+            load_errors = {
+                item.get('name'): item.get('error')
+                for item in plugin_list
+                if isinstance(item, dict) and item.get('error')
+            }
+            if load_errors:
+                raise RuntimeError(f'plugin load errors before measurement: {load_errors}')
 
             cgroup = Path(str(request['cgroup_path']))
             cpu_file = cgroup / 'cpu.stat'
-            before = _read_usage_usec(cpu_file)
-            started = time.perf_counter()
-            latencies: list[float] = []
-            failure = None
-            for index in range(planned):
-                call_start = time.perf_counter_ns()
+            measurements = {}
+            for operation in operations:
+                name = str(operation['name'])
+                route = str(operation['route'])
+                args = operation['args']
+                validation = operation['validation']
+                if not isinstance(args, list) or not isinstance(validation, dict):
+                    raise ValueError(f'malformed RPC operation {name!r}')
+                entry: dict[str, object] = {
+                    'name': name,
+                    'route': route,
+                    'args': args,
+                    'warmup_calls': warmups,
+                    'planned_calls': planned,
+                    'completed_calls': 0,
+                    'latency_ms': [],
+                    'ok': False,
+                }
                 try:
-                    result = await client.call('loader/call_plugin_method', plugin, 'sum_squares')
-                    if type(result) is not int or result != expected:
-                        raise RuntimeError(f'arithmetic result mismatch at measured call {index + 1}: {result!r}')
-                    latencies.append((time.perf_counter_ns() - call_start) / 1_000_000)
+                    plugin_name = operation.get('plugin_name')
+                    if plugin_name is not None:
+                        by_name = {
+                            item.get('name'): item
+                            for item in plugin_list if isinstance(item, dict)
+                        }
+                        plugin = by_name.get(plugin_name)
+                        if plugin is None or plugin.get('disabled') is True:
+                            raise RuntimeError(f'RPC plugin is not ready: {plugin_name!r} ({plugin!r})')
+                    for _ in range(warmups):
+                        result = await client.call(route, *args)
+                        _validate_operation_result(result, validation)
+
+                    before = _read_usage_usec(cpu_file)
+                    started = time.perf_counter()
+                    latencies: list[float] = []
+                    failure = None
+                    for index in range(planned):
+                        call_start = time.perf_counter_ns()
+                        try:
+                            result = await client.call(route, *args)
+                            _validate_operation_result(result, validation)
+                            latencies.append((time.perf_counter_ns() - call_start) / 1_000_000)
+                        except BaseException as error:
+                            failure = {
+                                'call_index': index + 1,
+                                'error': f'{type(error).__name__}: {error}',
+                            }
+                            break
+                    wall_seconds = time.perf_counter() - started
+                    after = _read_usage_usec(cpu_file)
+                    cpu_usec = after - before
+                    completed = len(latencies)
+                    entry.update(
+                        ok=failure is None and completed == planned,
+                        completed_calls=completed,
+                        latency_ms=latencies,
+                        latency_p50_ms=percentile(latencies, 50),
+                        latency_p95_ms=percentile(latencies, 95),
+                        throughput_calls_per_second=completed / wall_seconds if wall_seconds else None,
+                        loaded_wall_seconds=wall_seconds,
+                        loaded_cpu_usage_usec=cpu_usec,
+                        loaded_cpu_usec_per_completed_call=cpu_usec / completed if completed else None,
+                    )
+                    if failure:
+                        entry['failure'] = failure
+                        entry['error'] = failure['error']
+                    elif completed != planned:
+                        entry['error'] = f'only {completed} of {planned} RPCs completed'
                 except BaseException as error:
-                    failure = {
-                        'call_index': index + 1,
-                        'error': f'{type(error).__name__}: {error}',
-                    }
-                    break
-            wall_seconds = time.perf_counter() - started
-            after = _read_usage_usec(cpu_file)
-            cpu_usec = after - before
-            completed = len(latencies)
-            result = {
-                'ok': failure is None and completed == planned,
+                    entry['error'] = f'{type(error).__name__}: {error}'
+                measurements[name] = entry
+
+            failed = [name for name, entry in measurements.items() if entry['ok'] is not True]
+            return {
+                'ok': not failed,
                 'warmup_calls': warmups,
                 'planned_calls': planned,
-                'completed_calls': completed,
-                'latency_ms': latencies,
-                'latency_p50_ms': percentile(latencies, 50),
-                'latency_p95_ms': percentile(latencies, 95),
-                'throughput_calls_per_second': completed / wall_seconds if wall_seconds else None,
-                'loaded_wall_seconds': wall_seconds,
-                'loaded_cpu_usage_usec': cpu_usec,
-                'loaded_cpu_usec_per_completed_call': cpu_usec / completed if completed else None,
+                'measurements': measurements,
+                'failed_operations': failed,
+                'error': f'failed RPC operations: {failed}' if failed else None,
             }
-            if failure:
-                result['failure'] = failure
-                result['error'] = failure['error']
-            elif completed != planned:
-                result['error'] = f'only {completed} of {planned} arithmetic RPCs completed'
-            return result
         finally:
             await client.close()
 

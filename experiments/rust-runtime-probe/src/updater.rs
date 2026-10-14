@@ -164,6 +164,7 @@ impl Updater {
         let versions = self.versions.read().await;
         json!({
             "current": backend.version.as_str(),
+            "sdk_version": backend.sdk_version.as_str(),
             "remote": versions.remote,
             "all": versions.all,
             "updatable": backend.version.as_str() != "unknown" && backend.version.as_str() != "dev",

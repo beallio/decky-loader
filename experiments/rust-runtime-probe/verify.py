@@ -53,7 +53,7 @@ class Client:
             await self.socket.close()
 
 
-async def main(base: str, privileged: bool):
+async def main(base: str, privileged: bool, expected_version: str):
     async with aiohttp.ClientSession(auto_decompress=False) as session:
         async with session.get(base + '/auth/token') as response:
             assert response.status == 200
@@ -85,7 +85,8 @@ async def main(base: str, privileged: bool):
             user = await client.call('utilities/get_user_info')
             assert user == {'username': 'deck', 'path': '/home/deck'}, user
             version = await client.call('updater/get_version_info')
-            assert version['current'] == 'v3.2.10', version
+            assert version['current'] == expected_version, version
+            assert version['sdk_version'] == 'v3.2.10', version
 
             modern = await client.call('loader/call_plugin_method', 'Rust Probe Modern', 'compute', [3, 4])
             assert modern['total'] == 25 and modern['alias'] and modern['user'] == 1000, modern
@@ -155,7 +156,7 @@ async def main(base: str, privileged: bool):
                 assert passive['type'] == -1, passive
                 real['passive_plugin'] = 'listed; backend calls rejected'
 
-            print(json.dumps({'source_version': version['current'], 'http_auth_cors_assets': 'passed', 'sdk_authenticated_backend_call': 'passed', 'modern': modern, 'legacy': legacy['result'], 'events_unicode': 'passed', 'private_method_rejection': 'passed', 'duplicate_reply_replay': 'passed', 'inflight_full_sync': 'passed', 'reload_cancellation': 'passed', 'plugins': [{'name': item['name'], 'version': item['version'], 'load_type': item['load_type']} for item in plugins], 'real_plugins': real}, ensure_ascii=False))
+            print(json.dumps({'release_version': version['current'], 'sdk_version': version['sdk_version'], 'http_auth_cors_assets': 'passed', 'sdk_authenticated_backend_call': 'passed', 'modern': modern, 'legacy': legacy['result'], 'events_unicode': 'passed', 'private_method_rejection': 'passed', 'duplicate_reply_replay': 'passed', 'inflight_full_sync': 'passed', 'reload_cancellation': 'passed', 'plugins': [{'name': item['name'], 'version': item['version'], 'load_type': item['load_type']} for item in plugins], 'real_plugins': real}, ensure_ascii=False))
         finally:
             await client.close()
 
@@ -164,5 +165,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base', default='http://127.0.0.1:1339')
     parser.add_argument('--privileged', action='store_true')
+    parser.add_argument('--expected-version', default='dev')
     args = parser.parse_args()
-    asyncio.run(main(args.base, args.privileged))
+    asyncio.run(main(args.base, args.privileged, args.expected_version))

@@ -325,7 +325,7 @@ def main() -> int:
     }
     run_error = None
     try:
-        runtime_root = Path(tempfile.mkdtemp(prefix='decky-rust-validation-', dir='/run'))
+        runtime_root = Path(tempfile.mkdtemp(prefix='dv-', dir=os.environ.get('TMPDIR', '/var/tmp/omp-1000')))
         runtime_root.chmod(0o755)
         staged = runtime_root / 'bundle'
         shutil.copytree(BUNDLE, staged)
@@ -406,6 +406,7 @@ def main() -> int:
             '--',
             str(staged / 'decky-rust-runtime-probe'),
             '--listen', '127.0.0.1:1337',
+            '--release-version', manifest['release_version'],
             '--worker', str(staged / 'DeckyPluginWorker'),
             '--plugin-root', str(homebrew / 'plugins'),
             '--homebrew', str(homebrew),

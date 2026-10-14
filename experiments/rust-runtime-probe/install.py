@@ -439,6 +439,9 @@ def _validate_bundle(bundle_value: str, user: pwd.struct_passwd) -> tuple[Path, 
         _fail('bundle is not the private Rust runtime compatibility bundle')
     if manifest.get('rust_executable') != RUST_EXECUTABLE:
         _fail('bundle names an unexpected Rust executable')
+    release_version = manifest.get('release_version')
+    if not isinstance(release_version, str) or not release_version or any(ord(character) < 32 or ord(character) == 127 for character in release_version):
+        _fail('bundle has no valid Rust release identity')
     source = manifest.get('source_baseline')
     if not isinstance(source, dict) or source.get('tag') != BASELINE_TAG:
         _fail(f'bundle must retain the {BASELINE_TAG} source baseline')
@@ -773,7 +776,7 @@ def _listener_configuration(environment: list[str], listen: str) -> tuple[list[s
     return environment, ['/usr/bin/env', *assignments]
 
 
-def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_name: str, listen: str, cef_url: str, inject_frontend: bool, worker_mode: str, github_api: str, release_repository: str, testing_download_url: str) -> bytes:
+def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_name: str, listen: str, cef_url: str, inject_frontend: bool, worker_mode: str, github_api: str, release_repository: str, testing_download_url: str, version: str) -> bytes:
     environment = _service_environment(paths)
     present = _environment_keys(environment)
     defaults = {
@@ -791,6 +794,7 @@ def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_na
         '--worker', str(runtime / WORKER_EXECUTABLE),
         '--worker-mode', worker_mode,
         '--worker-bootstrap', 'lean',
+        '--release-version', version,
         '--plugin-root', str(paths['homebrew'] / 'plugins'),
         '--homebrew', str(paths['homebrew']),
         '--user', user,
@@ -857,6 +861,11 @@ def _stop_service(paths: dict[str, Path]) -> None:
         main_pid = int(properties.get('MainPID', '0') or '0')
     except ValueError:
         _fail(f'systemd returned an invalid MainPID for {paths["unit"].name}')
+    control_group = properties.get('ControlGroup') or None
+    if main_pid > 0:
+        _service_cgroup_pids(properties, main_pid)
+    elif control_group:
+        cgroup_processes(control_group)
     if properties.get('ActiveState') == 'failed':
         if main_pid:
             _fail(f'failed service {paths["unit"].name} still has MainPID={main_pid}')
@@ -871,7 +880,9 @@ def _stop_service(paths: dict[str, Path]) -> None:
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
         current = _unit_properties(paths)
-        if current.get('LoadState') == 'not-found' or (current.get('ActiveState') == 'inactive' and current.get('MainPID', '0') == '0'):
+        control_group = current.get('ControlGroup') or control_group
+        terminal = current.get('LoadState') == 'not-found' or current.get('ActiveState') in ('inactive', 'failed')
+        if terminal and current.get('MainPID', '0') == '0' and not cgroup_processes(control_group):
             return
         time.sleep(0.2)
     _fail(f'selected service {paths["unit"].name} did not stop cleanly')
@@ -1186,6 +1197,12 @@ def _api_health(paths: dict[str, Path], listen: str) -> None:
         version = _websocket_call(connection, 3, 'updater/get_version_info')
         if not isinstance(version, dict) or not isinstance(version.get('current'), str) or not version['current']:
             _fail('updater/get_version_info did not return a current version')
+        if paths['active'].exists():
+            expected = _read_json(paths['active'])
+            if 'version' in expected and version['current'] != expected['version']:
+                _fail('service release identity does not match the installed transaction')
+            if 'sdk_version' in expected and version.get('sdk_version') != expected['sdk_version']:
+                _fail('service SDK compatibility version does not match the installed runtime')
         _websocket_send(connection, 8, b'')
 
 
@@ -1547,7 +1564,7 @@ def _run_install(args: argparse.Namespace) -> dict[str, object]:
     cef_url = _validate_cef_url(args.cef_url)
     inject_frontend = args.inject_frontend == 'true'
     worker_mode = args.worker_mode
-    version = args.version or str(manifest['runtime']['decky_version'])
+    version = args.version or manifest['release_version']
     if not version or any(ord(character) < 32 or ord(character) == 127 for character in version):
         _fail('--version must be a non-empty printable release identifier')
     plugin_root = homebrew / 'plugins'
@@ -1582,9 +1599,10 @@ def _run_install(args: argparse.Namespace) -> dict[str, object]:
             args.github_api,
             args.release_repository,
             args.testing_download_url,
+            version,
         )
         unit_stage = _stage_bytes(unit_data, paths['unit_dir'], f'.{service_file}.{transaction_id}.')
-        active_stage = _stage_bytes((json.dumps({'listen': listen}, sort_keys=True) + '\n').encode(), paths['state'], f'.active.{transaction_id}.', 0o644)
+        active_stage = _stage_bytes((json.dumps({'listen': listen, 'version': version, 'sdk_version': manifest['runtime']['decky_version']}, sort_keys=True) + '\n').encode(), paths['state'], f'.active.{transaction_id}.', 0o644)
         prior = _capture_activation(paths)
         activation = dict(prior)
         if prior.get('load_state') == 'not-found':
