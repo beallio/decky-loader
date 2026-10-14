@@ -1110,6 +1110,7 @@ fn monitor_launcher_failure(
                 return;
             }
             if launcher_failure.changed().await.is_err() {
+                registry_failure.send_replace(true);
                 return;
             }
         }
@@ -2477,5 +2478,78 @@ mod inotify_parser_tests {
         assert_eq!(events[0].watch_descriptor, 7);
         assert_eq!(events[0].mask, 3);
         assert_eq!(events[0].name.as_deref(), Some(Path::new("abc")));
+    }
+}
+
+#[cfg(test)]
+mod launcher_failure_tests {
+    use super::*;
+
+    struct TestDirectory(PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_launcher_monitor_enters_failure_shutdown_and_removes_runtime_sockets() {
+        let homebrew =
+            TestDirectory(std::env::temp_dir().join(format!("decky-monitor-{}", Uuid::new_v4())));
+        let plugin_root = homebrew.0.join("plugins");
+        fs::create_dir_all(&plugin_root).unwrap();
+        let (events, _) = broadcast::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Arc::new(
+            PluginRegistry::start(
+                WorkerConfiguration {
+                    executable: std::env::current_exe().unwrap(),
+                    mode: WorkerMode::Fork,
+                    bootstrap: WorkerBootstrap::Lean,
+                    auth_token: "monitor-regression".into(),
+                    server_host: "127.0.0.1".into(),
+                    server_port: 1339,
+                    chown_plugin_path: false,
+                },
+                plugin_root,
+                homebrew.0.clone(),
+                std::env::var("USER").expect("test account USER"),
+                platform::effective_user_ids(),
+                events,
+                shutdown_rx,
+            )
+            .await
+            .unwrap(),
+        );
+        let socket_directory = registry.socket_directory.clone();
+        assert!(socket_directory.is_dir());
+        let (launcher_tx, launcher_rx) = watch::channel(false);
+        monitor_launcher_failure(
+            launcher_rx,
+            registry.launcher_failure.as_ref().unwrap().0.clone(),
+        );
+        let shutdown_registry = Arc::clone(&registry);
+        let (started_tx, started_rx) = oneshot::channel();
+        let mut shutdown = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            crate::essential_launcher_failed(shutdown_registry.essential_failure()).await;
+            shutdown_registry.shutdown().await;
+        });
+        started_rx.await.unwrap();
+        assert!(!shutdown.is_finished());
+        drop(launcher_tx);
+        let completed = timeout(Duration::from_secs(1), &mut shutdown).await;
+        if completed.is_err() {
+            shutdown.abort();
+            registry.shutdown().await;
+        }
+        assert!(
+            completed.is_ok(),
+            "lost launcher supervision did not enter the backend failure shutdown"
+        );
+        completed.unwrap().unwrap();
+        assert!(registry.shutting_down.load(Ordering::Acquire));
+        assert!(!socket_directory.exists());
     }
 }
