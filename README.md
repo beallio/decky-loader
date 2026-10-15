@@ -131,7 +131,7 @@ Source control and deploying plugins are left to each respective contributor for
 
 The [Rust backend](backend-rust) keeps Python plugins and the existing Decky interface. It is a private candidate, not the default public release. Physical Steam Deck and full Steam interface checks remain deferred. Building it does not change an installed copy of Decky Loader.
 
-The `Runtime Builder` workflow checks dependencies and builds a complete Linux x86-64 bundle. The bundle contains the Rust backend, Python launcher and workers, Python plugin support code, interface files, installer, and file checksums. The existing public Python release workflow is unchanged; the runtime workflow does not publish a release.
+The `Runtime Builder` workflow checks dependencies and builds a complete Linux x86-64 bundle. Its artifact contains an installable ZIP, `SHA256SUMS`, and a build record. The ZIP contains the Rust backend, Python launcher and workers, Python plugin support code, interface files, installer, and file checksums. The existing public Python release workflow is unchanged; the runtime workflow does not publish a release.
 
 To build locally, install the GitHub CLI and the Rust, Node.js, and pnpm versions listed in [build-config.json](backend-rust/build-config.json). The build downloads a checksum-verified CPython archive and installs Python dependencies in temporary environments. It uses the committed Cargo, Poetry, and pnpm lockfiles.
 
