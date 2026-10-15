@@ -157,9 +157,9 @@ The [installer](backend-rust/install.py) supports new installs, replacement of a
 
 #### Install the private candidate over SSH
 
-Use [install-to-deck.sh](scripts/install-to-deck.sh) from a Linux workstation with Bash, SSH, and SCP. Enable SSH on the Deck and make sure you can use `sudo` there. Installation uses the Deck's system Python. Plugins use the included Python runtime. The Deck does not need Rust, Poetry, pnpm, or pip packages.
+Use [install-to-deck.sh](scripts/install-to-deck.sh) from a Linux workstation with Bash, curl, unzip, SSH, and SCP. Enable SSH on the Deck and make sure you can use `sudo` there. Installation uses the Deck's system Python. Plugins use the included Python runtime. The Deck does not need Rust, Poetry, pnpm, or pip packages.
 
-The script downloads the pinned `v3.2.10-rust.6-rc.1` bundle with the GitHub CLI and checks its SHA256. Sign in to `gh` on the workstation first. To use an already downloaded runtime ZIP instead, add `--bundle /path/to/decky-loader-runtime-linux-x86_64.zip`. Use the inner runtime ZIP, not the outer Actions download.
+The script downloads the pinned `v3.2.10-rust.6-rc.1` bundle through [nightly.link](https://nightly.link). No GitHub account, token, or GitHub CLI is required. It checks the runtime ZIP against the pinned SHA256 before it connects to the Deck. CI artifacts can expire. To use a saved runtime ZIP instead, add `--bundle /path/to/decky-loader-runtime-linux-x86_64.zip`. Use the inner runtime ZIP, not the outer Actions download.
 
 Replace `steamdeck` below with your Deck's address or SSH alias:
 

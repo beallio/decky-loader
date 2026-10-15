@@ -10,8 +10,10 @@ show_help() {
     cat <<'HELP'
 Usage: DECK_IP=<host-or-SSH-alias> scripts/install-to-deck.sh [options]
 
-Without --bundle, download the pinned v3.2.10-rust.6-rc.1 CI artifact using gh.
+Without --bundle, download the pinned v3.2.10-rust.6-rc.1 CI artifact publicly
+through nightly.link. No GitHub account, token, or GitHub CLI is required.
 Run this saved script on your workstation. No Rust/Python build tools are needed.
+The automatic download requires curl and unzip on the workstation.
 
   --bundle ZIP             Use the inner runtime ZIP from a CI artifact
   --sha256 HASH            Expected runtime ZIP checksum (default: pinned RC)
@@ -317,9 +319,15 @@ trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 if [[ $action == install || $action == check ]]; then
     if [[ -z $bundle_archive ]]; then
-        need gh
-        gh run download "$run_id" --repo beallio/decky-loader --name decky-loader-runtime-linux-x86_64 --dir "$work/download"
-        bundle_archive="$work/download/decky-loader-runtime-linux-x86_64.zip"
+        need curl
+        need unzip
+        curl -q --fail --location --proto '=https' --proto-redir '=https' \
+            --output "$work/artifact.zip" \
+            "https://nightly.link/beallio/decky-loader/actions/runs/$run_id/decky-loader-runtime-linux-x86_64.zip" \
+            || fail 'Public artifact download failed; CI artifacts can expire. Use --bundle with the approved runtime ZIP if you have saved it.'
+        bundle_archive="$work/decky-loader-runtime-linux-x86_64.zip"
+        unzip -p "$work/artifact.zip" decky-loader-runtime-linux-x86_64.zip > "$bundle_archive" \
+            || fail 'Public artifact does not contain the installable runtime ZIP'
     fi
     [[ -f $bundle_archive ]] || fail "Runtime ZIP not found: $bundle_archive"
     read -r actual _ < <(sha256sum -- "$bundle_archive")
