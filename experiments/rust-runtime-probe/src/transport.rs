@@ -5,6 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use axum::{
@@ -33,6 +34,8 @@ use tokio::{
 };
 
 use crate::backend::{Backend, RpcError};
+
+const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 type PendingCalls = HashMap<i64, PendingCall>;
 
@@ -199,17 +202,46 @@ pub async fn serve(
         .layer(middleware::from_fn_with_state(token, csrf_middleware))
         .with_state(state.clone());
 
-    let shutdown_sockets = state.sockets.clone();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        let _ = shutdown.await;
-        close_active_socket(&shutdown_sockets).await;
-    });
-    let result = server.await;
+    let result = serve_http(listener, app, state.sockets.clone(), shutdown).await;
     drop(events);
     let _ = event_stop_sender.send(());
     let _ = event_task.await;
     result?;
     Ok(())
+}
+
+async fn serve_http(
+    listener: TcpListener,
+    app: Router,
+    sockets: Arc<Mutex<SocketRegistry>>,
+    shutdown: oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    let (drain_started_sender, drain_started_receiver) = oneshot::channel();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let _ = shutdown.await;
+        // Include active-socket closure in the bounded shutdown interval.
+        let _ = drain_started_sender.send(());
+        close_active_socket(&sockets).await;
+    });
+    let server = std::future::IntoFuture::into_future(server);
+    tokio::pin!(server);
+
+    tokio::select! {
+        result = &mut server => result,
+        started = drain_started_receiver => {
+            if started.is_ok() {
+                match tokio::time::timeout(HTTP_DRAIN_TIMEOUT, &mut server).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        eprintln!("HTTP server did not drain within {HTTP_DRAIN_TIMEOUT:?}; ending server task");
+                        Ok(())
+                    }
+                }
+            } else {
+                server.await
+            }
+        }
+    }
 }
 
 async fn expose_response_headers(request: Request<Body>, next: Next) -> Response {
@@ -812,6 +844,75 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_bounds_a_pending_http_stream_without_affecting_regular_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/fetch",
+                get(|| async {
+                    let body = futures_util::stream::once(async {
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(b"partial"))
+                    })
+                    .chain(futures_util::stream::pending::<
+                        Result<Bytes, std::convert::Infallible>,
+                    >());
+                    Response::builder()
+                        .header(CONTENT_LENGTH, "100")
+                        .body(Body::from_stream(body))
+                        .unwrap()
+                }),
+            )
+            .route("/ordinary", get(|| async { "ordinary response" }));
+        let sockets = Arc::new(Mutex::new(SocketRegistry::default()));
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn(serve_http(listener, app, sockets, shutdown_receiver));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base_url = format!("http://{address}");
+
+        let ordinary = client
+            .get(format!("{base_url}/ordinary"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ordinary.status(), StatusCode::OK);
+        assert_eq!(ordinary.text().await.unwrap(), "ordinary response");
+
+        let mut pending_response = client
+            .get(format!("{base_url}/fetch"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pending_response.status(), StatusCode::OK);
+        let first_chunk = tokio::time::timeout(Duration::from_secs(5), pending_response.chunk())
+            .await
+            .expect("the streaming response should produce its first chunk")
+            .unwrap()
+            .expect("the streaming response should remain readable");
+        assert_eq!(first_chunk, Bytes::from_static(b"partial"));
+
+        let ordinary = client
+            .get(format!("{base_url}/ordinary"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ordinary.status(), StatusCode::OK);
+        assert_eq!(ordinary.text().await.unwrap(), "ordinary response");
+
+        shutdown_sender.send(()).unwrap();
+        let server_result =
+            tokio::time::timeout(HTTP_DRAIN_TIMEOUT + Duration::from_secs(5), server)
+                .await
+                .expect("a pending stream must not keep the server alive after shutdown")
+                .expect("server task must not panic");
+        assert!(
+            server_result.is_ok(),
+            "bounded shutdown should complete cleanly"
+        );
+        drop(pending_response);
     }
 
     #[tokio::test]
