@@ -56,7 +56,7 @@ def _set_parent_death_signal(expected_parent: int) -> None:
 
 
 def _worker_child(
-    gate_read: int, gate_write: int, arguments: dict[str, str],
+    gate_read: int, gate_write: int, arguments: dict[str, Any],
     parent_pid: int, inherited_fds: tuple[int, ...],
 ) -> None:
     try:
@@ -155,9 +155,10 @@ def _start_child(
     requested_bootstrap = request.get("bootstrap", bootstrap)
     if requested_bootstrap != bootstrap:
         raise ValueError("worker bootstrap does not match launcher bootstrap")
-    arguments: dict[str, str] = {}
+    arguments: dict[str, Any] = {}
     for key in ("plugin_root", "plugin_directory", "socket", "homebrew", "user"):
         arguments[key] = _request(request, key, str)
+    arguments["approved_launch"] = _request(request, "approved_launch", dict)
     arguments["bootstrap"] = bootstrap
 
     _assert_fork_safe()

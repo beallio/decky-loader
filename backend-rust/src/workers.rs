@@ -1,8 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
-    fs, io,
-    os::fd::{AsFd, OwnedFd},
+    fs::{self, File},
+    io,
+    os::fd::{AsFd, AsRawFd, OwnedFd},
     os::unix::{
         ffi::OsStrExt,
         fs::PermissionsExt,
@@ -68,12 +69,18 @@ impl std::error::Error for WorkerError {}
 struct PluginMetadata {
     name: String,
     directory: String,
-    version: Option<Value>,
+    author: String,
+    flags: Vec<String>,
+    api_version: u64,
+    version: Option<String>,
     load_type: u8,
     passive: bool,
     disabled: bool,
     requires_root: bool,
     debug: bool,
+    approved_directory: Arc<OwnedFd>,
+    directory_device: u64,
+    directory_inode: u64,
 }
 
 struct PluginRuntime {
@@ -371,13 +378,7 @@ impl PluginRegistry {
 
             if !entry.metadata.passive && !entry.disabled.load(Ordering::Relaxed) {
                 let mut runtime = entry.runtime.lock().await;
-                let plugin_directory = registry.plugin_root.join(&entry.metadata.directory);
-                match set_plugin_permissions_inner(
-                    &plugin_directory,
-                    entry.metadata.requires_root,
-                    registry.user_ids,
-                    registry.chown_plugin_path,
-                ) {
+                match registry.set_approved_plugin_permissions(&entry.metadata) {
                     Err(error) => runtime.start_error = Some(error.to_string()),
                     Ok(()) => {
                         let fork_launcher = if registry.worker_mode == WorkerMode::Fork {
@@ -641,7 +642,7 @@ impl PluginRegistry {
             .iter()
             .any(|disabled| disabled == &metadata.name);
         if !metadata.passive && !metadata.disabled {
-            self.set_plugin_permissions(&directory_path, metadata.requires_root)?;
+            self.set_approved_plugin_permissions(&metadata)?;
         }
 
         let (previous_was_running, previous_error) = if let Some(previous) = &previous {
@@ -700,7 +701,11 @@ impl PluginRegistry {
                 "loader/import_plugin",
                 vec![
                     Value::String(metadata.name),
-                    metadata.version.unwrap_or(Value::Null),
+                    metadata
+                        .version
+                        .clone()
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
                     Value::from(metadata.load_type),
                     Value::Bool(true),
                     Value::from(15_000),
@@ -744,19 +749,25 @@ impl PluginRegistry {
             && !self.shutting_down.load(Ordering::Acquire)
             && !shutdown_requested(&self.shutdown)
         {
-            let mut shutdown = self.shutdown.clone();
-            match self
-                .launch_plugin_worker(&entry.metadata, &mut shutdown)
-                .await
-            {
-                Ok(restarted) => {
-                    worker = restarted;
-                    start_error = None;
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    restart_error = Some(message.clone());
-                    start_error = Some(message);
+            if let Err(error) = self.set_approved_plugin_permissions(&entry.metadata) {
+                let message = error.to_string();
+                restart_error = Some(message.clone());
+                start_error = Some(message);
+            } else {
+                let mut shutdown = self.shutdown.clone();
+                match self
+                    .launch_plugin_worker(&entry.metadata, &mut shutdown)
+                    .await
+                {
+                    Ok(restarted) => {
+                        worker = restarted;
+                        start_error = None;
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        restart_error = Some(message.clone());
+                        start_error = Some(message);
+                    }
                 }
             }
         }
@@ -813,8 +824,7 @@ impl PluginRegistry {
         let mut metadata = entry.metadata.clone();
         metadata.disabled = disabled;
         if !disabled && !metadata.passive {
-            let directory = self.plugin_root.join(&metadata.directory);
-            self.set_plugin_permissions(&directory, metadata.requires_root)?;
+            self.set_approved_plugin_permissions(&metadata)?;
         }
 
         let (previous_was_running, previous_error, previous_worker) = {
@@ -874,7 +884,11 @@ impl PluginRegistry {
             "loader/import_plugin",
             vec![
                 Value::String(metadata.name),
-                metadata.version.unwrap_or(Value::Null),
+                metadata
+                    .version
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
                 Value::from(metadata.load_type),
                 Value::Bool(true),
                 Value::from(15_000),
@@ -903,8 +917,7 @@ impl PluginRegistry {
         let mut metadata = entry.metadata.clone();
         metadata.disabled = disabled;
         if !metadata.disabled && !metadata.passive {
-            let directory = self.plugin_root.join(&metadata.directory);
-            self.set_plugin_permissions(&directory, metadata.requires_root)?;
+            self.set_approved_plugin_permissions(&metadata)?;
         }
 
         let (previous_was_running, previous_error, previous_worker) = {
@@ -955,7 +968,11 @@ impl PluginRegistry {
             "loader/import_plugin",
             vec![
                 Value::String(metadata.name),
-                metadata.version.unwrap_or(Value::Null),
+                metadata
+                    .version
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
                 Value::from(metadata.load_type),
                 Value::Bool(false),
             ],
@@ -1010,18 +1027,15 @@ impl PluginRegistry {
         cleanup_plugins(&plugins, &self.socket_directory, fork_launcher.as_ref()).await;
     }
 
-    pub fn set_plugin_permissions(
+    fn set_approved_plugin_permissions(
         &self,
-        directory: &Path,
-        requires_root: bool,
+        metadata: &PluginMetadata,
     ) -> std::result::Result<(), WorkerError> {
-        let directory = directory
-            .to_str()
-            .ok_or_else(|| WorkerError::Error("Plugin path is not valid UTF-8".to_owned()))?;
-        let directory = resolve_plugin_directory(&self.plugin_root, directory)?;
-        set_plugin_permissions_inner(
+        let directory = self.plugin_root.join(&metadata.directory);
+        set_plugin_permissions_on_approved(
+            &metadata.approved_directory,
             &directory,
-            requires_root,
+            metadata.requires_root,
             self.user_ids,
             self.chown_plugin_path,
         )
@@ -1037,7 +1051,7 @@ impl PluginRegistry {
         }
         let directory_path = resolve_plugin_directory(&self.plugin_root, directory)?;
         let metadata = read_plugin_metadata(&directory_path, &[])?;
-        self.set_plugin_permissions(&directory_path, metadata.requires_root)?;
+        self.set_approved_plugin_permissions(&metadata)?;
         Ok(())
     }
 
@@ -1150,90 +1164,72 @@ async fn cleanup_plugins(
 
 fn display_name(plugin: &PluginMetadata) -> String {
     match &plugin.version {
-        Some(Value::String(version)) if !version.is_empty() => {
-            format!("{} (v{version})", plugin.name)
-        }
-        Some(Value::Number(version)) => format!("{} (v{version})", plugin.name),
+        Some(version) if !version.is_empty() => format!("{} (v{version})", plugin.name),
         _ => plugin.name.clone(),
     }
+}
+fn approved_launch_json(plugin: &PluginMetadata) -> Value {
+    json!({
+        "descriptor": {
+            "pid": std::process::id(),
+            "fd": plugin.approved_directory.as_raw_fd(),
+            "device": plugin.directory_device,
+            "inode": plugin.directory_inode,
+        },
+        "metadata": {
+            "name": plugin.name.as_str(),
+            "author": plugin.author.as_str(),
+            "flags": &plugin.flags,
+            "api_version": plugin.api_version,
+            "version": plugin.version.as_deref(),
+        },
+    })
 }
 
 fn discover_plugins(
     plugin_root: &Path,
     disabled: &[String],
 ) -> Result<HashMap<String, PluginMetadata>> {
-    let mut directories = fs::read_dir(plugin_root)
-        .with_context(|| format!("Failed to read plugin root {}", plugin_root.display()))?
+    let root_fd = open_plugin_directory_fd(plugin_root)
+        .with_context(|| format!("Failed to open plugin root {}", plugin_root.display()))?;
+    let mut root_stream = open_directory_stream(&root_fd)
+        .with_context(|| format!("Failed to read plugin root {}", plugin_root.display()))?;
+    let mut directories = root_stream
+        .iter()
         .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.path().is_dir())
         .collect::<Vec<_>>();
-    directories.sort_unstable_by_key(|entry| entry.file_name());
+    directories.sort_unstable_by(|left, right| {
+        left.file_name()
+            .to_bytes()
+            .cmp(right.file_name().to_bytes())
+    });
 
     let mut plugins = HashMap::with_capacity(directories.len());
-    for directory in directories {
-        let directory_name = directory.file_name().to_string_lossy().into_owned();
-        let directory_path = directory.path();
+    for entry in directories {
+        let directory_name = OsStr::from_bytes(entry.file_name().to_bytes());
+        let directory_name_bytes = directory_name.as_bytes();
+        if directory_name_bytes == b"." || directory_name_bytes == b".." {
+            continue;
+        }
+        let directory_path = plugin_root.join(directory_name);
         if is_managed_plugin_directory(plugin_root, &directory_path) {
             continue;
         }
-        let plugin_json_path = directory_path.join("plugin.json");
-        if !plugin_json_path.is_file() {
-            continue;
-        }
-        let metadata_json = match read_json(&plugin_json_path) {
+        let directory_fd = match open_directory_at(&root_fd, directory_name) {
+            Ok(fd) => fd,
+            Err(_) => continue,
+        };
+        let display_directory = directory_name.to_string_lossy().into_owned();
+        let metadata = match read_plugin_metadata_from_fd(
+            directory_fd,
+            display_directory,
+            &directory_path,
+            disabled,
+        ) {
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
-        let Some(name) = metadata_json.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        if metadata_json.get("author").is_none() || metadata_json.get("flags").is_none() {
-            continue;
-        }
-        let flags = metadata_json.get("flags");
-        let requires_root = match flags {
-            Some(Value::Array(flags)) => flags.iter().any(|flag| flag.as_str() == Some("root")),
-            Some(Value::String(flags)) => flags.contains("root"),
-            Some(Value::Object(flags)) => flags.contains_key("root"),
-            _ => false,
-        };
-        let debug = match flags {
-            Some(Value::Array(flags)) => flags.iter().any(|flag| flag.as_str() == Some("debug")),
-            Some(Value::String(flags)) => flags.contains("debug"),
-            Some(Value::Object(flags)) => flags.contains_key("debug"),
-            _ => false,
-        };
-
-        let package_path = directory_path.join("package.json");
-        let (version, load_type) = if package_path.is_file() {
-            let package = match read_json(&package_path) {
-                Ok(package) => package,
-                Err(_) => continue,
-            };
-            let Some(version) = package.get("version") else {
-                continue;
-            };
-            let load_type = if package.get("type").and_then(Value::as_str) == Some("module") {
-                1
-            } else {
-                0
-            };
-            (Some(version.clone()), load_type)
-        } else {
-            (None, 0)
-        };
-
-        let plugin = PluginMetadata {
-            name: name.to_owned(),
-            directory: directory_name,
-            version,
-            load_type,
-            passive: !directory_path.join("main.py").is_file(),
-            disabled: disabled.iter().any(|disabled| disabled == name),
-            requires_root,
-            debug,
-        };
-        plugins.insert(plugin.name.clone(), plugin);
+        plugins.insert(metadata.name.clone(), metadata);
     }
 
     Ok(plugins)
@@ -1275,13 +1271,53 @@ fn read_plugin_metadata(
     directory: &Path,
     disabled_plugins: &[String],
 ) -> std::result::Result<PluginMetadata, WorkerError> {
-    let plugin_json_path = directory.join("plugin.json");
-    let metadata_json = read_json(&plugin_json_path).map_err(|error| {
+    let directory_name = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| WorkerError::Error("Plugin directory name is not valid UTF-8".to_owned()))?
+        .to_owned();
+    let directory_fd = open_plugin_directory_fd(directory).map_err(|error| {
         WorkerError::Error(format!(
-            "Could not read plugin metadata {}: {error}",
-            plugin_json_path.display()
+            "Could not securely open plugin directory {}: {error}",
+            directory.display()
         ))
     })?;
+    read_plugin_metadata_from_fd(directory_fd, directory_name, directory, disabled_plugins)
+}
+
+fn read_plugin_metadata_from_fd(
+    directory_fd: OwnedFd,
+    directory_name: String,
+    directory_path: &Path,
+    disabled_plugins: &[String],
+) -> std::result::Result<PluginMetadata, WorkerError> {
+    let approved_directory = Arc::new(directory_fd);
+    let directory_stat = fstat(approved_directory.as_fd()).map_err(|error| {
+        WorkerError::Error(format!(
+            "Could not inspect approved plugin directory {}: {error}",
+            directory_path.display()
+        ))
+    })?;
+    if SFlag::from_bits_truncate(directory_stat.st_mode) != SFlag::S_IFDIR {
+        return Err(WorkerError::Error(format!(
+            "Plugin directory is not a directory: {}",
+            directory_path.display()
+        )));
+    }
+
+    let metadata_json = read_json_at(approved_directory.as_ref(), OsStr::new("plugin.json"))
+        .map_err(|error| {
+            WorkerError::Error(format!(
+                "Could not read plugin metadata {}: {error}",
+                directory_path.join("plugin.json").display()
+            ))
+        })?
+        .ok_or_else(|| {
+            WorkerError::Error(format!(
+                "Could not read plugin metadata {}: file is missing",
+                directory_path.join("plugin.json").display()
+            ))
+        })?;
     let name = metadata_json
         .get("name")
         .and_then(Value::as_str)
@@ -1289,68 +1325,106 @@ fn read_plugin_metadata(
         .ok_or_else(|| {
             WorkerError::Error(format!(
                 "Plugin metadata has no valid name: {}",
-                plugin_json_path.display()
+                directory_path.join("plugin.json").display()
             ))
         })?;
-    if metadata_json.get("author").is_none() || metadata_json.get("flags").is_none() {
-        return Err(WorkerError::Error(format!(
-            "Plugin metadata is missing author or flags: {}",
-            plugin_json_path.display()
-        )));
-    }
-    let flags = metadata_json.get("flags");
-    let requires_root = match flags {
-        Some(Value::Array(flags)) => flags.iter().any(|flag| flag.as_str() == Some("root")),
-        Some(Value::String(flags)) => flags.contains("root"),
-        Some(Value::Object(flags)) => flags.contains_key("root"),
-        _ => false,
+    let author = metadata_json
+        .get("author")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            WorkerError::Error(format!(
+                "Plugin metadata has no valid author: {}",
+                directory_path.join("plugin.json").display()
+            ))
+        })?;
+    let raw_flags = metadata_json
+        .get("flags")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            WorkerError::Error(format!(
+                "Plugin metadata has no valid flags list: {}",
+                directory_path.join("plugin.json").display()
+            ))
+        })?;
+    let flags = raw_flags
+        .iter()
+        .map(|flag| {
+            flag.as_str().map(str::to_owned).ok_or_else(|| {
+                WorkerError::Error(format!(
+                    "Plugin metadata flags must be strings: {}",
+                    directory_path.join("plugin.json").display()
+                ))
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let requires_root = flags.iter().any(|flag| flag == "root");
+    let debug = flags.iter().any(|flag| flag == "debug");
+    let api_version = match metadata_json.get("api_version") {
+        Some(version) => version.as_u64().ok_or_else(|| {
+            WorkerError::Error(format!(
+                "Plugin metadata has no valid API version: {}",
+                directory_path.join("plugin.json").display()
+            ))
+        })?,
+        None => 0,
     };
-    let debug = match flags {
-        Some(Value::Array(flags)) => flags.iter().any(|flag| flag.as_str() == Some("debug")),
-        Some(Value::String(flags)) => flags.contains("debug"),
-        Some(Value::Object(flags)) => flags.contains_key("debug"),
-        _ => false,
-    };
-    let package_path = directory.join("package.json");
-    let (version, load_type) = if package_path.is_file() {
-        let package = read_json(&package_path).map_err(|error| {
+
+    let package =
+        read_json_at(approved_directory.as_ref(), OsStr::new("package.json")).map_err(|error| {
             WorkerError::Error(format!(
                 "Could not read package metadata {}: {error}",
-                package_path.display()
+                directory_path.join("package.json").display()
             ))
         })?;
-        let version = package.get("version").ok_or_else(|| {
-            WorkerError::Error(format!(
-                "Package metadata has no version: {}",
-                package_path.display()
-            ))
-        })?;
-        (
-            Some(version.clone()),
-            u8::from(package.get("type").and_then(Value::as_str) == Some("module")),
-        )
-    } else {
-        (None, 0)
+    let (version, load_type) = match package {
+        Some(package) => {
+            let version = match package.get("version") {
+                Some(Value::String(version)) => Some(version.clone()),
+                Some(Value::Null) => None,
+                _ => {
+                    return Err(WorkerError::Error(format!(
+                        "Package metadata has no valid version: {}",
+                        directory_path.join("package.json").display()
+                    )));
+                }
+            };
+            (
+                version,
+                u8::from(package.get("type").and_then(Value::as_str) == Some("module")),
+            )
+        }
+        None => (None, 0),
     };
-    let directory_name = directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| WorkerError::Error("Plugin directory name is not valid UTF-8".to_owned()))?
-        .to_owned();
+    let passive = !is_regular_file_at(approved_directory.as_ref(), OsStr::new("main.py")).map_err(
+        |error| {
+            WorkerError::Error(format!(
+                "Could not inspect plugin entry point {}: {error}",
+                directory_path.join("main.py").display()
+            ))
+        },
+    )?;
+
     Ok(PluginMetadata {
         name: name.to_owned(),
         directory: directory_name,
-        version,
-        load_type,
-        passive: !directory.join("main.py").is_file(),
-        disabled: disabled_plugins.iter().any(|disabled| disabled == name),
+        author: author.to_owned(),
         requires_root,
         debug,
+        flags,
+        api_version,
+        version,
+        load_type,
+        passive,
+        disabled: disabled_plugins.iter().any(|disabled| disabled == name),
+        approved_directory,
+        directory_device: directory_stat.st_dev as u64,
+        directory_inode: directory_stat.st_ino as u64,
     })
 }
 
-fn set_plugin_permissions_inner(
-    directory: &Path,
+fn set_plugin_permissions_on_approved(
+    directory_fd: &OwnedFd,
+    directory_path: &Path,
     requires_root: bool,
     host_user_ids: (u32, u32),
     enabled: bool,
@@ -1359,10 +1433,10 @@ fn set_plugin_permissions_inner(
         return Ok(());
     }
 
-    let mut root = open_plugin_directory(directory).map_err(|error| {
+    let mut root = open_directory_stream(directory_fd).map_err(|error| {
         WorkerError::Error(format!(
-            "Could not securely open plugin directory {}: {error}",
-            directory.display()
+            "Could not securely open approved plugin directory {}: {error}",
+            directory_path.display()
         ))
     })?;
     let effective_user_ids = platform::effective_user_ids();
@@ -1380,7 +1454,7 @@ fn set_plugin_permissions_inner(
     lock_directory(&root, effective_user_ids, locked_mode).map_err(|error| {
         WorkerError::Error(format!(
             "Could not secure plugin directory {}: {error}",
-            directory.display()
+            directory_path.display()
         ))
     })?;
     update_directory_contents(
@@ -1393,19 +1467,19 @@ fn set_plugin_permissions_inner(
     .map_err(|error| {
         WorkerError::Error(format!(
             "Could not update plugin directory permissions {}: {error}",
-            directory.display()
+            directory_path.display()
         ))
     })?;
     fchmod(&root, Mode::from_bits_truncate(0o755)).map_err(|error| {
         WorkerError::Error(format!(
             "Could not chmod plugin directory {}: {error}",
-            directory.display()
+            directory_path.display()
         ))
     })?;
     Ok(())
 }
 
-fn open_plugin_directory(path: &Path) -> io::Result<Dir> {
+fn open_plugin_directory_fd(path: &Path) -> io::Result<OwnedFd> {
     let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
     let mut current = if path.is_absolute() {
         open("/", flags, Mode::empty())
@@ -1429,7 +1503,61 @@ fn open_plugin_directory(path: &Path) -> io::Result<Dir> {
         current = openat(&current, name, flags, Mode::empty()).map_err(io::Error::from)?;
     }
 
-    Dir::from_fd(current).map_err(io::Error::from)
+    Ok(current)
+}
+
+fn open_directory_at(parent: &impl AsFd, name: &OsStr) -> io::Result<OwnedFd> {
+    openat(
+        parent,
+        name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)
+}
+
+fn open_directory_stream(directory_fd: &impl AsFd) -> io::Result<Dir> {
+    let fd = open_directory_at(directory_fd, OsStr::new("."))?;
+    Dir::from_fd(fd).map_err(io::Error::from)
+}
+
+fn open_regular_file_at(parent: &impl AsFd, name: &OsStr) -> io::Result<Option<OwnedFd>> {
+    let fd = match openat(
+        parent,
+        name,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::ENOENT) => return Ok(None),
+        Err(error) => return Err(io::Error::from(error)),
+    };
+    let metadata = fstat(&fd).map_err(io::Error::from)?;
+    if SFlag::from_bits_truncate(metadata.st_mode) != SFlag::S_IFREG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "plugin metadata file is not a regular file",
+        ));
+    }
+    Ok(Some(fd))
+}
+
+fn read_json_at(parent: &impl AsFd, name: &OsStr) -> io::Result<Option<Value>> {
+    let Some(fd) = open_regular_file_at(parent, name)? else {
+        return Ok(None);
+    };
+    serde_json::from_reader(File::from(fd))
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn is_regular_file_at(parent: &impl AsFd, name: &OsStr) -> io::Result<bool> {
+    let metadata = match fstatat(parent, name, AtFlags::empty()) {
+        Ok(metadata) => metadata,
+        Err(Errno::ENOENT) => return Ok(false),
+        Err(error) => return Err(io::Error::from(error)),
+    };
+    Ok(SFlag::from_bits_truncate(metadata.st_mode) == SFlag::S_IFREG)
 }
 
 fn lock_directory(
@@ -1516,7 +1644,7 @@ fn update_directory_contents(
     locked_mode: Mode,
     protect_metadata: bool,
 ) -> io::Result<()> {
-    let parent_fd = unistd::dup(directory.as_fd()).map_err(io::Error::from)?;
+    let parent_fd = open_directory_at(&*directory, OsStr::new("."))?;
     for entry in directory.iter() {
         let entry = entry.map_err(io::Error::from)?;
         let name = entry.file_name();
@@ -1611,6 +1739,30 @@ fn update_directory_contents(
 mod plugin_permission_tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    fn set_plugin_permissions_inner(
+        directory: &Path,
+        requires_root: bool,
+        host_user_ids: (u32, u32),
+        enabled: bool,
+    ) -> std::result::Result<(), WorkerError> {
+        if !enabled {
+            return Ok(());
+        }
+
+        let directory_fd = open_plugin_directory_fd(directory).map_err(|error| {
+            WorkerError::Error(format!(
+                "Could not securely open plugin directory {}: {error}",
+                directory.display()
+            ))
+        })?;
+        set_plugin_permissions_on_approved(
+            &directory_fd,
+            directory,
+            requires_root,
+            host_user_ids,
+            enabled,
+        )
+    }
 
     struct TestDirectory(PathBuf);
 
@@ -1638,6 +1790,148 @@ mod plugin_permission_tests {
         } else {
             effective
         }
+    }
+
+    fn write_approved_plugin(directory: &Path, flags: &[&str]) {
+        fs::create_dir_all(directory).unwrap();
+        let metadata = serde_json::json!({
+            "name": "Example",
+            "author": "Unit Test",
+            "flags": flags,
+            "api_version": 3,
+        });
+        fs::write(directory.join("plugin.json"), metadata.to_string()).unwrap();
+        fs::write(
+            directory.join("package.json"),
+            br#"{"version":"1.2.3","type":"module"}"#,
+        )
+        .unwrap();
+        fs::write(directory.join("main.py"), b"pass\n").unwrap();
+        set_mode(directory, 0o700);
+        set_mode(&directory.join("plugin.json"), 0o600);
+        set_mode(&directory.join("package.json"), 0o600);
+        set_mode(&directory.join("main.py"), 0o600);
+    }
+
+    #[test]
+    fn linked_backend_entrypoints_remain_active() {
+        let temporary = TestDirectory::new();
+        let plugin = temporary.0.join("plugin");
+        write_approved_plugin(&plugin, &[]);
+        fs::rename(plugin.join("main.py"), plugin.join("backend.py")).unwrap();
+        symlink("backend.py", plugin.join("main.py")).unwrap();
+        let metadata = read_plugin_metadata(&plugin, &[]).unwrap();
+        assert!(!metadata.passive);
+    }
+
+    #[test]
+    fn approved_metadata_and_permissions_stay_bound_after_parent_replacement() {
+        let temporary = TestDirectory::new();
+        let plugin_root = temporary.0.join("plugins");
+        let plugin_path = plugin_root.join("Example");
+        write_approved_plugin(&plugin_path, &[]);
+
+        let metadata = {
+            let discovered = discover_plugins(&plugin_root, &[]).unwrap();
+            discovered.get("Example").unwrap().clone()
+        };
+        assert!(!metadata.requires_root);
+
+        let displaced_root = temporary.0.join("plugins-displaced");
+        fs::rename(&plugin_root, &displaced_root).unwrap();
+        let replacement_path = plugin_root.join("Example");
+        write_approved_plugin(&replacement_path, &["root"]);
+        let replacement = read_plugin_metadata(&replacement_path, &[]).unwrap();
+        assert!(replacement.requires_root);
+        assert_ne!(replacement.directory_inode, metadata.directory_inode);
+
+        let effective = platform::effective_user_ids();
+        let host = host_user_ids(effective);
+        set_plugin_permissions_on_approved(
+            &metadata.approved_directory,
+            &replacement_path,
+            metadata.requires_root,
+            host,
+            true,
+        )
+        .unwrap();
+
+        let retained_plugin = displaced_root.join("Example");
+        let standard_file = fs::metadata(retained_plugin.join("main.py")).unwrap();
+        assert_eq!((standard_file.uid(), standard_file.gid()), host);
+        assert_eq!(standard_file.mode() & 0o7777, 0o755);
+        assert_eq!(
+            fs::metadata(retained_plugin.join("plugin.json"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+
+        assert_eq!(
+            fs::metadata(&replacement_path).unwrap().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(replacement_path.join("main.py"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(replacement_path.join("plugin.json"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        set_plugin_permissions_on_approved(
+            &replacement.approved_directory,
+            &replacement_path,
+            replacement.requires_root,
+            host,
+            true,
+        )
+        .unwrap();
+        let root_file = fs::metadata(replacement_path.join("main.py")).unwrap();
+        assert_eq!((root_file.uid(), root_file.gid()), effective);
+        assert_eq!(root_file.mode() & 0o7777, 0o755);
+    }
+
+    #[test]
+    fn approved_metadata_reads_require_regular_nofollow_json_files() {
+        let temporary = TestDirectory::new();
+        let plugin = temporary.0.join("plugin");
+        write_approved_plugin(&plugin, &[]);
+        let external_plugin_json = temporary.0.join("external-plugin.json");
+        fs::write(
+            &external_plugin_json,
+            br#"{"name":"Replacement","author":"Outside","flags":["root"]}"#,
+        )
+        .unwrap();
+        fs::remove_file(plugin.join("plugin.json")).unwrap();
+        symlink(&external_plugin_json, plugin.join("plugin.json")).unwrap();
+        assert!(read_plugin_metadata(&plugin, &[]).is_err());
+
+        fs::remove_file(plugin.join("plugin.json")).unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            br#"{"name":"Example","author":"Unit Test","flags":[],"api_version":0}"#,
+        )
+        .unwrap();
+        let external_package_json = temporary.0.join("external-package.json");
+        fs::write(
+            &external_package_json,
+            br#"{"version":"9.9.9","type":"module"}"#,
+        )
+        .unwrap();
+        fs::remove_file(plugin.join("package.json")).unwrap();
+        symlink(&external_package_json, plugin.join("package.json")).unwrap();
+        assert!(read_plugin_metadata(&plugin, &[]).is_err());
+        fs::remove_file(plugin.join("plugin.json")).unwrap();
+        unistd::mkfifo(&plugin.join("plugin.json"), Mode::from_bits_truncate(0o600)).unwrap();
+        assert!(read_plugin_metadata(&plugin, &[]).is_err());
     }
 
     #[test]
@@ -2249,7 +2543,8 @@ async fn launch_worker(
     if shutdown_requested(shutdown) {
         return Err(WorkerLaunchError::Interrupted);
     }
-    if plugin.requires_root {
+    let requires_root = plugin.requires_root;
+    if requires_root {
         let effective_uid = platform::effective_user_ids().0;
         if effective_uid != 0 {
             return Err(WorkerLaunchError::Failed(format!(
@@ -2260,7 +2555,7 @@ async fn launch_worker(
     }
 
     let socket_path = socket_directory
-        .join(if plugin.requires_root { "root" } else { "user" })
+        .join(if requires_root { "root" } else { "user" })
         .join(socket_filename());
     if socket_path.as_os_str().as_bytes().len() >= 108 {
         return Err(WorkerLaunchError::Failed(format!(
@@ -2268,10 +2563,17 @@ async fn launch_worker(
             socket_path.display()
         )));
     }
+    let approved_launch = approved_launch_json(plugin);
 
     let mut supervisor = match worker_mode {
         WorkerMode::Exec => {
             let mut command = Command::new(worker_executable);
+            let approved_launch_argument =
+                serde_json::to_string(&approved_launch).map_err(|error| {
+                    WorkerLaunchError::Failed(format!(
+                        "Failed to serialize approved plugin launch metadata: {error}"
+                    ))
+                })?;
             command
                 .arg("--plugin-root")
                 .arg(plugin_root)
@@ -2285,6 +2587,8 @@ async fn launch_worker(
                 .arg(user)
                 .arg("--bootstrap")
                 .arg(worker_bootstrap.as_str())
+                .arg("--approved-launch")
+                .arg(&approved_launch_argument)
                 .env("DECKY_AUTH_TOKEN", auth_token)
                 .env("SERVER_HOST", server_host)
                 .env("SERVER_PORT", server_port.to_string())
@@ -2328,6 +2632,7 @@ async fn launch_worker(
                     "homebrew": homebrew,
                     "user": user,
                     "bootstrap": worker_bootstrap.as_str(),
+                    "approved_launch": &approved_launch,
                 }))
                 .await
             {

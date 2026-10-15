@@ -5,7 +5,16 @@ import asyncio
 import hashlib
 import importlib
 from importlib.abc import Loader, MetaPathFinder
-from importlib.machinery import ModuleSpec
+from importlib.machinery import (
+    BYTECODE_SUFFIXES,
+    EXTENSION_SUFFIXES,
+    SOURCE_SUFFIXES,
+    ExtensionFileLoader,
+    FileFinder,
+    ModuleSpec,
+    SourceFileLoader,
+    SourcelessFileLoader,
+)
 import json
 import logging
 import os
@@ -13,6 +22,7 @@ import platform
 import stat
 import sys
 import sysconfig
+import zipimport
 from pathlib import Path
 from types import CodeType, ModuleType
 from typing import Any, Callable, Coroutine, Sequence, cast
@@ -27,6 +37,216 @@ _SDK_ALIAS_ROOTS = frozenset(
      "main", "plugin", "settings", "updater", "utilities", "wsrouter")
 )
 _prepared_bootstraps: set[str] = set()
+
+
+class _AnchoredSourceFileLoader(SourceFileLoader):
+    def __init__(self, bridge: _PluginImportBridge, fullname: str, path: str) -> None:
+        self._bridge = bridge
+        super().__init__(fullname, bridge._public_path(path))
+
+    def get_data(self, path: str) -> bytes:
+        return super().get_data(self._bridge._anchored_path(path))
+
+    def path_stats(self, path: str) -> dict[str, float | int]:
+        return super().path_stats(self._bridge._anchored_path(path))
+
+    def set_data(self, path: str, data: bytes, *, _mode: int = 0o666) -> None:
+        super().set_data(self._bridge._anchored_path(path), data, _mode=_mode)
+
+
+class _AnchoredBytecodeLoader(SourcelessFileLoader):
+    def __init__(self, bridge: _PluginImportBridge, fullname: str, path: str) -> None:
+        self._bridge = bridge
+        super().__init__(fullname, bridge._public_path(path))
+
+    def get_data(self, path: str) -> bytes:
+        return super().get_data(self._bridge._anchored_path(path))
+
+
+class _PublicOriginExtensionLoader(Loader):
+    def __init__(self, loader: ExtensionFileLoader, public_origin: str) -> None:
+        self._loader = loader
+        self._anchored_origin = loader.path
+        self._public_origin = public_origin
+
+    def create_module(self, spec: ModuleSpec) -> ModuleType | None:
+        spec.origin = self._anchored_origin
+        try:
+            return self._loader.create_module(spec)
+        finally:
+            spec.origin = self._public_origin
+
+    def exec_module(self, module: ModuleType) -> None:
+        spec = module.__spec__
+        if spec is None:
+            raise ImportError(f"native module {module.__name__!r} has no import specification")
+        spec.origin = self._anchored_origin
+        try:
+            self._loader.exec_module(module)
+        finally:
+            spec.origin = self._public_origin
+            module.__file__ = self._public_origin
+
+    def get_filename(self, fullname: str) -> str:
+        return self._public_origin
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._loader, name)
+
+
+class _PublicOriginZipLoader(Loader):
+    def __init__(
+        self, bridge: _PluginImportBridge, loader: zipimport.zipimporter
+    ) -> None:
+        self._bridge = bridge
+        self._loader = loader
+
+    def create_module(self, spec: ModuleSpec) -> ModuleType | None:
+        return self._loader.create_module(spec)
+
+    def _public_code(self, code: CodeType) -> CodeType:
+        try:
+            filename = self._bridge._public_path(code.co_filename)
+        except ImportError:
+            filename = code.co_filename
+        return code.replace(
+            co_filename=filename,
+            co_consts=tuple(
+                self._public_code(value) if isinstance(value, CodeType) else value
+                for value in code.co_consts
+            ),
+        )
+
+    def get_code(self, fullname: str) -> CodeType | None:
+        code = self._loader.get_code(fullname)
+        return None if code is None else self._public_code(code)
+
+    def exec_module(self, module: ModuleType) -> None:
+        code = self.get_code(module.__name__)
+        if code is None:
+            raise ImportError(f"no code for ZIP module {module.__name__!r}")
+        exec(code, module.__dict__)
+
+    def get_filename(self, fullname: str) -> str:
+        return self._bridge._public_path(self._loader.get_filename(fullname))
+
+    def get_data(self, path: str) -> bytes:
+        return self._loader.get_data(self._bridge._anchored_path(path))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._loader, name)
+
+
+class _AnchoredFileFinder:
+    def __init__(self, bridge: _PluginImportBridge, path: str) -> None:
+        self._bridge = bridge
+        try:
+            self._finder = zipimport.zipimporter(path)
+        except zipimport.ZipImportError:
+            self._finder = FileFinder(
+                path,
+                (ExtensionFileLoader, EXTENSION_SUFFIXES),
+                (self._source_loader, SOURCE_SUFFIXES),
+                (self._bytecode_loader, BYTECODE_SUFFIXES),
+            )
+
+    def _source_loader(self, fullname: str, path: str) -> Loader:
+        return _AnchoredSourceFileLoader(self._bridge, fullname, path)
+
+    def _bytecode_loader(self, fullname: str, path: str) -> Loader:
+        return _AnchoredBytecodeLoader(self._bridge, fullname, path)
+
+    def find_spec(
+        self,
+        fullname: str,
+        target: ModuleType | None = None,
+    ) -> ModuleSpec | None:
+        spec = self._finder.find_spec(fullname, target=target)
+        if spec is None:
+            return None
+        cached = spec.cached
+        if spec.origin is not None:
+            public_origin = self._bridge._public_path(spec.origin)
+            if isinstance(spec.loader, ExtensionFileLoader):
+                spec.loader = _PublicOriginExtensionLoader(spec.loader, public_origin)
+            elif isinstance(spec.loader, zipimport.zipimporter):
+                spec.loader = _PublicOriginZipLoader(self._bridge, spec.loader)
+            spec.origin = public_origin
+        if cached is not None:
+            spec.cached = self._bridge._public_path(cached)
+        if spec.submodule_search_locations is not None:
+            spec.submodule_search_locations = [
+                self._bridge._public_path(location)
+                for location in spec.submodule_search_locations
+            ]
+        return spec
+
+    def invalidate_caches(self) -> None:
+        self._finder.invalidate_caches()
+
+
+class _PluginImportBridge:
+    def __init__(self, directory_fd: int, public_directory: Path) -> None:
+        self._public_directory = Path(os.path.abspath(public_directory))
+        self._anchored_directory = f"/proc/self/fd/{directory_fd}"
+        self._installed = False
+
+    def _relative_public_path(self, path: str) -> Path:
+        candidate = Path(os.path.abspath(path))
+        try:
+            return candidate.relative_to(self._public_directory)
+        except ValueError as error:
+            raise OSError(f"path is outside the approved plugin directory: {path}") from error
+
+    def _anchored_path(self, public_path: str) -> str:
+        relative = self._relative_public_path(public_path)
+        return os.path.join(self._anchored_directory, *relative.parts)
+
+    def _public_path(self, anchored_path: str) -> str:
+        candidate = Path(os.path.abspath(anchored_path))
+        try:
+            relative = candidate.relative_to(Path(self._anchored_directory))
+        except ValueError as error:
+            raise ImportError(f"path is outside the approved plugin descriptor: {anchored_path}") from error
+        return str(self._public_directory.joinpath(relative))
+
+    def entrypoint_loader(self, public_path: str) -> Loader:
+        relative = self._relative_public_path(public_path)
+        if relative.parts != ("main.py",):
+            raise WorkerError(f"loader-managed entrypoint is outside the approved plugin directory: {public_path}")
+        return _AnchoredSourceFileLoader(self, "_", self._anchored_path(public_path))
+
+    def __call__(self, path_entry: str) -> _AnchoredFileFinder:
+        if not isinstance(path_entry, str):
+            raise ImportError("plugin import path must be a string")
+        candidate = Path(os.path.abspath(path_entry))
+        try:
+            relative = candidate.relative_to(self._public_directory)
+        except ValueError as error:
+            raise ImportError(f"path is outside the approved plugin directory: {path_entry}") from error
+        anchored_path = os.path.join(self._anchored_directory, *relative.parts)
+        return _AnchoredFileFinder(self, anchored_path)
+
+    def _clear_importer_cache(self) -> None:
+        for path_entry in tuple(sys.path_importer_cache):
+            if not isinstance(path_entry, str):
+                continue
+            try:
+                Path(os.path.abspath(path_entry)).relative_to(self._public_directory)
+            except ValueError:
+                continue
+            sys.path_importer_cache.pop(path_entry, None)
+
+    def install(self) -> None:
+        self._clear_importer_cache()
+        sys.path_hooks.insert(0, self)
+        self._installed = True
+
+    def close(self) -> None:
+        if self._installed:
+            sys.path_hooks[:] = [path_hook for path_hook in sys.path_hooks if path_hook is not self]
+            self._installed = False
+        self._clear_importer_cache()
 
 
 class _SdkAliasLoader(Loader):
@@ -127,6 +347,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--socket", help="Unix socket path used for plugin IPC")
     parser.add_argument("--homebrew", help="isolated Decky homebrew directory")
     parser.add_argument("--user", help="account that owns the isolated Decky tree")
+    parser.add_argument("--approved-launch", type=json.loads, help="authoritative launch metadata and directory reference")
     parser.add_argument("--bootstrap", choices=("full", "lean"), default="lean", help="SDK startup path")
     return parser
 
@@ -140,6 +361,7 @@ def _required_arguments(parser: argparse.ArgumentParser, args: argparse.Namespac
             ("--socket", args.socket),
             ("--homebrew", args.homebrew),
             ("--user", args.user),
+            ("--approved-launch", args.approved_launch),
         )
         if not value
     ]
@@ -147,80 +369,102 @@ def _required_arguments(parser: argparse.ArgumentParser, args: argparse.Namespac
         parser.error("missing required arguments: " + ", ".join(missing))
 
 
-def _resolve_plugin_directory(plugin_root: str, plugin_directory: str) -> tuple[Path, Path]:
-    try:
-        root = Path(plugin_root).expanduser().resolve(strict=True)
-    except OSError as error:
-        raise WorkerError(f"plugin root is not accessible: {plugin_root}: {error}") from error
-    if not root.is_dir():
-        raise WorkerError(f"plugin root is not a directory: {root}")
+def _acquire_approved_launch(value: Any) -> tuple[int, dict[str, Any]]:
+    if not isinstance(value, dict) or set(value) != {"descriptor", "metadata"}:
+        raise WorkerError("--approved-launch must contain exactly descriptor and metadata objects")
+    descriptor = value["descriptor"]
+    metadata = value["metadata"]
+    if not isinstance(descriptor, dict) or set(descriptor) != {"pid", "fd", "device", "inode"}:
+        raise WorkerError("--approved-launch descriptor has an invalid shape")
+    if not isinstance(metadata, dict) or set(metadata) != {
+        "name", "author", "flags", "api_version", "version"
+    }:
+        raise WorkerError("--approved-launch metadata has an invalid shape")
 
-    requested = Path(plugin_directory).expanduser()
-    candidate = requested if requested.is_absolute() else root / requested
+    def unsigned_integer(item: Any, field: str, maximum: int) -> int:
+        if type(item) is not int or item < 0 or item > maximum:
+            raise WorkerError(f"--approved-launch {field} must be an unsigned integer")
+        return item
+
+    pid = unsigned_integer(descriptor["pid"], "descriptor.pid", 2**32 - 1)
+    if pid == 0:
+        raise WorkerError("--approved-launch descriptor.pid must be positive")
+    remote_fd = unsigned_integer(descriptor["fd"], "descriptor.fd", 2**31 - 1)
+    device = unsigned_integer(descriptor["device"], "descriptor.device", 2**64 - 1)
+    inode = unsigned_integer(descriptor["inode"], "descriptor.inode", 2**64 - 1)
+
+    name = metadata["name"]
+    author = metadata["author"]
+    flags = metadata["flags"]
+    api_version = metadata["api_version"]
+    version = metadata["version"]
+    if not isinstance(name, str) or not name:
+        raise WorkerError("--approved-launch metadata.name must be a non-empty string")
+    if not isinstance(author, str):
+        raise WorkerError("--approved-launch metadata.author must be a string")
+    if not isinstance(flags, list) or any(not isinstance(flag, str) for flag in flags):
+        raise WorkerError("--approved-launch metadata.flags must be a list of strings")
+    if type(api_version) is not int or api_version < 0:
+        raise WorkerError("--approved-launch metadata.api_version must be a non-negative integer")
+    if version is not None and not isinstance(version, str):
+        raise WorkerError("--approved-launch metadata.version must be a string or null")
+
+    approved_metadata = {
+        "name": name,
+        "author": author,
+        "flags": list(flags),
+        "api_version": api_version,
+        "version": version,
+    }
+    reference = f"/proc/{pid}/fd/{remote_fd}"
     try:
-        directory = candidate.resolve(strict=True)
+        directory_fd = os.open(reference, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError as error:
-        raise WorkerError(f"plugin directory is not accessible: {plugin_directory}: {error}") from error
+        raise WorkerError(f"could not acquire approved plugin directory descriptor {reference}: {error}") from error
     try:
-        directory.relative_to(root)
+        status = os.fstat(directory_fd)
+    except OSError as error:
+        os.close(directory_fd)
+        raise WorkerError(f"could not inspect approved plugin directory descriptor {reference}: {error}") from error
+    if status.st_dev != device or status.st_ino != inode:
+        os.close(directory_fd)
+        raise WorkerError(
+            "approved plugin directory descriptor identity does not match the Rust launch reference"
+        )
+
+    return directory_fd, approved_metadata
+
+
+def _public_plugin_paths(plugin_root: str, plugin_directory: str) -> tuple[Path, Path]:
+    root = Path(os.path.abspath(os.path.expanduser(plugin_root)))
+    requested = Path(os.path.expanduser(plugin_directory))
+    directory = requested if requested.is_absolute() else root / requested
+    directory = Path(os.path.abspath(directory))
+    try:
+        relative = directory.relative_to(root)
     except ValueError as error:
         raise WorkerError(f"plugin directory escapes plugin root: {plugin_directory}") from error
-    if directory == root or directory.parent != root or not directory.is_dir():
-        raise WorkerError(f"plugin directory must be a direct directory inside plugin root: {plugin_directory}")
+    if len(relative.parts) != 1 or relative.parts[0] in ("", ".", ".."):
+        raise WorkerError(
+            f"plugin directory must be a direct directory inside plugin root: {plugin_directory}"
+        )
     return root, directory
 
 
-def _read_json(path: Path) -> Any:
+def _validate_approved_entrypoint(directory_fd: int, public_path: Path) -> None:
     try:
-        with path.open("r", encoding="utf-8") as file:
-            return json.load(file)
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise WorkerError(f"could not read plugin metadata {path}: {error}") from error
-
-
-def _plugin_metadata(plugin_directory: Path) -> tuple[str, list[str], str, str | None, str, int]:
-    metadata_path = plugin_directory / "plugin.json"
-    metadata = _read_json(metadata_path)
-    if not isinstance(metadata, dict):
-        raise WorkerError(f"plugin metadata must be a JSON object: {metadata_path}")
-    metadata = cast(dict[str, Any], metadata)
-
+        entrypoint_fd = os.open(
+            "main.py",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+    except OSError as error:
+        raise WorkerError(f"plugin has no readable backend entrypoint: {public_path}: {error}") from error
     try:
-        name = metadata["name"]
-        author = metadata["author"]
-        flags = metadata["flags"]
-        api_version = metadata.get("api_version", 0)
-    except KeyError as error:
-        raise WorkerError(f"plugin metadata is missing required field {error.args[0]!r}: {metadata_path}") from error
-
-    if not isinstance(name, str) or not name:
-        raise WorkerError(f"plugin metadata field 'name' must be a non-empty string: {metadata_path}")
-    if not isinstance(author, str):
-        raise WorkerError(f"plugin metadata field 'author' must be a string: {metadata_path}")
-    if not isinstance(flags, list) or any(not isinstance(flag, str) for flag in cast(list[Any], flags)):
-        raise WorkerError(f"plugin metadata field 'flags' must be a list of strings: {metadata_path}")
-    if type(api_version) is not int or api_version < 0:
-        raise WorkerError(f"plugin metadata field 'api_version' must be a non-negative integer: {metadata_path}")
-
-    version: str | None = None
-    package_path = plugin_directory / "package.json"
-    if package_path.is_file():
-        package = _read_json(package_path)
-        if not isinstance(package, dict):
-            raise WorkerError(f"package metadata must be a JSON object: {package_path}")
-        package = cast(dict[str, Any], package)
-        try:
-            version = package["version"]
-        except KeyError as error:
-            raise WorkerError(f"package metadata is missing required field 'version': {package_path}") from error
-        if not isinstance(version, str):
-            raise WorkerError(f"package metadata field 'version' must be a string: {package_path}")
-
-    entrypoint = plugin_directory / "main.py"
-    if not entrypoint.is_file():
-        raise WorkerError(f"plugin has no backend entrypoint and is passive: {entrypoint}")
-
-    return name, cast(list[str], flags), str(entrypoint), version, author, api_version
+        if not stat.S_ISREG(os.fstat(entrypoint_fd).st_mode):
+            raise WorkerError(f"plugin backend entrypoint is not a regular file: {public_path}")
+    finally:
+        os.close(entrypoint_fd)
 
 
 def _selected_user(user: str) -> Any:
@@ -388,81 +632,102 @@ def _append_system_pythonpaths(get_system_pythonpaths: Any) -> None:
 
 
 def launch(args: argparse.Namespace) -> None:
-    root, plugin_directory = _resolve_plugin_directory(args.plugin_root, args.plugin_directory)
-    name, flags, entrypoint, version, author, api_version = _plugin_metadata(plugin_directory)
-    account = _selected_user(args.user)
-    if "root" in flags and os.geteuid() != 0:
-        raise WorkerError(f"plugin {name!r} requires root privileges, but the worker is not running as root")
-
+    directory_fd, metadata = _acquire_approved_launch(getattr(args, "approved_launch", None))
+    bridge: _PluginImportBridge | None = None
     try:
-        homebrew = _prepare_plugin_storage(Path(args.homebrew), plugin_directory.name, account)
-    except OSError as error:
-        raise WorkerError(
-            f"could not prepare isolated homebrew directory {args.homebrew}: {error}"
-        ) from error
-    _configure_environment(root, homebrew, args.user)
+        root, plugin_directory = _public_plugin_paths(args.plugin_root, args.plugin_directory)
+        name = cast(str, metadata["name"])
+        flags = cast(list[str], metadata["flags"])
+        version = cast(str | None, metadata["version"])
+        author = cast(str, metadata["author"])
+        api_version = cast(int, metadata["api_version"])
+        entrypoint = str(plugin_directory / "main.py")
+        _validate_approved_entrypoint(directory_fd, Path(entrypoint))
 
-    socket_path = Path(args.socket).expanduser().absolute()
-    if not socket_path.parent.is_dir():
-        raise WorkerError(f"IPC socket parent directory does not exist: {socket_path.parent}")
-    if socket_path.exists() or socket_path.is_symlink():
-        raise WorkerError(f"refusing to replace an existing IPC socket path: {socket_path}")
+        account = _selected_user(args.user)
+        if "root" in flags and os.geteuid() != 0:
+            raise WorkerError(f"plugin {name!r} requires root privileges, but the worker is not running as root")
 
-    from decky_loader.localplatform.localplatform import get_log_level
-
-    logging.basicConfig(
-        level=get_log_level(),
-        format="[%(name)s][%(levelname)s]: %(message)s",
-        stream=sys.stderr,
-    )
-
-    prepare_runtime(args.bootstrap)
-    from decky_loader.helpers import get_system_pythonpaths
-    from decky_loader.localplatform.localsocket import LocalSocket
-    from decky_loader.plugin.sandboxed_plugin import SandboxedPlugin
-
-    class TrackedLocalSocket(LocalSocket):
-        server_ready = False
-        startup_error: Exception | None = None
-
-        async def setup_server(self, on_new_message: Callable[[str], Coroutine[Any, Any, Any]]) -> None:
-            try:
-                await super().setup_server(on_new_message)
-            except Exception as error:
-                self.startup_error = error
-                asyncio.get_running_loop().stop()
-                raise
-            else:
-                self.server_ready = True
-
-    _append_system_pythonpaths(get_system_pythonpaths)
-
-    tracked_socket = TrackedLocalSocket()
-    tracked_socket.socket_addr = str(socket_path)
-    plugin = SandboxedPlugin(
-        name,
-        False,
-        flags,
-        entrypoint,
-        plugin_directory.name,
-        str(root),
-        version,
-        author,
-        api_version,
-    )
-    try:
-        plugin.initialize(tracked_socket)
-    except SystemExit as error:
-        if not tracked_socket.server_ready:
+        try:
+            homebrew = _prepare_plugin_storage(Path(args.homebrew), plugin_directory.name, account)
+        except OSError as error:
             raise WorkerError(
-                f"plugin {name!r} exited during startup before its IPC listener became ready"
+                f"could not prepare isolated homebrew directory {args.homebrew}: {error}"
             ) from error
-        raise WorkerError(f"plugin {name!r} exited with status {error.code}") from error
+        _configure_environment(root, homebrew, args.user)
 
-    if tracked_socket.startup_error is not None:
-        raise WorkerError(f"could not create plugin IPC listener: {tracked_socket.startup_error}")
-    if not tracked_socket.server_ready:
-        raise WorkerError(f"plugin {name!r} exited before its IPC listener became ready")
+        socket_path = Path(args.socket).expanduser().absolute()
+        if not socket_path.parent.is_dir():
+            raise WorkerError(f"IPC socket parent directory does not exist: {socket_path.parent}")
+        if socket_path.exists() or socket_path.is_symlink():
+            raise WorkerError(f"refusing to replace an existing IPC socket path: {socket_path}")
+
+        from decky_loader.localplatform.localplatform import get_log_level
+
+        logging.basicConfig(
+            level=get_log_level(),
+            format="[%(name)s][%(levelname)s]: %(message)s",
+            stream=sys.stderr,
+        )
+
+        prepare_runtime(args.bootstrap)
+        from decky_loader.helpers import get_system_pythonpaths
+        from decky_loader.localplatform.localsocket import LocalSocket
+        from decky_loader.plugin.sandboxed_plugin import SandboxedPlugin
+
+        class TrackedLocalSocket(LocalSocket):
+            server_ready = False
+            startup_error: Exception | None = None
+
+            async def setup_server(
+                self, on_new_message: Callable[[str], Coroutine[Any, Any, Any]]
+            ) -> None:
+                try:
+                    await super().setup_server(on_new_message)
+                except Exception as error:
+                    self.startup_error = error
+                    asyncio.get_running_loop().stop()
+                    raise
+                else:
+                    self.server_ready = True
+
+        _append_system_pythonpaths(get_system_pythonpaths)
+
+        tracked_socket = TrackedLocalSocket()
+        tracked_socket.socket_addr = str(socket_path)
+        bridge = _PluginImportBridge(directory_fd, plugin_directory)
+        bridge.install()
+        plugin = SandboxedPlugin(
+            name,
+            False,
+            flags,
+            entrypoint,
+            plugin_directory.name,
+            str(root),
+            version,
+            author,
+            api_version,
+            entrypoint_loader=bridge.entrypoint_loader,
+        )
+        try:
+            plugin.initialize(tracked_socket)
+        except SystemExit as error:
+            if not tracked_socket.server_ready:
+                raise WorkerError(
+                    f"plugin {name!r} exited during startup before its IPC listener became ready"
+                ) from error
+            raise WorkerError(f"plugin {name!r} exited with status {error.code}") from error
+
+        if tracked_socket.startup_error is not None:
+            raise WorkerError(f"could not create plugin IPC listener: {tracked_socket.startup_error}")
+        if not tracked_socket.server_ready:
+            raise WorkerError(f"plugin {name!r} exited before its IPC listener became ready")
+    finally:
+        try:
+            if bridge is not None:
+                bridge.close()
+        finally:
+            os.close(directory_fd)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -1,6 +1,7 @@
 import sys
 from os import path, environ
 from importlib.util import module_from_spec, spec_from_file_location
+from importlib.abc import Loader
 from json import dumps, loads
 from logging import getLogger
 from traceback import format_exc
@@ -16,9 +17,12 @@ from ..enums import UserType
 from .. import helpers
 from .. import settings # pyright: ignore [reportUnusedImport]
 
-from typing import List, TypeVar, Any
+from typing import Callable, List, TypeVar, Any
+
+EntrypointLoader = Callable[[str], Loader]
 
 DataType = TypeVar("DataType")
+
 
 class SandboxedPlugin:
     def __init__(self,
@@ -30,7 +34,9 @@ class SandboxedPlugin:
                  plugin_path: str,
                  version: str|None,
                  author: str,
-                 api_version: int) -> None:
+                 api_version: int,
+                 *,
+                 entrypoint_loader: EntrypointLoader | None = None) -> None:
         self.name = name
         self.passive = passive
         self.flags = flags
@@ -40,6 +46,7 @@ class SandboxedPlugin:
         self.version = version
         self.author = author
         self.api_version = api_version
+        self._entrypoint_loader = entrypoint_loader
         self.shutdown_running = False
         self.uninstalling = False
 
@@ -109,7 +116,12 @@ class SandboxedPlugin:
             # provided for compatibility
             sys.modules["decky_plugin"] = decky
 
-            spec = spec_from_file_location("_", self.file)
+            if self._entrypoint_loader is None:
+                spec = spec_from_file_location("_", self.file)
+            else:
+                spec = spec_from_file_location(
+                    "_", self.file, loader=self._entrypoint_loader(self.file)
+                )
             assert spec is not None
             module = module_from_spec(spec)
             assert spec.loader is not None

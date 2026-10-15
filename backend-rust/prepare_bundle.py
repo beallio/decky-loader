@@ -22,6 +22,11 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 BUILD_CONFIG = json.loads((HERE / 'build-config.json').read_text())
 BASELINE_TAG = BUILD_CONFIG['sdk']['tag']
+SDK_OVERLAYS = (
+    'backend/decky_loader/plugin/worker.py',
+    'backend/decky_loader/plugin/launcher.py',
+    'backend/decky_loader/plugin/sandboxed_plugin.py',
+)
 
 
 def digest(path: Path) -> str:
@@ -45,8 +50,7 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
         raise ValueError(f'output already exists; use a new isolated path: {output}')
     subprocess.run(
         ['git', 'diff', '--quiet', BASELINE_TAG, '--', 'backend/decky_loader', 'frontend',
-         ':(exclude)backend/decky_loader/plugin/worker.py',
-         ':(exclude)backend/decky_loader/plugin/launcher.py'],
+         *(f':(exclude){path}' for path in SDK_OVERLAYS)],
         cwd=REPO, check=True,
     )
     commit, backend_tree, frontend_tree = subprocess.check_output(
@@ -101,6 +105,7 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
             'rust_executable': 'decky-loader-runtime',
             'runtime': runtime,
             'source_baseline': source_baseline,
+            'sdk_overlays': {path: digest(REPO / path) for path in SDK_OVERLAYS},
             'cargo_lock_sha256': digest(HERE / 'Cargo.lock'),
             'build': build_provenance,
             'sha256': {path.relative_to(bundle).as_posix(): digest(path) for path in sorted(bundle.rglob('*')) if path.is_file()},

@@ -1,5 +1,4 @@
 """Descriptor-anchored storage preparation regressions for the Python worker."""
-import argparse
 import importlib.util
 import os
 import stat
@@ -77,7 +76,7 @@ class PluginStorageTests(unittest.TestCase):
                              (before.st_uid, before.st_gid, stat.S_IMODE(before.st_mode)))
             self.assertFalse((outside / "example-plugin").exists())
 
-    def test_launch_rejects_preexisting_homebrew_symlink_ancestor(self):
+    def test_storage_rejects_symlink_ancestor_without_touching_external_inode(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             outside = base / "outside"
@@ -87,26 +86,14 @@ class PluginStorageTests(unittest.TestCase):
             before = homebrew_target.stat()
             configured_parent = base / "configured"
             configured_parent.symlink_to(outside, target_is_directory=True)
-            plugin_root = base / "plugins"
-            plugin_directory = plugin_root / "example-plugin"
-            args = argparse.Namespace(
-                plugin_root=str(plugin_root),
-                plugin_directory=str(plugin_directory),
-                socket=str(base / "missing" / "plugin.sock"),
-                homebrew=str(configured_parent / "homebrew"),
-                user="selected-user",
-                bootstrap="lean",
-            )
 
-            with mock.patch.object(worker, "_resolve_plugin_directory", return_value=(plugin_root, plugin_directory)), \
-                    mock.patch.object(worker, "_plugin_metadata",
-                                      return_value=("example", [], "main.py", None, "tester", 0)), \
-                    mock.patch.object(worker, "_selected_user", return_value=self.selected_user()), \
-                    mock.patch.object(worker, "_configure_environment"):
-                with self.assertRaises(worker.WorkerError):
-                    worker.launch(args)
+            with self.assertRaises(worker.WorkerError):
+                worker._prepare_plugin_storage(
+                    configured_parent / "homebrew", "example-plugin", self.selected_user()
+                )
 
             after = homebrew_target.stat()
+            self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino))
             self.assertEqual((after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode)),
                              (before.st_uid, before.st_gid, stat.S_IMODE(before.st_mode)))
             self.assertFalse(any((homebrew_target / name).exists() for name in ("settings", "data", "logs")))

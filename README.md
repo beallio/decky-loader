@@ -143,9 +143,11 @@ python3 backend-rust/build.py \
 
 Choose an output directory that does not already exist. The output includes `bundle/`, an installable ZIP, `SHA256SUMS`, and `build-result.json`. The bundle manifest records source hashes, tool versions, package versions, and the separate Rust release identity. These records support repeatable builds; they do not promise byte-for-byte identical binaries on different build hosts.
 
-The Python plugin support code and interface remain based on `v3.2.10`. Bundle assembly verifies that baseline and checks the packaged helper code against its source. The Rust release identity is separate; `dev` builds do not offer updates.
+The Python plugin support code and interface remain based on `v3.2.10`. Bundle assembly verifies that baseline, records the startup changes, and checks the packaged helper code against its source. The Rust release identity is separate; `dev` builds do not offer updates.
 
 Python plugins still run in separate processes. A shared Python parent loads common support code, then creates a child process for each active plugin. This can share memory without putting all plugins in one interpreter.
+
+Plugin startup keeps the selected plugin information and Python imports together if the installed folder is moved or replaced. Normal plugin file paths and settings locations stay the same. This check covers imports managed by the loader, not every file or helper program that a plugin opens itself. Plugins with administrator access must still be trusted.
 
 The [installer](backend-rust/install.py) supports new installs, replacement of an existing install, and rollback. A failed activation restores the previous backend and service file. User plugins, settings, and data remain in place. Use its `--help` before installing a private candidate.
 
