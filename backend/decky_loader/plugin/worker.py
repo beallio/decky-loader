@@ -25,7 +25,18 @@ import sysconfig
 import zipimport
 from pathlib import Path
 from types import CodeType, ModuleType
-from typing import Any, Callable, Coroutine, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Mapping, Sequence, cast
+
+if TYPE_CHECKING:
+    from _typeshed import ReadableBuffer
+    from typing import Protocol
+
+    class _FileFinderConstructor(Protocol):
+        # CPython calls loader factories; typeshed restricts these to classes.
+        def __call__(
+            self, path: str,
+            *loader_details: tuple[Callable[[str, str], Loader], Sequence[str]],
+        ) -> FileFinder: ...
 
 
 class WorkerError(RuntimeError):
@@ -42,25 +53,25 @@ _prepared_bootstraps: set[str] = set()
 class _AnchoredSourceFileLoader(SourceFileLoader):
     def __init__(self, bridge: _PluginImportBridge, fullname: str, path: str) -> None:
         self._bridge = bridge
-        super().__init__(fullname, bridge._public_path(path))
+        super().__init__(fullname, bridge.public_path(path))
 
     def get_data(self, path: str) -> bytes:
-        return super().get_data(self._bridge._anchored_path(path))
+        return super().get_data(self._bridge.anchored_path(path))
 
-    def path_stats(self, path: str) -> dict[str, float | int]:
-        return super().path_stats(self._bridge._anchored_path(path))
+    def path_stats(self, path: str) -> Mapping[str, float | int]:
+        return super().path_stats(self._bridge.anchored_path(path))
 
-    def set_data(self, path: str, data: bytes, *, _mode: int = 0o666) -> None:
-        super().set_data(self._bridge._anchored_path(path), data, _mode=_mode)
+    def set_data(self, path: str, data: ReadableBuffer, *, _mode: int = 0o666) -> None:
+        super().set_data(self._bridge.anchored_path(path), data, _mode=_mode)
 
 
 class _AnchoredBytecodeLoader(SourcelessFileLoader):
     def __init__(self, bridge: _PluginImportBridge, fullname: str, path: str) -> None:
         self._bridge = bridge
-        super().__init__(fullname, bridge._public_path(path))
+        super().__init__(fullname, bridge.public_path(path))
 
     def get_data(self, path: str) -> bytes:
-        return super().get_data(self._bridge._anchored_path(path))
+        return super().get_data(self._bridge.anchored_path(path))
 
 
 class _PublicOriginExtensionLoader(Loader):
@@ -106,7 +117,7 @@ class _PublicOriginZipLoader(Loader):
 
     def _public_code(self, code: CodeType) -> CodeType:
         try:
-            filename = self._bridge._public_path(code.co_filename)
+            filename = self._bridge.public_path(code.co_filename)
         except ImportError:
             filename = code.co_filename
         return code.replace(
@@ -117,21 +128,17 @@ class _PublicOriginZipLoader(Loader):
             ),
         )
 
-    def get_code(self, fullname: str) -> CodeType | None:
-        code = self._loader.get_code(fullname)
-        return None if code is None else self._public_code(code)
+    def get_code(self, fullname: str) -> CodeType:
+        return self._public_code(self._loader.get_code(fullname))
 
     def exec_module(self, module: ModuleType) -> None:
-        code = self.get_code(module.__name__)
-        if code is None:
-            raise ImportError(f"no code for ZIP module {module.__name__!r}")
-        exec(code, module.__dict__)
+        exec(self.get_code(module.__name__), module.__dict__)
 
     def get_filename(self, fullname: str) -> str:
-        return self._bridge._public_path(self._loader.get_filename(fullname))
+        return self._bridge.public_path(self._loader.get_filename(fullname))
 
     def get_data(self, path: str) -> bytes:
-        return self._loader.get_data(self._bridge._anchored_path(path))
+        return self._loader.get_data(self._bridge.anchored_path(path))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._loader, name)
@@ -143,7 +150,7 @@ class _AnchoredFileFinder:
         try:
             self._finder = zipimport.zipimporter(path)
         except zipimport.ZipImportError:
-            self._finder = FileFinder(
+            self._finder = cast("_FileFinderConstructor", FileFinder)(
                 path,
                 (ExtensionFileLoader, EXTENSION_SUFFIXES),
                 (self._source_loader, SOURCE_SUFFIXES),
@@ -166,17 +173,17 @@ class _AnchoredFileFinder:
             return None
         cached = spec.cached
         if spec.origin is not None:
-            public_origin = self._bridge._public_path(spec.origin)
+            public_origin = self._bridge.public_path(spec.origin)
             if isinstance(spec.loader, ExtensionFileLoader):
                 spec.loader = _PublicOriginExtensionLoader(spec.loader, public_origin)
             elif isinstance(spec.loader, zipimport.zipimporter):
                 spec.loader = _PublicOriginZipLoader(self._bridge, spec.loader)
             spec.origin = public_origin
         if cached is not None:
-            spec.cached = self._bridge._public_path(cached)
+            spec.cached = self._bridge.public_path(cached)
         if spec.submodule_search_locations is not None:
             spec.submodule_search_locations = [
-                self._bridge._public_path(location)
+                self._bridge.public_path(location)
                 for location in spec.submodule_search_locations
             ]
         return spec
@@ -198,11 +205,11 @@ class _PluginImportBridge:
         except ValueError as error:
             raise OSError(f"path is outside the approved plugin directory: {path}") from error
 
-    def _anchored_path(self, public_path: str) -> str:
+    def anchored_path(self, public_path: str) -> str:
         relative = self._relative_public_path(public_path)
         return os.path.join(self._anchored_directory, *relative.parts)
 
-    def _public_path(self, anchored_path: str) -> str:
+    def public_path(self, anchored_path: str) -> str:
         candidate = Path(os.path.abspath(anchored_path))
         try:
             relative = candidate.relative_to(Path(self._anchored_directory))
@@ -214,9 +221,9 @@ class _PluginImportBridge:
         relative = self._relative_public_path(public_path)
         if relative.parts != ("main.py",):
             raise WorkerError(f"loader-managed entrypoint is outside the approved plugin directory: {public_path}")
-        return _AnchoredSourceFileLoader(self, "_", self._anchored_path(public_path))
+        return _AnchoredSourceFileLoader(self, "_", self.anchored_path(public_path))
 
-    def __call__(self, path_entry: str) -> _AnchoredFileFinder:
+    def __call__(self, path_entry: object) -> _AnchoredFileFinder:
         if not isinstance(path_entry, str):
             raise ImportError("plugin import path must be a string")
         candidate = Path(os.path.abspath(path_entry))
@@ -229,8 +236,6 @@ class _PluginImportBridge:
 
     def _clear_importer_cache(self) -> None:
         for path_entry in tuple(sys.path_importer_cache):
-            if not isinstance(path_entry, str):
-                continue
             try:
                 Path(os.path.abspath(path_entry)).relative_to(self._public_directory)
             except ValueError:
@@ -370,13 +375,16 @@ def _required_arguments(parser: argparse.ArgumentParser, args: argparse.Namespac
 
 
 def _acquire_approved_launch(value: Any) -> tuple[int, dict[str, Any]]:
-    if not isinstance(value, dict) or set(value) != {"descriptor", "metadata"}:
+    launch = cast(dict[str, Any], value)
+    if not isinstance(value, dict) or set(launch) != {"descriptor", "metadata"}:
         raise WorkerError("--approved-launch must contain exactly descriptor and metadata objects")
-    descriptor = value["descriptor"]
-    metadata = value["metadata"]
-    if not isinstance(descriptor, dict) or set(descriptor) != {"pid", "fd", "device", "inode"}:
+    descriptor_value = launch["descriptor"]
+    metadata_value = launch["metadata"]
+    descriptor = cast(dict[str, Any], descriptor_value)
+    metadata = cast(dict[str, Any], metadata_value)
+    if not isinstance(descriptor_value, dict) or set(descriptor) != {"pid", "fd", "device", "inode"}:
         raise WorkerError("--approved-launch descriptor has an invalid shape")
-    if not isinstance(metadata, dict) or set(metadata) != {
+    if not isinstance(metadata_value, dict) or set(metadata) != {
         "name", "author", "flags", "api_version", "version"
     }:
         raise WorkerError("--approved-launch metadata has an invalid shape")
@@ -402,17 +410,17 @@ def _acquire_approved_launch(value: Any) -> tuple[int, dict[str, Any]]:
         raise WorkerError("--approved-launch metadata.name must be a non-empty string")
     if not isinstance(author, str):
         raise WorkerError("--approved-launch metadata.author must be a string")
-    if not isinstance(flags, list) or any(not isinstance(flag, str) for flag in flags):
+    if not isinstance(flags, list) or any(not isinstance(flag, str) for flag in cast(list[object], flags)):
         raise WorkerError("--approved-launch metadata.flags must be a list of strings")
     if type(api_version) is not int or api_version < 0:
         raise WorkerError("--approved-launch metadata.api_version must be a non-negative integer")
     if version is not None and not isinstance(version, str):
         raise WorkerError("--approved-launch metadata.version must be a string or null")
 
-    approved_metadata = {
+    approved_metadata: dict[str, Any] = {
         "name": name,
         "author": author,
-        "flags": list(flags),
+        "flags": list(cast(list[str], flags)),
         "api_version": api_version,
         "version": version,
     }

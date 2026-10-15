@@ -50,7 +50,13 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               for key in ('node', 'pnpm', 'rust'):
                   print(f'{key}={config[key]}', file=output)
+              print(f'sdk_tag={config["sdk"]["tag"]}', file=output)
           PY
+
+      - name: Fetch pinned SDK release baseline
+        env:
+          SDK_TAG: ${{ steps.config.outputs.sdk_tag }}
+        run: git fetch --no-tags https://github.com/SteamDeckHomebrew/decky-loader.git "refs/tags/$SDK_TAG:refs/tags/$SDK_TAG"
 
       - name: Set up pinned Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
