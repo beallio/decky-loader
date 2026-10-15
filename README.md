@@ -157,7 +157,7 @@ The [installer](backend-rust/install.py) supports new installs, replacement of a
 
 #### Install the private candidate over SSH
 
-Use [install-to-deck.sh](scripts/install-to-deck.sh) from a Linux workstation with Bash, SSH, and SCP. Enable SSH on the Deck and make sure you can use `sudo` there. The Deck uses its system Python; it does not need Rust, Poetry, pnpm, or pip packages.
+Use [install-to-deck.sh](scripts/install-to-deck.sh) from a Linux workstation with Bash, SSH, and SCP. Enable SSH on the Deck and make sure you can use `sudo` there. Installation uses the Deck's system Python. Plugins use the included Python runtime. The Deck does not need Rust, Poetry, pnpm, or pip packages.
 
 The script downloads the pinned `v3.2.10-rust.6-rc.1` bundle with the GitHub CLI and checks its SHA256. Sign in to `gh` on the workstation first. To use an already downloaded runtime ZIP instead, add `--bundle /path/to/decky-loader-runtime-linux-x86_64.zip`. Use the inner runtime ZIP, not the outer Actions download.
 
@@ -172,6 +172,8 @@ bash scripts/install-to-deck.sh --status
 
 `--check` verifies the bundle and basic target requirements without stopping the service or changing the installation. Installation briefly stops the selected service to make a full backup of homebrew and its service configuration, then restores its running state before the maintained installer takes over. Backups stay outside homebrew, in the sibling `decky-runtime-backups` directory by default. Use `--backup-dir` to choose another location with enough space.
 
+Space checks cover temporary files, the installed runtime, and the full backup. The check adds these requirements together when they share a storage volume. It checks separate volumes independently, including a separate volume mounted at `homebrew/services`. If space is too low, the script stops before it changes the service or creates a backup.
+
 To restore the previous backend and service configuration:
 
 ```sh
@@ -181,6 +183,8 @@ DECK_IP=steamdeck bash scripts/install-to-deck.sh --undo
 Rollback uses small recovery tools retained under `homebrew/services/.decky-deploy`; it does not need GitHub access. It does not restore the separate user-data archive automatically. Keep that recovery directory and your backups.
 
 Use `--help` for custom paths, service names, and candidate overrides. `DECK_USER` selects the SSH/plugin account, and `DECK_PORT` overrides the SSH port for both SSH and SCP. Interactive runs can ask for the Deck's sudo password; `--non-interactive` requires SSH keys and non-interactive sudo access. The script stays pinned while other runtime builds are investigated.
+
+After installation, open Decky in Gaming Mode. Open each plugin and use its main function. Check that settings persist after a plugin reload and after a reboot. Check suspend and resume. Keep the pinned candidate and backups until these checks pass on your Deck. If the interface or plugins fail, use `--undo` and check the previous installation again.
 
 
 The [dependency audit](backend-rust/audit.sh) must pass security, source, and dependency-use checks. The [VM validation tools](backend-rust/benchmark_vm.py) use owned clones rather than replacing the normal installation. Their results do not establish compatibility with every third-party plugin or replace physical Steam Deck testing.

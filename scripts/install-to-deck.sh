@@ -56,7 +56,9 @@ remote_cleanup() {
 remote_action() {
     local action=$1 homebrew=$2 user=$3 service=$4 backup_base=$5 expected=$6 version=$7
     local listen=$8 cef=$9 inject=${10}
-    local stage unit kit restart_needed=0 backup='' state fragment wd unpacked
+    local kit backup='' state fragment wd unpacked
+    # EXIT can run after function locals unwind, including on a failed preflight.
+    restart_needed=0
     stage=$(realpath -- "$(dirname -- "${BASH_SOURCE[0]}")")
     [[ $(basename -- "$stage") == decky-runtime-deploy.???????? ]] || fail 'Invalid remote staging directory'
     [[ $EUID == 0 ]] || fail 'The remote operation requires sudo'
@@ -129,19 +131,24 @@ with zipfile.ZipFile(archive) as z:
                 if digest(stream) != hashes[info.filename]:
                     raise SystemExit('Payload checksum mismatch: ' + info.filename)
     size = sum(i.file_size for i in infos)
-    parent = backup
-    while not parent.exists():
-        parent = parent.parent
     home_size = int(subprocess.check_output(['du', '-sb', '--', str(hb)], text=True).split()[0]) if hb.exists() else 0
-    stage_parent = Path(destination).parent
-    runtime_required = size * 3 + 256 * 1024 * 1024
-    backup_required = home_size + 64 * 1024 * 1024
-    if os.stat(parent).st_dev == os.stat(stage_parent).st_dev:
-        if shutil.disk_usage(parent).free < runtime_required + backup_required:
-            raise SystemExit('Not enough free space for the full backup and runtime installation')
-    elif (shutil.disk_usage(parent).free < backup_required
-          or shutil.disk_usage(stage_parent).free < runtime_required):
-        raise SystemExit('Not enough free space for the full backup or runtime installation')
+    # Extraction, installation/rollback copies, and the full snapshot can use
+    # different filesystems. Add every reservation on a shared device together.
+    requirements = {}
+    for path, required in (
+        (Path(destination).parent, size + 64 * 1024 * 1024),
+        (hb / 'services', size * 2 + 256 * 1024 * 1024),
+        (backup, home_size + 64 * 1024 * 1024),
+    ):
+        while not path.exists():
+            path = path.parent
+        device = path.stat().st_dev
+        previous = requirements.get(device, (path, 0))
+        requirements[device] = (previous[0], previous[1] + required)
+    for path, required in requirements.values():
+        available = shutil.disk_usage(path).free
+        if available < required:
+            raise SystemExit(f'Not enough free space on {path}: need {required} bytes, available {available} bytes')
     target = Path(destination)
     target.mkdir(mode=0o755)
     for info in infos:
