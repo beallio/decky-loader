@@ -5,16 +5,24 @@ use std::{
     os::fd::{AsFd, OwnedFd},
     os::unix::{
         ffi::OsStrExt,
-        fs::{MetadataExt, PermissionsExt},
+        fs::PermissionsExt,
         process::{CommandExt, ExitStatusExt},
     },
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
+};
+
+use nix::{
+    dir::Dir,
+    errno::Errno,
+    fcntl::{AtFlags, OFlag, open, openat},
+    sys::stat::{Mode, SFlag, fchmod, fstat, fstatat},
+    unistd::{self, Gid, Uid},
 };
 
 use anyhow::{Context, Result};
@@ -1350,90 +1358,421 @@ fn set_plugin_permissions_inner(
     if !enabled {
         return Ok(());
     }
-    let metadata = fs::symlink_metadata(directory).map_err(|error| {
+
+    let mut root = open_plugin_directory(directory).map_err(|error| {
         WorkerError::Error(format!(
-            "Could not inspect plugin directory {}: {error}",
+            "Could not securely open plugin directory {}: {error}",
             directory.display()
         ))
     })?;
-    if !metadata.is_dir() {
-        return Err(WorkerError::Error(format!(
-            "Plugin path is not a directory: {}",
-            directory.display()
-        )));
-    }
     let effective_user_ids = platform::effective_user_ids();
     let tree_user_ids = if requires_root {
         effective_user_ids
     } else {
         host_user_ids
     };
-    chown_tree(directory, tree_user_ids).map_err(|error| {
+    let locked_mode = if effective_user_ids.0 == 0 {
+        Mode::empty()
+    } else {
+        Mode::from_bits_truncate(0o700)
+    };
+
+    lock_directory(&root, effective_user_ids, locked_mode).map_err(|error| {
         WorkerError::Error(format!(
-            "Could not chown plugin directory {}: {error}",
+            "Could not secure plugin directory {}: {error}",
             directory.display()
         ))
     })?;
-    chown_path(directory, effective_user_ids).map_err(|error| {
+    update_directory_contents(
+        &mut root,
+        tree_user_ids,
+        effective_user_ids,
+        locked_mode,
+        true,
+    )
+    .map_err(|error| {
         WorkerError::Error(format!(
-            "Could not chown plugin directory {}: {error}",
+            "Could not update plugin directory permissions {}: {error}",
             directory.display()
         ))
     })?;
-    chmod_tree(directory).map_err(|error| {
+    fchmod(&root, Mode::from_bits_truncate(0o755)).map_err(|error| {
         WorkerError::Error(format!(
             "Could not chmod plugin directory {}: {error}",
             directory.display()
         ))
     })?;
-    let plugin_json = directory.join("plugin.json");
-    chown_path(&plugin_json, effective_user_ids).map_err(|error| {
-        WorkerError::Error(format!(
-            "Could not chown plugin metadata {}: {error}",
-            plugin_json.display()
-        ))
-    })?;
-    fs::set_permissions(&plugin_json, fs::Permissions::from_mode(0o755)).map_err(|error| {
-        WorkerError::Error(format!(
-            "Could not chmod plugin metadata {}: {error}",
-            plugin_json.display()
-        ))
-    })
+    Ok(())
 }
 
-fn chown_tree(path: &Path, owner: (u32, u32)) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
+fn open_plugin_directory(path: &Path) -> io::Result<Dir> {
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let mut current = if path.is_absolute() {
+        open("/", flags, Mode::empty())
+    } else {
+        open(".", flags, Mode::empty())
+    }
+    .map_err(io::Error::from)?;
+
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::ParentDir => OsStr::new(".."),
+            Component::Normal(name) => name,
+            Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "plugin path has an unsupported prefix",
+                ));
+            }
+        };
+        current = openat(&current, name, flags, Mode::empty()).map_err(io::Error::from)?;
+    }
+
+    Dir::from_fd(current).map_err(io::Error::from)
+}
+
+fn lock_directory(
+    directory: &Dir,
+    effective_user_ids: (u32, u32),
+    locked_mode: Mode,
+) -> io::Result<()> {
+    chown_descriptor(directory, effective_user_ids)?;
+    fchmod(directory, locked_mode).map_err(io::Error::from)
+}
+
+fn restore_directory_owner(directory: &Dir, owner: (u32, u32)) -> io::Result<()> {
+    chown_descriptor(directory, owner)?;
+    fchmod(directory, Mode::from_bits_truncate(0o755)).map_err(io::Error::from)
+}
+
+fn chown_descriptor(fd: &impl AsFd, owner: (u32, u32)) -> io::Result<()> {
+    let metadata = fstat(fd).map_err(io::Error::from)?;
+    if metadata.st_uid != owner.0 || metadata.st_gid != owner.1 {
+        unistd::fchown(
+            fd,
+            Some(Uid::from_raw(owner.0)),
+            Some(Gid::from_raw(owner.1)),
+        )
+        .map_err(io::Error::from)?;
+    }
+    Ok(())
+}
+
+fn set_file_permissions(fd: &OwnedFd, owner: (u32, u32)) -> io::Result<()> {
+    let metadata = fstat(fd).map_err(io::Error::from)?;
+    let owner_changes = metadata.st_uid != owner.0 || metadata.st_gid != owner.1;
+    let mode_changes = metadata.st_mode & 0o7777 != 0o755;
+    if metadata.st_nlink > 1 && (owner_changes || mode_changes) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refusing to change a multiply-linked plugin file",
+        ));
+    }
+    if owner_changes {
+        unistd::fchown(
+            fd,
+            Some(Uid::from_raw(owner.0)),
+            Some(Gid::from_raw(owner.1)),
+        )
+        .map_err(io::Error::from)?;
+    }
+    if mode_changes {
+        fchmod(fd, Mode::from_bits_truncate(0o755)).map_err(io::Error::from)?;
+    }
+    Ok(())
+}
+
+fn set_protected_file_permissions(fd: &OwnedFd, owner: (u32, u32)) -> io::Result<()> {
+    let metadata = fstat(fd).map_err(io::Error::from)?;
+    let owner_changes = metadata.st_uid != owner.0 || metadata.st_gid != owner.1;
+    let mode_changes = metadata.st_mode & 0o7777 != 0o755;
+    if metadata.st_nlink > 1 && (owner_changes || mode_changes) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refusing to change multiply-linked plugin metadata",
+        ));
+    }
+    if !owner_changes && !mode_changes {
         return Ok(());
     }
-    if metadata.is_dir() {
-        for entry in fs::read_dir(path)? {
-            chown_tree(&entry?.path(), owner)?;
+
+    fchmod(fd, Mode::empty()).map_err(io::Error::from)?;
+    if owner_changes {
+        unistd::fchown(
+            fd,
+            Some(Uid::from_raw(owner.0)),
+            Some(Gid::from_raw(owner.1)),
+        )
+        .map_err(io::Error::from)?;
+    }
+    fchmod(fd, Mode::from_bits_truncate(0o755)).map_err(io::Error::from)
+}
+
+fn update_directory_contents(
+    directory: &mut Dir,
+    tree_owner: (u32, u32),
+    effective_user_ids: (u32, u32),
+    locked_mode: Mode,
+    protect_metadata: bool,
+) -> io::Result<()> {
+    let parent_fd = unistd::dup(directory.as_fd()).map_err(io::Error::from)?;
+    for entry in directory.iter() {
+        let entry = entry.map_err(io::Error::from)?;
+        let name = entry.file_name();
+        let name_bytes = name.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        let is_plugin_metadata = protect_metadata && name_bytes == b"plugin.json";
+        let metadata =
+            fstatat(&parent_fd, name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+        let file_type = SFlag::from_bits_truncate(metadata.st_mode);
+
+        if file_type == SFlag::S_IFLNK {
+            if is_plugin_metadata {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "plugin metadata must not be a symbolic link",
+                ));
+            }
+            continue;
+        }
+
+        if file_type == SFlag::S_IFDIR {
+            let mut child = match Dir::openat(
+                &parent_fd,
+                name,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(child) => child,
+                Err(Errno::ELOOP | Errno::ENOENT) => continue,
+                Err(error) => return Err(io::Error::from(error)),
+            };
+            lock_directory(&child, effective_user_ids, locked_mode)?;
+            if is_plugin_metadata {
+                fchmod(&child, Mode::from_bits_truncate(0o755)).map_err(io::Error::from)?;
+            } else {
+                update_directory_contents(
+                    &mut child,
+                    tree_owner,
+                    effective_user_ids,
+                    locked_mode,
+                    false,
+                )?;
+                restore_directory_owner(&child, tree_owner)?;
+            }
+            continue;
+        }
+
+        if file_type != SFlag::S_IFREG && file_type != SFlag::S_IFIFO {
+            continue;
+        }
+        let fd = match openat(
+            &parent_fd,
+            name,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::ELOOP | Errno::ENOENT) => continue,
+            Err(error) => return Err(io::Error::from(error)),
+        };
+        let opened_metadata = fstat(&fd).map_err(io::Error::from)?;
+        let opened_type = SFlag::from_bits_truncate(opened_metadata.st_mode);
+        if opened_type == SFlag::S_IFDIR {
+            let mut child = Dir::from_fd(fd).map_err(io::Error::from)?;
+            lock_directory(&child, effective_user_ids, locked_mode)?;
+            if is_plugin_metadata {
+                fchmod(&child, Mode::from_bits_truncate(0o755)).map_err(io::Error::from)?;
+            } else {
+                update_directory_contents(
+                    &mut child,
+                    tree_owner,
+                    effective_user_ids,
+                    locked_mode,
+                    false,
+                )?;
+                restore_directory_owner(&child, tree_owner)?;
+            }
+        } else if opened_type == SFlag::S_IFREG || opened_type == SFlag::S_IFIFO {
+            if is_plugin_metadata {
+                set_protected_file_permissions(&fd, effective_user_ids)?;
+            } else {
+                set_file_permissions(&fd, tree_owner)?;
+            }
         }
     }
-    chown_path(path, owner)
+    Ok(())
 }
 
-fn chown_path(path: &Path, owner: (u32, u32)) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || (metadata.uid() == owner.0 && metadata.gid() == owner.1)
-    {
-        return Ok(());
-    }
-    platform::chown_link(path, owner)
-}
+#[cfg(test)]
+mod plugin_permission_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
-fn chmod_tree(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-    if metadata.is_dir() {
-        for entry in fs::read_dir(path)? {
-            chmod_tree(&entry?.path())?;
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("decky-permissions-{}", Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
         }
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn host_user_ids(effective: (u32, u32)) -> (u32, u32) {
+        if effective.0 == 0 {
+            (65_534, 65_534)
+        } else {
+            effective
+        }
+    }
+
+    #[test]
+    fn metadata_stays_protected_while_standard_and_root_plugin_permissions_are_preserved() {
+        let temporary = TestDirectory::new();
+        let root = fs::canonicalize(&temporary.0).unwrap();
+        let plugin = root.join("plugin");
+        let nested = plugin.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            br#"{"name":"Example","flags":[]}"#,
+        )
+        .unwrap();
+        fs::write(plugin.join("main.py"), b"pass\n").unwrap();
+        fs::write(nested.join("code.py"), b"pass\n").unwrap();
+        set_mode(&plugin, 0o777);
+        set_mode(&plugin.join("plugin.json"), 0o600);
+        set_mode(&plugin.join("main.py"), 0o600);
+        set_mode(&nested, 0o777);
+        set_mode(&nested.join("code.py"), 0o600);
+
+        let outside = root.join("outside.py");
+        fs::write(&outside, b"outside\n").unwrap();
+        set_mode(&outside, 0o640);
+        symlink(&outside, nested.join("linked.py")).unwrap();
+
+        let outside_directory = root.join("outside-directory");
+        fs::create_dir(&outside_directory).unwrap();
+        let outside_directory_file = outside_directory.join("victim.py");
+        fs::write(&outside_directory_file, b"outside directory\n").unwrap();
+        set_mode(&outside_directory_file, 0o640);
+        symlink(&outside_directory, nested.join("linked-directory")).unwrap();
+        let socket_path = nested.join("worker.sock");
+        let _socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let effective = platform::effective_user_ids();
+        let host = host_user_ids(effective);
+        set_plugin_permissions_inner(&plugin, false, host, true).unwrap();
+        std::os::unix::net::UnixStream::connect(&socket_path).unwrap();
+
+        let plugin_metadata = fs::metadata(&plugin).unwrap();
+        assert_eq!((plugin_metadata.uid(), plugin_metadata.gid()), effective);
+        assert_eq!(plugin_metadata.mode() & 0o7777, 0o755);
+        let metadata_file = fs::metadata(plugin.join("plugin.json")).unwrap();
+        assert_eq!((metadata_file.uid(), metadata_file.gid()), effective);
+        assert_eq!(metadata_file.mode() & 0o7777, 0o755);
+        let standard_file = fs::metadata(plugin.join("main.py")).unwrap();
+        assert_eq!((standard_file.uid(), standard_file.gid()), host);
+        assert_eq!(standard_file.mode() & 0o7777, 0o755);
+        let outside_metadata = fs::metadata(&outside).unwrap();
+        assert_eq!((outside_metadata.uid(), outside_metadata.gid()), effective);
+        assert_eq!(outside_metadata.mode() & 0o7777, 0o640);
+
+        assert_eq!(
+            fs::metadata(&outside_directory_file).unwrap().mode() & 0o7777,
+            0o640
+        );
+        set_plugin_permissions_inner(&plugin, true, host, true).unwrap();
+        let root_plugin_file = fs::metadata(plugin.join("main.py")).unwrap();
+        assert_eq!((root_plugin_file.uid(), root_plugin_file.gid()), effective);
+        assert_eq!(root_plugin_file.mode() & 0o7777, 0o755);
+
+        set_plugin_permissions_inner(&root.join("missing"), false, host, false).unwrap();
+    }
+
+    #[test]
+    fn ancestor_symlinks_and_external_hardlinks_are_not_changed() {
+        let temporary = TestDirectory::new();
+        let root = fs::canonicalize(&temporary.0).unwrap();
+        let outside_tree = root.join("outside-tree");
+        let outside_plugin = outside_tree.join("plugin");
+        fs::create_dir_all(&outside_plugin).unwrap();
+        fs::write(outside_plugin.join("plugin.json"), b"{}\n").unwrap();
+        fs::write(outside_plugin.join("main.py"), b"pass\n").unwrap();
+        set_mode(&outside_plugin, 0o700);
+        set_mode(&outside_plugin.join("plugin.json"), 0o600);
+        set_mode(&outside_plugin.join("main.py"), 0o600);
+
+        let ancestor_link = root.join("plugin-root-link");
+        symlink(&outside_tree, &ancestor_link).unwrap();
+        let effective = platform::effective_user_ids();
+        assert!(
+            set_plugin_permissions_inner(&ancestor_link.join("plugin"), false, effective, true,)
+                .is_err()
+        );
+        assert_eq!(
+            fs::metadata(&outside_plugin).unwrap().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(outside_plugin.join("plugin.json"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(outside_plugin.join("main.py")).unwrap().mode() & 0o7777,
+            0o600
+        );
+
+        let plugin = root.join("hardlink-plugin");
+        fs::create_dir(&plugin).unwrap();
+        fs::write(plugin.join("plugin.json"), b"{}\n").unwrap();
+        let outside_file = root.join("outside-hardlink.py");
+        fs::write(&outside_file, b"outside\n").unwrap();
+        set_mode(&outside_file, 0o600);
+        fs::hard_link(&outside_file, plugin.join("linked.py")).unwrap();
+        assert!(set_plugin_permissions_inner(&plugin, false, effective, true).is_err());
+        let outside_metadata = fs::metadata(&outside_file).unwrap();
+        assert_eq!((outside_metadata.uid(), outside_metadata.gid()), effective);
+        assert_eq!(outside_metadata.mode() & 0o7777, 0o600);
+    }
+
+    #[test]
+    fn protected_metadata_cannot_reference_a_mutable_outside_file() {
+        let temporary = TestDirectory::new();
+        let root = fs::canonicalize(&temporary.0).unwrap();
+        let plugin = root.join("plugin");
+        fs::create_dir(&plugin).unwrap();
+        let outside = root.join("outside.json");
+        fs::write(&outside, br#"{"name":"Example","flags":[]}"#).unwrap();
+        set_mode(&outside, 0o640);
+        symlink(&outside, plugin.join("plugin.json")).unwrap();
+        let before = fs::metadata(&outside).unwrap();
+        assert!(
+            set_plugin_permissions_inner(&plugin, false, platform::effective_user_ids(), true)
+                .is_err()
+        );
+        let after = fs::metadata(&outside).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode()),
+            (before.uid(), before.gid(), before.mode())
+        );
+    }
 }
 
 fn read_json(path: &Path) -> io::Result<Value> {

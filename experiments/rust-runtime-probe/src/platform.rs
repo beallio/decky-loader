@@ -7,12 +7,11 @@ use std::{
 use nix::{
     NixPath,
     errno::Errno,
-    fcntl::{AT_FDCWD, AtFlags},
     sys::{
         inotify::{InitFlags, Inotify},
         signal::{self, Signal},
     },
-    unistd::{self, Gid, Pid, Uid},
+    unistd::{self, Pid},
 };
 
 /// Return the effective UID and GID without allocating or changing process state.
@@ -84,18 +83,6 @@ pub(crate) fn signal_group(pid: u32, signal_number: i32) -> io::Result<()> {
     } else {
         Ok(())
     }
-}
-
-/// Change the link itself (not its target) to the requested owner and group.
-pub(crate) fn chown_link(path: &Path, owner: (u32, u32)) -> io::Result<()> {
-    unistd::fchownat(
-        AT_FDCWD,
-        path,
-        Some(Uid::from_raw(owner.0)),
-        Some(Gid::from_raw(owner.1)),
-        AtFlags::AT_SYMLINK_NOFOLLOW,
-    )
-    .map_err(io::Error::from)
 }
 
 /// Create a nonblocking, close-on-exec inotify descriptor without duplicating it.
