@@ -149,6 +149,8 @@ Python plugins still run in separate processes. A shared Python parent loads com
 
 Plugin startup keeps the selected plugin information and Python imports together if the installed folder is moved or replaced. Normal plugin file paths and settings locations stay the same. This check covers imports managed by the loader, not every file or helper program that a plugin opens itself. Plugins with administrator access must still be trusted.
 
+The selected-file binding stays available until the worker process exits, including shutdown callbacks and failed startup.
+
 The [installer](backend-rust/install.py) supports new installs, replacement of an existing install, and rollback. A failed activation restores the previous backend and service file. User plugins, settings, and data remain in place. Use its `--help` before installing a private candidate.
 
 The [dependency audit](backend-rust/audit.sh) must pass security, source, and dependency-use checks. The [VM validation tools](backend-rust/benchmark_vm.py) use owned clones rather than replacing the normal installation. Their results do not establish compatibility with every third-party plugin or replace physical Steam Deck testing.

@@ -633,7 +633,7 @@ def _append_system_pythonpaths(get_system_pythonpaths: Any) -> None:
 
 def launch(args: argparse.Namespace) -> None:
     directory_fd, metadata = _acquire_approved_launch(getattr(args, "approved_launch", None))
-    bridge: _PluginImportBridge | None = None
+    process_owned = False
     try:
         root, plugin_directory = _public_plugin_paths(args.plugin_root, args.plugin_directory)
         name = cast(str, metadata["name"])
@@ -697,6 +697,9 @@ def launch(args: argparse.Namespace) -> None:
         tracked_socket.socket_addr = str(socket_path)
         bridge = _PluginImportBridge(directory_fd, plugin_directory)
         bridge.install()
+        # sys.path_hooks retains the bridge. Keep its descriptor process-owned
+        # through failed imports and interpreter exit callbacks, not just the loop.
+        process_owned = True
         plugin = SandboxedPlugin(
             name,
             False,
@@ -723,10 +726,7 @@ def launch(args: argparse.Namespace) -> None:
         if not tracked_socket.server_ready:
             raise WorkerError(f"plugin {name!r} exited before its IPC listener became ready")
     finally:
-        try:
-            if bridge is not None:
-                bridge.close()
-        finally:
+        if not process_owned:
             os.close(directory_fd)
 
 

@@ -9,6 +9,7 @@ import logging
 import os
 import py_compile
 import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -259,6 +260,16 @@ class WorkerPinnedImportTests(unittest.TestCase):
                 os.close(directory_fd)
 
     def test_launch_uses_approved_object_code_and_flags_after_public_replacement(self):
+        # launch() owns its binding until process exit, as it does in a worker.
+        test_name = f"{type(self).__name__}.{self._testMethodName}"
+        if os.environ.get("DECKY_IMPORT_TEST_PROCESS") != test_name:
+            child = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), test_name],
+                env=dict(os.environ, DECKY_IMPORT_TEST_PROCESS=test_name),
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+            return
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             plugin_root = base / "plugins"
@@ -393,7 +404,6 @@ class WorkerPinnedImportTests(unittest.TestCase):
 
                     sandbox_module.SandboxedPlugin = ObservedSandboxedPlugin
                     worker.launch(args)
-                    cache_was_cleared = public_cache_key not in sys.path_importer_cache
                 self.assertEqual(len(instances), 1)
                 plugin = instances[0]
                 self.assertEqual((plugin.name, plugin.passive, plugin.flags), ("approved-plugin", False, []))
@@ -417,7 +427,6 @@ class WorkerPinnedImportTests(unittest.TestCase):
                 self.assertTrue(plugin.public_py_modules.startswith(str(plugin_root)))
                 self.assertEqual(plugin.plugin_path_value, str(plugin_root))
                 self.assertEqual(plugin.plugin_dir_value, str(public_directory))
-                self.assertTrue(cache_was_cleared)
             finally:
                 os.close(directory_fd)
 
