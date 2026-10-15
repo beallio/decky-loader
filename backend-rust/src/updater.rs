@@ -26,8 +26,8 @@ use crate::backend::{Backend, RpcError, exact, string};
 const INITIAL_CHECK_DELAY: Duration = Duration::from_secs(30);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const FALLBACK_DOWNLOAD_SIZE: u64 = 25 * 1024 * 1024;
-const RUST_BUNDLE_ASSET: &str = "decky-rust-runtime-linux-x86_64.zip";
-const RUST_TESTING_ARTIFACT: &str = "decky-rust-runtime-linux-x86_64";
+const RUST_BUNDLE_ASSET: &str = "decky-loader-runtime-linux-x86_64.zip";
+const RUST_TESTING_ARTIFACT: &str = "decky-loader-runtime-linux-x86_64";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 
 #[derive(Default)]
@@ -295,7 +295,9 @@ impl Updater {
             })?;
         let run_id = workflows
             .iter()
-            .find(|workflow| workflow.get("name").and_then(Value::as_str) == Some("Builder"))
+            .find(|workflow| {
+                workflow.get("name").and_then(Value::as_str) == Some("Runtime Builder")
+            })
             .and_then(|workflow| workflow.get("id"))
             .and_then(Value::as_u64)
             .ok_or_else(|| RpcError::failure("Workflow run not found."))?;
@@ -885,7 +887,7 @@ mod tests {
         json!({
             "name": RUST_BUNDLE_ASSET,
             "size": 512,
-            "browser_download_url": "https://github.com/beallio/decky-loader/releases/download/v1.0.0/decky-rust-runtime-linux-x86_64.zip"
+            "browser_download_url": "https://github.com/beallio/decky-loader/releases/download/v1.0.0/decky-loader-runtime-linux-x86_64.zip"
         })
     }
 

@@ -1,21 +1,12 @@
 #!/usr/bin/env python3
-"""Prepare an isolated private-test bundle, not a distributable Decky release.
+"""Assemble a complete private Decky runtime candidate from built components.
 
-The SDK and frontend use v3.2.10. Use a CPython 3.11
-environment with the backend dependencies and PyInstaller 6.22.3 installed.
-Install the backend with POETRY_DYNAMIC_VERSIONING_BYPASS=3.2.10 so that its
-package metadata reports the verified SDK baseline, not the probe branch's
-development commit count.
-
-From the repository root, build the default one-file worker with:
-    python -m PyInstaller --distpath /var/tmp/worker-dist --workpath /var/tmp/worker-build backend/worker.spec
-For an onedir worker, set DECKY_WORKER_ONEDIR=1 on the same command:
-    DECKY_WORKER_ONEDIR=1 python -m PyInstaller --distpath /var/tmp/worker-dist --workpath /var/tmp/worker-build backend/worker.spec
-Both builds produce DeckyPluginWorker under the supplied dist path; the onedir build also produces its
-sibling _internal directory. Then supply the worker executable, Rust executable
-and frontend assets/locales to this command. It records the release commit,
-SDK/frontend Git tree hashes, runtime description, packaging variant, and file
-checksums, including every onedir runtime file.
+Use build.py for the pinned, end-to-end build. This lower-level command accepts
+prebuilt components and verifies their Python SDK/frontend source baseline,
+packaged helper code, runtime description and complete payload checksums.
+Both one-file and shared-directory workers are supported; the automated build
+uses the shared-directory worker with separate forked Python plugin processes.
+Distribution approval remains disabled until the deferred hardware/UI checks.
 """
 from __future__ import annotations
 
@@ -28,8 +19,9 @@ import subprocess
 import tempfile
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[1]
-BASELINE_TAG = 'v3.2.10'
+REPO = HERE.parent
+BUILD_CONFIG = json.loads((HERE / 'build-config.json').read_text())
+BASELINE_TAG = BUILD_CONFIG['sdk']['tag']
 
 
 def digest(path: Path) -> str:
@@ -40,7 +32,8 @@ def digest(path: Path) -> str:
     return result.hexdigest()
 
 
-def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path, release_version: str) -> dict:
+def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path, release_version: str,
+            *, build_provenance: dict | None = None) -> dict:
     if not release_version or any(ord(character) < 32 or ord(character) == 127 for character in release_version):
         raise ValueError('release version must be a non-empty printable identifier')
     for executable in (worker, rust):
@@ -65,6 +58,8 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
         'tag': BASELINE_TAG, 'commit': commit,
         'backend_tree': backend_tree, 'frontend_tree': frontend_tree,
     }
+    if source_baseline != BUILD_CONFIG['sdk']:
+        raise ValueError('SDK/frontend tag identities differ from the pinned source baseline')
     helper_path = REPO / 'backend/decky_loader/helpers.py'
     helper_sha256 = digest(helper_path)
     onedir_runtime = worker.parent / '_internal'
@@ -72,8 +67,8 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
     if worker_packaging == 'onedir' and not any(onedir_runtime.rglob('*')):
         raise ValueError(f'worker onedir runtime directory is empty: {onedir_runtime}')
     runtime = json.loads(subprocess.check_output([str(worker), '--describe'], text=True, timeout=20))
-    if not runtime['frozen'] or not runtime['python'].startswith('3.11.'):
-        raise ValueError('the private probe requires a frozen CPython 3.11 worker')
+    if not runtime['frozen'] or runtime['python'] != BUILD_CONFIG['python']['version']:
+        raise ValueError('the runtime requires the pinned frozen CPython version')
     if runtime['decky_version'] != BASELINE_TAG:
         raise ValueError(f'worker version {runtime["decky_version"]} does not match {BASELINE_TAG}; rebuild its package metadata')
     helper = runtime.get('sdk_sources', {}).get('decky_loader.helpers', {})
@@ -92,21 +87,22 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
             (bundle / '_internal').chmod(0o755)
             for path in (bundle / '_internal').rglob('*'):
                 path.chmod(0o755)
-        shutil.copy2(rust, bundle / 'decky-rust-runtime-probe')
+        shutil.copy2(rust, bundle / 'decky-loader-runtime')
         shutil.copy2(HERE / 'install.py', bundle / 'install.py')
         shutil.copy2(HERE / 'process_observer.py', bundle / 'process_observer.py')
         shutil.copytree(assets, bundle / 'assets')
         shutil.copytree(locales, bundle / 'locales')
         manifest = {
-            'kind': 'decky-rust-runtime-probe',
+            'kind': 'decky-loader-runtime',
             'release_version': release_version,
             'private_only': True,
             'distribution_approved': False,
             'worker_packaging': worker_packaging,
-            'rust_executable': 'decky-rust-runtime-probe',
+            'rust_executable': 'decky-loader-runtime',
             'runtime': runtime,
             'source_baseline': source_baseline,
             'cargo_lock_sha256': digest(HERE / 'Cargo.lock'),
+            'build': build_provenance,
             'sha256': {path.relative_to(bundle).as_posix(): digest(path) for path in sorted(bundle.rglob('*')) if path.is_file()},
         }
         (bundle / 'bundle.json').write_text(json.dumps(manifest, indent=2) + '\n')

@@ -106,7 +106,7 @@ There is no complete plugin development documentation yet. However a good starti
 
 Please consult [the wiki page regarding development](https://wiki.deckbrew.xyz/en/loader-dev/development) for more information on installing development versions of Decky Loader. You can also install the Steam Deck UI on a Windows or Linux computer for testing by following [this YouTube guide](https://youtu.be/1IAbZte8e7E?t=112).
 
-For Rust work in OMP, install `rust-analyzer` and the standard-library source for the pinned Rust 1.98.1 toolchain. The project configuration in `.omp/lsp.json` selects the runtime in `experiments/rust-runtime-probe` when OMP starts at the repository root. Reload the LSP configuration after installation. Code navigation and native diagnostics are enabled; save-triggered Cargo checks are disabled, so run the normal build and checks before submitting changes.
+For Rust work in OMP, install `rust-analyzer` and the standard-library source for the pinned Rust 1.98.1 toolchain. The project configuration in `.omp/lsp.json` selects `backend-rust` when OMP starts at the repository root. Reload the LSP configuration after installation. Save-triggered Cargo checks are disabled; run the build and checks before submitting changes.
 
 1. Clone the repository using the latest commit to main before starting your PR.
 1. In your clone of the repository, run these commands.
@@ -127,37 +127,29 @@ pnpm update @decky/ui --latest
 
 Source control and deploying plugins are left to each respective contributor for the cloned repos in order to keep dependencies up to date.
 
-The private Rust test build keeps Python plugins and the existing Decky interface. It includes plugin management, loader updates, and an installer for fresh installs, replacement of an existing install, and rollback. It is not a public release. Physical Steam Deck testing is deferred. See the [bundle setup](experiments/rust-runtime-probe/prepare_bundle.py), [test installer](experiments/rust-runtime-probe/install.py), and [dependency audit](experiments/rust-runtime-probe/audit.sh). Setup and the installer provide `--help`.
+### Private Rust runtime
 
-The test bundle uses the `v3.2.10` baseline. Setup checks the Python plugin support code and frontend against that version. The packaged Python worker must report the same version. Setup also rejects a worker whose packaged helper source does not match its running code.
+The [Rust backend](backend-rust) keeps Python plugins and the existing Decky interface. It is a private candidate, not the default public release. Physical Steam Deck and full Steam interface checks remain deferred. Building it does not change an installed copy of Decky Loader.
 
-Rust updates use a separate release channel and require a complete Rust bundle. Python-only releases and test builds are excluded. The installer keeps the selected address, port, and update channel when a Rust update replaces the backend and service file. These settings take precedence over conflicting service environment values. Other environment settings and user files stay in place, including settings stored together on one service configuration line. A failed activation restores the previous backend and service file. For a running installation, rollback waits for the restored backend to own its listener and answer authenticated requests. Explicit rollback can restore the original Python installation, including its effective loopback address and port.
+The `Runtime Builder` workflow checks dependencies and builds a complete Linux x86-64 bundle. The bundle contains the Rust backend, Python launcher and workers, Python plugin support code, interface files, installer, and file checksums. The existing public Python release workflow is unchanged; the runtime workflow does not publish a release.
 
-The Rust release version is separate from the Python compatibility baseline. Bundle setup records it with `--release-version`; the installer uses that value unless `--version` selects another release identity. Updates and rollback preserve the selected identity, so the existing interface can recognise an installed update. Direct development runs without `--release-version` report `dev` and do not offer updates. The packaged Python SDK still reports `v3.2.10`.
+To build locally, install the GitHub CLI and the Rust, Node.js, and pnpm versions listed in [build-config.json](backend-rust/build-config.json). The build downloads a checksum-verified CPython archive and installs Python dependencies in temporary environments. It uses the committed Cargo, Poetry, and pnpm lockfiles.
 
-Worker builds can use one executable or a shared runtime folder. Set `DECKY_WORKER_ONEDIR=1` when building `backend/worker.spec` for the shared-folder build. Keep the worker executable and its `_internal` folder together; bundle setup checks both.
+```sh
+python3 backend-rust/build.py \
+  --release-version dev \
+  --output "${TMPDIR:-/var/tmp/omp-1000}/decky-runtime"
+```
 
-The Rust runtime and installer default to forked Python workers (`fork`). A dedicated Python parent starts when the first active, enabled plugin loads. It loads the common SDK once, then creates a separate child process for each plugin. Plugin code runs in the children, not in one shared interpreter. Empty, passive-only, and disabled-only startup does not keep a Python launcher running. Use `--worker-mode exec` to start Python independently for each plugin instead.
+Choose an output directory that does not already exist. The output includes `bundle/`, an installable ZIP, `SHA256SUMS`, and `build-result.json`. The bundle manifest records source hashes, tool versions, package versions, and the separate Rust release identity. These records support repeatable builds; they do not promise byte-for-byte identical binaries on different build hosts.
 
-Concurrent plugin loads share one fork parent. Once started, that parent stays until backend shutdown, even after the last plugin is disabled, to avoid repeated startup and teardown. If it fails or its failure-monitor channel closes, the backend exits so the service can restart it and its plugins. Both modes clean up their owned worker process groups on failure and shutdown.
+The Python plugin support code and interface remain based on `v3.2.10`. Bundle assembly verifies that baseline and checks the packaged helper code against its source. The Rust release identity is separate; `dev` builds do not offer updates.
 
-`exec` workers start Python independently and can use more memory than forked workers. Forked workers can share Python state that the parent loaded before startup. Rust does not remove the Python runtime from Python plugins.
+Python plugins still run in separate processes. A shared Python parent loads common support code, then creates a child process for each active plugin. This can share memory without putting all plugins in one interpreter.
 
-The VM checks cover the installed plugins and the public plugin APIs, not every third-party plugin. Plugins with unusual Python libraries, process-name checks, or direct access to private loader internals need separate checks. Shared-launcher mode also needs checks for native-library fork safety.
+The [installer](backend-rust/install.py) supports new installs, replacement of an existing install, and rollback. A failed activation restores the previous backend and service file. User plugins, settings, and data remain in place. Use its `--help` before installing a private candidate.
 
-The [SteamOS VM benchmark driver](experiments/rust-runtime-probe/benchmark_vm.py) compares the installed Python backend with three Rust modes: full SDK startup with separate workers, lean startup with separate workers, and lean startup with a shared fork launcher. All Rust modes use the same shared-directory worker build, supplied with `--worker`. It requires root access on a private VM with Decky Metadata, CSS Loader, SDH-Ludusavi, and HLTB for Deck installed. Use `--help` for the required executable and output paths. It runs at least ten trials per mode in rotating order, using cloned plugin and settings files and private network namespaces. Measurements include every process in the owned service group, with PSS (shared-memory-adjusted use), private dirty memory, CPU use, startup, RPC latency, and shutdown. It leaves the normal service running and records raw trials, failures, and summary statistics. These are backend measurements, not full-product performance or production-parity results.
-
-Use `--profile plugin-count-scaling` to compare the installed Python backend with the forked Rust build at 0, 4, 8, and 12 plugins. The four installed plugins stay unchanged; the higher counts add small, deterministic test plugins. The driver runs at least ten matched pairs per count, checks every expected plugin, and measures backend ping, a common installed-plugin call, and test-plugin work where available. Its results include paired confidence intervals and memory added per plugin. The test plugins show worker overhead, not the memory cost of additional full-featured plugins.
-
-The corrected on-demand build passed the full VM performance gate across all tested plugin counts. Paired confidence intervals support lower PSS and private dirty memory, with no increase in idle CPU or measured service CPU per call. Backend startup is also faster in the measured cases. This supports continued private release-candidate validation, not public rollout: VM backend checks do not replace physical Steam Deck or full-interface validation.
-
-Shutdown checks track process identities and state, including exited processes that have not yet been collected. A clean result describes the observed processes; it does not prove that no short-lived process existed between samples.
-
-Installer stop checks accept an inactive or failed service only after its main process and all tracked service processes have exited and been collected. An application exit code of 1 does not, by itself, mean that a process remains alive. Network test clients use only the target network namespace; changing the mount namespace can hide the service process group and invalidate these checks.
-
-The dependency audit must pass its security, dependency-source, and dependency-use checks. License findings are reported for information only and do not block this private experiment.
-
-The Rust test build keeps its remaining unsafe Linux calls in the platform helpers and the child process setup hook. Each boundary documents its safety requirements. User IDs, ordinary signals, reads, ownership changes, and inotify descriptor creation use safe library interfaces; event decoding uses checked byte slices rather than raw pointer reads. Clippy rejects undocumented unsafe blocks. This does not mean that the whole dependency graph is free of unsafe code or that runtime tests prove every safety requirement.
+The [dependency audit](backend-rust/audit.sh) must pass security, source, and dependency-use checks. The [VM validation tools](backend-rust/benchmark_vm.py) use owned clones rather than replacing the normal installation. Their results do not establish compatibility with every third-party plugin or replace physical Steam Deck testing.
 
 ## 📜 Credits
 

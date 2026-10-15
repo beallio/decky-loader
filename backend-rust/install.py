@@ -35,7 +35,7 @@ sys.dont_write_bytecode = True
 from process_observer import cgroup_processes
 
 
-KIND = 'decky-rust-runtime-probe'
+KIND = 'decky-loader-runtime'
 BASELINE_TAG = 'v3.2.10'
 UNIT_DIRECTORY = Path('/etc/systemd/system')
 SYSTEMCTL_CANDIDATES = (Path('/usr/bin/systemctl'), Path('/bin/systemctl'))
@@ -44,7 +44,7 @@ DEFAULT_CEF_URL = 'http://127.0.0.1:8080'
 DEFAULT_GITHUB_API = 'https://api.github.com'
 DEFAULT_RELEASE_REPOSITORY = 'beallio/decky-loader'
 DEFAULT_TESTING_DOWNLOAD_URL = 'https://nightly.link'
-RUST_EXECUTABLE = 'decky-rust-runtime-probe'
+RUST_EXECUTABLE = 'decky-loader-runtime'
 WORKER_EXECUTABLE = 'DeckyPluginWorker'
 MAX_HTTP_HEADERS = 65536
 MAX_WEBSOCKET_FRAME = 1024 * 1024

@@ -1,14 +1,7 @@
 name: Rust Dependency Audit
 
 on:
-  push:
-    paths:
-      - "experiments/rust-runtime-probe/**"
-      - ".github/workflows/rust-runtime-probe-dependencies.yml"
-  pull_request:
-    paths:
-      - "experiments/rust-runtime-probe/**"
-      - ".github/workflows/rust-runtime-probe-dependencies.yml"
+  workflow_call:
   schedule:
     - cron: "0 10 * * *"
   workflow_dispatch:
@@ -39,5 +32,5 @@ jobs:
         run: gh repo clone RustSec/advisory-db "$RUSTSEC_ADVISORY_DB" -- --depth 1
 
       - name: Check the complete locked dependency graph
-        working-directory: experiments/rust-runtime-probe
+        working-directory: backend-rust
         run: ./audit.sh

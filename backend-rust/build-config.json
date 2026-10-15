@@ -1,0 +1,21 @@
+{
+  "python": {
+    "version": "3.11.17",
+    "repository": "astral-sh/python-build-standalone",
+    "release": "20261013",
+    "asset": "cpython-3.11.17+20261013-x86_64-unknown-linux-gnu-install_only.tar.gz",
+    "sha256": "846bf682e2b67393f2affa5e5c0994e446abc3a7cc5bb699890c36346823644c"
+  },
+  "rust": "1.98.1",
+  "node": "24.18.0",
+  "pnpm": "10.33.0",
+  "poetry": "2.2.1",
+  "poetry_dynamic_versioning": "1.9.1",
+  "pyinstaller": "6.22.3",
+  "sdk": {
+    "tag": "v3.2.10",
+    "commit": "75563316f9119ee7e36be7f43885be65e877fad0",
+    "backend_tree": "b91f27b0b096009247cf1735cf304beb9f48bf5d",
+    "frontend_tree": "a40fc99b5ffca4a1e52b3f1ba705bf4d98345fe2"
+  }
+}

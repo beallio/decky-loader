@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 
-WORKER_PATH = Path(__file__).parents[2] / "backend" / "decky_loader" / "plugin" / "worker.py"
+WORKER_PATH = Path(__file__).parents[1] / "backend" / "decky_loader" / "plugin" / "worker.py"
 WORKER_SPEC = importlib.util.spec_from_file_location("decky_worker_storage_test", WORKER_PATH)
 assert WORKER_SPEC is not None and WORKER_SPEC.loader is not None
 worker = importlib.util.module_from_spec(WORKER_SPEC)

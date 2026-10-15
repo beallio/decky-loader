@@ -1853,7 +1853,7 @@ def prepare_inputs(args: argparse.Namespace, work_root: Path) -> dict[str, objec
 def run_benchmark(args: argparse.Namespace) -> int:
     if os.geteuid() != 0:
         raise BenchmarkError('run this harness as root so transient cgroups and namespace clients are owned safely')
-    repository_root = Path(__file__).resolve().parents[2]
+    repository_root = Path(__file__).resolve().parents[1]
     output = ensure_output_directory(Path(args.output), repository_root)
     if not (CGROUP_ROOT / 'cgroup.controllers').is_file():
         raise BenchmarkError('benchmark requires the systemd cgroup v2 hierarchy')

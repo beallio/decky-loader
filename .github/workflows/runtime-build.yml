@@ -1,0 +1,87 @@
+name: Runtime Builder
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Rust candidate version; does not publish a release
+        default: dev
+        type: string
+  workflow_call:
+    inputs:
+      release_version:
+        description: Rust candidate version; does not publish a release
+        default: dev
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  dependencies:
+    uses: ./.github/workflows/runtime-dependencies.yml
+
+  build:
+    name: Build complete Linux runtime
+    needs: dependencies
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CANDIDATE_VERSION: ${{ inputs.release_version || 'dev' }}
+    steps:
+      - name: Use the runner temporary directory
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Check out complete source history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Read pinned build configuration
+        id: config
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          config = json.loads(Path('backend-rust/build-config.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key in ('node', 'pnpm', 'rust'):
+                  print(f'{key}={config[key]}', file=output)
+          PY
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ steps.config.outputs.node }}
+
+      - name: Set up pinned package manager and Rust
+        env:
+          PNPM_VERSION: ${{ steps.config.outputs.pnpm }}
+          RUST_VERSION: ${{ steps.config.outputs.rust }}
+        run: |
+          npm install --global "pnpm@$PNPM_VERSION"
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
+
+      - name: Check the runtime and installer
+        working-directory: backend-rust
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          python3 -m unittest discover -s . -p 'test_*.py'
+
+      - name: Build the complete pinned candidate
+        run: |
+          python3 backend-rust/build.py \
+            --release-version "$CANDIDATE_VERSION" \
+            --output "$RUNNER_TEMP/decky-runtime"
+
+      - name: Upload the complete runtime bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: decky-loader-runtime-linux-x86_64
+          path: ${{ runner.temp }}/decky-runtime/bundle/
+          if-no-files-found: error
+          include-hidden-files: true

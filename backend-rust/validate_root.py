@@ -19,7 +19,7 @@ import urllib.request
 
 from process_observer import cgroup_processes
 
-BASE = Path('/home/deck/.local/share/decky-rust-runtime-probe')
+BASE = Path('/home/deck/.local/share/decky-loader-runtime')
 BUNDLE = BASE / 'bundle'
 NORMAL = Path('/home/deck/homebrew')
 SERVICE = 'plugin_loader.service'
@@ -40,8 +40,8 @@ def command(*args: str, timeout: float = 90) -> str:
 
 def verify_bundle() -> dict:
     manifest = json.loads((BUNDLE / 'bundle.json').read_text())
-    if manifest.get('kind') != 'decky-rust-runtime-probe':
-        raise RuntimeError('not a Decky compatibility probe bundle')
+    if manifest.get('kind') != 'decky-loader-runtime':
+        raise RuntimeError('not a Decky runtime candidate bundle')
     for relative, expected in manifest['sha256'].items():
         path = (BUNDLE / relative).resolve()
         if not path.is_relative_to(BUNDLE.resolve()) or not path.is_file():
@@ -404,7 +404,7 @@ def main() -> int:
         launcher.append(f'--setenv=TMPDIR={runtime_root}')
         launcher.extend([
             '--',
-            str(staged / 'decky-rust-runtime-probe'),
+            str(staged / 'decky-loader-runtime'),
             '--listen', '127.0.0.1:1337',
             '--release-version', manifest['release_version'],
             '--worker', str(staged / 'DeckyPluginWorker'),
