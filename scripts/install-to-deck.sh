@@ -8,13 +8,15 @@ need() { command -v "$1" >/dev/null || fail "Required command is missing: $1"; }
 
 show_help() {
     cat <<'HELP'
-Usage: DECK_IP=<host-or-SSH-alias> scripts/install-to-deck.sh [options]
+Usage: bash install-to-deck.sh [options]
 
 Without --bundle, download the pinned v3.2.10-rust.6-rc.1 CI artifact publicly
 through nightly.link. No GitHub account, token, or GitHub CLI is required.
-Run this saved script on your workstation. No Rust/Python build tools are needed.
-The automatic download requires curl and unzip on the workstation.
+Run this saved script on the Deck in Desktop Mode. Local execution is the default;
+no IP address or SSH is needed. No Rust/Python build tools are needed.
+The automatic download requires curl and unzip.
 
+  --remote HOST            Deploy over SSH instead of installing on this machine
   --bundle ZIP             Use the inner runtime ZIP from a CI artifact
   --sha256 HASH            Expected runtime ZIP checksum (default: pinned RC)
   --run-id ID              GitHub Actions run (default: 38802815038)
@@ -28,12 +30,12 @@ The automatic download requires curl and unzip on the workstation.
   --listen ADDRESS         Backend listener (default: 127.0.0.1:1337)
   --cef-url URL            Steam debugger endpoint (default: http://127.0.0.1:8080)
   --inject-frontend BOOL    true or false (default: true)
-  --non-interactive        Require SSH keys and passwordless/cached sudo
+  --non-interactive        Do not prompt for sudo or SSH passwords
   --help                   Show help without connecting
 
-Environment: DECK_IP is required; DECK_USER defaults to deck. DECK_PORT, when
-set, overrides the SSH configuration for both ssh and scp. TMPDIR is used for
-owned staging; the fallback on each machine is /var/tmp/omp-1000.
+Environment: DECK_USER defaults to deck (the plugin account, and SSH account in
+remote mode). DECK_PORT overrides the SSH port only with --remote. TMPDIR is used
+for owned staging; the fallback on each machine is /var/tmp/omp-1000.
 
 Install briefly stops the selected service for a consistent full backup, then
 restores its prior running state before install.py takes its transaction snapshot.
@@ -41,7 +43,7 @@ Rollback restores backend/service state, not the separate user-data snapshot.
 HELP
 }
 
-remote_cleanup() {
+target_cleanup() {
     local result=$?
     trap - EXIT
     if (( restart_needed )); then
@@ -54,16 +56,16 @@ remote_cleanup() {
     exit "$result"
 }
 
-# This same saved script is transferred to an owned target staging directory.
-remote_action() {
+# Both local and SSH execution use this same staged script and transaction path.
+target_action() {
     local action=$1 homebrew=$2 user=$3 service=$4 backup_base=$5 expected=$6 version=$7
     local listen=$8 cef=$9 inject=${10}
     local kit backup='' state fragment wd unpacked
     # EXIT can run after function locals unwind, including on a failed preflight.
     restart_needed=0
     stage=$(realpath -- "$(dirname -- "${BASH_SOURCE[0]}")")
-    [[ $(basename -- "$stage") == decky-runtime-deploy.???????? ]] || fail 'Invalid remote staging directory'
-    [[ $EUID == 0 ]] || fail 'The remote operation requires sudo'
+    [[ $(basename -- "$stage") == decky-runtime-deploy.???????? ]] || fail 'Invalid target staging directory'
+    [[ $EUID == 0 ]] || fail 'The target operation requires sudo'
     umask 077
     export PYTHONDONTWRITEBYTECODE=1 TMPDIR="${TMPDIR:-/var/tmp/omp-1000}"
     [[ -d $TMPDIR ]] || mkdir -p -- "$TMPDIR"
@@ -72,7 +74,7 @@ remote_action() {
     [[ $homebrew == /* && $homebrew != / && $homebrew != /home ]] || fail 'Use an absolute homebrew directory, not / or /home'
     homebrew=$(realpath -m -- "$homebrew")
     kit="$homebrew/services/.decky-deploy/$unit"
-    trap remote_cleanup EXIT
+    trap target_cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
     for tool in python3 systemctl tar du install sha256sum; do need "$tool"; done
@@ -228,13 +230,14 @@ PY
     exit 0
 }
 
-if [[ ${1:-} == --_remote ]]; then
+if [[ ${1:-} == --_target ]]; then
     shift
     [[ $# == 10 ]] || fail 'Invalid internal deployment arguments'
-    remote_action "$@"
+    target_action "$@"
 fi
 
 action=install
+remote_host=''
 bundle_archive=''
 expected=61b549a6d2d7f99a5d9afd6cb4575d4d3d9c4c2cb277d6e465942b7c148f425c
 version=v3.2.10-rust.6-rc.1
@@ -254,9 +257,10 @@ while (( $# )); do
             [[ $action == install ]] || fail 'Choose only one of --undo, --status, or --check'
             action=${1#--}; shift ;;
         --non-interactive) non_interactive=true; shift ;;
-        --bundle|--sha256|--version|--run-id|--homebrew|--service|--backup-dir|--listen|--cef-url|--inject-frontend)
+        --remote|--bundle|--sha256|--version|--run-id|--homebrew|--service|--backup-dir|--listen|--cef-url|--inject-frontend)
             (( $# >= 2 )) || fail "Missing value for $1"
             case $1 in
+                --remote) [[ -n $2 ]] || fail '--remote requires a host'; remote_host=$2 ;;
                 --bundle) bundle_archive=$2 ;; --sha256) expected=$2 ;; --version) version=$2 ;;
                 --run-id) run_id=$2 ;; --homebrew) homebrew=$2 ;; --service) service=$2 ;;
                 --backup-dir) backup_base=$2 ;; --listen) listen=$2 ;; --cef-url) cef=$2 ;;
@@ -266,15 +270,13 @@ while (( $# )); do
         *) fail "Unknown option: $1 (use --help)" ;;
     esac
 done
-[[ -n ${DECK_IP:-} ]] || fail 'Set DECK_IP to the target address or SSH alias'
-[[ $DECK_IP != -* && $DECK_IP != *[[:space:]]* && $DECK_IP != *@* ]] || fail 'Invalid DECK_IP'
 [[ $user =~ ^[a-z_][a-z0-9_-]*$ && $user != root ]] || fail 'DECK_USER must name a non-root target account'
 [[ $expected =~ ^[[:xdigit:]]{64}$ ]] || fail 'Expected SHA256 must contain 64 hexadecimal characters'
 expected=${expected,,}
 [[ $run_id =~ ^[0-9]+$ ]] || fail '--run-id must be numeric'
 [[ $inject == true || $inject == false ]] || fail '--inject-frontend must be true or false'
 [[ -n $backup_base ]] || backup_base="$(dirname -- "$homebrew")/decky-runtime-backups"
-for tool in ssh scp sha256sum realpath; do need "$tool"; done
+for tool in sha256sum realpath cp; do need "$tool"; done
 ssh_opts=()
 scp_opts=()
 tty_args=()
@@ -283,23 +285,29 @@ run_ssh_command() {
     local -a invocation=(ssh "${ssh_opts[@]}" "${tty_args[@]}" "$target" "$@")
     "${invocation[@]}"
 }
-if [[ -n ${DECK_PORT:-} ]]; then
-    [[ $DECK_PORT =~ ^[0-9]+$ && ${#DECK_PORT} -le 5 ]] || fail 'Invalid DECK_PORT'
-    (( 10#$DECK_PORT >= 1 && 10#$DECK_PORT <= 65535 )) || fail 'Invalid DECK_PORT'
-    ssh_opts+=(-p "$DECK_PORT")
-    scp_opts+=(-P "$DECK_PORT")
+if [[ -n $remote_host ]]; then
+    [[ $remote_host != -* && $remote_host != *[[:space:]]* && $remote_host != *@* ]] || fail 'Invalid --remote host'
+    need ssh
+    need scp
+    if [[ -n ${DECK_PORT:-} ]]; then
+        [[ $DECK_PORT =~ ^[0-9]+$ && ${#DECK_PORT} -le 5 ]] || fail 'Invalid DECK_PORT'
+        (( 10#$DECK_PORT >= 1 && 10#$DECK_PORT <= 65535 )) || fail 'Invalid DECK_PORT'
+        ssh_opts+=(-p "$DECK_PORT")
+        scp_opts+=(-P "$DECK_PORT")
+    fi
+    if $non_interactive; then
+        ssh_opts+=(-o BatchMode=yes)
+        scp_opts+=(-o BatchMode=yes)
+    fi
+    target="$user@$remote_host"
+    scp_target=$target
+    if [[ $remote_host == *:* && $remote_host != \[*\] ]]; then scp_target="$user@[$remote_host]"; fi
 fi
-if $non_interactive; then
-    ssh_opts+=(-o BatchMode=yes)
-    scp_opts+=(-o BatchMode=yes)
-fi
-target="$user@$DECK_IP"
-scp_target=$target
-if [[ $DECK_IP == *:* && $DECK_IP != \[*\] ]]; then scp_target="$user@[$DECK_IP]"; fi
 tmpbase=${TMPDIR:-/var/tmp/omp-1000}
 [[ -d $tmpbase ]] || mkdir -p -- "$tmpbase"
-work=$(mktemp -d "$tmpbase/decky-deploy-host.XXXXXXXX")
+work=$(mktemp -d "$tmpbase/decky-deploy.XXXXXXXX")
 remote_stage=''
+local_stage=''
 cleanup() {
     local result=$?
     trap - EXIT
@@ -310,6 +318,10 @@ cleanup() {
         if ! run_ssh_command "$command"; then
             printf 'Warning: target staging may remain at %s\n' "$remote_stage" >&2
         fi
+    fi
+    if [[ -n $local_stage ]] && ! rm -rf -- "$local_stage"; then
+        printf 'Warning: local staging may remain at %s; sudo may be needed to remove it\n' "$local_stage" >&2
+        result=1
     fi
     rm -rf -- "$work"
     exit "$result"
@@ -333,6 +345,25 @@ if [[ $action == install || $action == check ]]; then
     read -r actual _ < <(sha256sum -- "$bundle_archive")
     [[ $actual == "$expected" ]] || fail 'Runtime ZIP checksum mismatch; use the inner runtime ZIP and its approved SHA256'
 fi
+sudo_args=(sudo -n)
+if ! $non_interactive && [[ -t 0 && -t 1 ]]; then
+    sudo_args=(sudo)
+fi
+target_args=(--_target "$action" "$homebrew" "$user" "$service" "$backup_base" "$expected" "$version" "$listen" "$cef" "$inject")
+if [[ -z $remote_host ]]; then
+    local_stage=$(mktemp -d "$tmpbase/decky-runtime-deploy.XXXXXXXX")
+    cp -- "$(realpath -- "${BASH_SOURCE[0]}")" "$local_stage/deploy.sh"
+    if [[ $action == install || $action == check ]]; then
+        cp -- "$bundle_archive" "$local_stage/runtime.zip"
+    fi
+    if (( EUID == 0 )); then
+        bash "$local_stage/deploy.sh" "${target_args[@]}"
+    else
+        need sudo
+        "${sudo_args[@]}" env "TMPDIR=$tmpbase" bash "$local_stage/deploy.sh" "${target_args[@]}"
+    fi
+    exit 0
+fi
 proposed_stage=$(ssh "${ssh_opts[@]}" "$target" 'set -eu; umask 077; base=${TMPDIR:-/var/tmp/omp-1000}; if [ ! -d "$base" ]; then mkdir -p -- "$base"; fi; mktemp -d "$base/decky-runtime-deploy.XXXXXXXX"')
 [[ $proposed_stage == /* && $proposed_stage != *$'\n'* && $(basename -- "$proposed_stage") == decky-runtime-deploy.???????? ]] || fail 'Unexpected remote staging path'
 remote_stage=$proposed_stage
@@ -340,12 +371,9 @@ scp "${scp_opts[@]}" -- "$(realpath -- "${BASH_SOURCE[0]}")" "$scp_target:$remot
 if [[ $action == install || $action == check ]]; then
     scp "${scp_opts[@]}" -- "$bundle_archive" "$scp_target:$remote_stage/runtime.zip"
 fi
-sudo_args=(sudo -n)
 tty_args=()
 if ! $non_interactive && [[ -t 0 && -t 1 ]]; then
-    sudo_args=(sudo)
     tty_args=(-t)
 fi
-printf -v command '%q ' "${sudo_args[@]}" bash "$remote_stage/deploy.sh" --_remote \
-    "$action" "$homebrew" "$user" "$service" "$backup_base" "$expected" "$version" "$listen" "$cef" "$inject"
+printf -v command '%q ' "${sudo_args[@]}" bash "$remote_stage/deploy.sh" "${target_args[@]}"
 run_ssh_command "$command"

@@ -155,19 +155,20 @@ The selected-file binding stays available until the worker process exits, includ
 
 The [installer](backend-rust/install.py) supports new installs, replacement of an existing install, and rollback. A failed activation restores the previous backend and service file. User plugins, settings, and data remain in place. Use its `--help` before installing a private candidate.
 
-#### Install the private candidate over SSH
+#### Install the private candidate on the Deck
 
-Use [install-to-deck.sh](scripts/install-to-deck.sh) from a Linux workstation with Bash, curl, unzip, SSH, and SCP. Enable SSH on the Deck and make sure you can use `sudo` there. Installation uses the Deck's system Python. Plugins use the included Python runtime. The Deck does not need Rust, Poetry, pnpm, or pip packages.
+Save [install-to-deck.sh](scripts/install-to-deck.sh) on the Deck. Switch to Desktop Mode and open Konsole in the folder where you saved it. Local installation is the default. You do not need an IP address, SSH, or another computer.
 
-The script downloads the pinned `v3.2.10-rust.6-rc.1` bundle through [nightly.link](https://nightly.link). No GitHub account, token, or GitHub CLI is required. It checks the runtime ZIP against the pinned SHA256 before it connects to the Deck. CI artifacts can expire. To use a saved runtime ZIP instead, add `--bundle /path/to/decky-loader-runtime-linux-x86_64.zip`. Use the inner runtime ZIP, not the outer Actions download.
+The script uses Bash, curl, unzip, and the Deck's system Python. It asks for your user's sudo password when needed. If you have not set a password, run `passwd` in Konsole first. Plugins use the included Python runtime. The Deck does not need Rust, Poetry, pnpm, or pip packages.
 
-Replace `steamdeck` below with your Deck's address or SSH alias:
+The script downloads the pinned `v3.2.10-rust.6-rc.1` bundle through [nightly.link](https://nightly.link). No GitHub account, token, or GitHub CLI is required. It checks the runtime ZIP against the pinned SHA256 before it changes the installation. CI artifacts can expire. To use a saved runtime ZIP instead, add `--bundle /path/to/decky-loader-runtime-linux-x86_64.zip`. Use the inner runtime ZIP, not the outer Actions download.
+
+Run these commands as your normal Deck user. The script requests sudo itself:
 
 ```sh
-export DECK_IP=steamdeck
-bash scripts/install-to-deck.sh --check
-bash scripts/install-to-deck.sh
-bash scripts/install-to-deck.sh --status
+bash install-to-deck.sh --check
+bash install-to-deck.sh
+bash install-to-deck.sh --status
 ```
 
 `--check` verifies the bundle and basic target requirements without stopping the service or changing the installation. Installation briefly stops the selected service to make a full backup of homebrew and its service configuration, then restores its running state before the maintained installer takes over. Backups stay outside homebrew, in the sibling `decky-runtime-backups` directory by default. Use `--backup-dir` to choose another location with enough space.
@@ -177,12 +178,14 @@ Space checks cover temporary files, the installed runtime, and the full backup. 
 To restore the previous backend and service configuration:
 
 ```sh
-DECK_IP=steamdeck bash scripts/install-to-deck.sh --undo
+bash install-to-deck.sh --undo
 ```
 
 Rollback uses small recovery tools retained under `homebrew/services/.decky-deploy`; it does not need GitHub access. It does not restore the separate user-data archive automatically. Keep that recovery directory and your backups.
 
-Use `--help` for custom paths, service names, and candidate overrides. `DECK_USER` selects the SSH/plugin account, and `DECK_PORT` overrides the SSH port for both SSH and SCP. Interactive runs can ask for the Deck's sudo password; `--non-interactive` requires SSH keys and non-interactive sudo access. The script stays pinned while other runtime builds are investigated.
+Use `--help` for custom paths, service names, and candidate overrides. `DECK_USER` selects the plugin account and defaults to `deck`. `--non-interactive` disables password prompts. The script stays pinned while other runtime builds are investigated.
+
+For optional deployment from another Linux computer, use `--remote HOST`, such as `bash install-to-deck.sh --remote steamdeck --check`. Remote mode requires SSH and SCP on that computer and SSH access to the Deck. `DECK_USER` also selects the SSH account, and `DECK_PORT` overrides its port. Setting `DECK_IP` no longer selects a remote target; use `--remote` explicitly.
 
 After installation, open Decky in Gaming Mode. Open each plugin and use its main function. Check that settings persist after a plugin reload and after a reboot. Check suspend and resume. Keep the pinned candidate and backups until these checks pass on your Deck. If the interface or plugins fail, use `--undo` and check the previous installation again.
 
