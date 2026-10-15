@@ -155,6 +155,34 @@ The selected-file binding stays available until the worker process exits, includ
 
 The [installer](backend-rust/install.py) supports new installs, replacement of an existing install, and rollback. A failed activation restores the previous backend and service file. User plugins, settings, and data remain in place. Use its `--help` before installing a private candidate.
 
+#### Install the private candidate over SSH
+
+Use [install-to-deck.sh](scripts/install-to-deck.sh) from a Linux workstation with Bash, SSH, and SCP. Enable SSH on the Deck and make sure you can use `sudo` there. The Deck uses its system Python; it does not need Rust, Poetry, pnpm, or pip packages.
+
+The script downloads the pinned `v3.2.10-rust.6-rc.1` bundle with the GitHub CLI and checks its SHA256. Sign in to `gh` on the workstation first. To use an already downloaded runtime ZIP instead, add `--bundle /path/to/decky-loader-runtime-linux-x86_64.zip`. Use the inner runtime ZIP, not the outer Actions download.
+
+Replace `steamdeck` below with your Deck's address or SSH alias:
+
+```sh
+export DECK_IP=steamdeck
+bash scripts/install-to-deck.sh --check
+bash scripts/install-to-deck.sh
+bash scripts/install-to-deck.sh --status
+```
+
+`--check` verifies the bundle and basic target requirements without stopping the service or changing the installation. Installation briefly stops the selected service to make a full backup of homebrew and its service configuration, then restores its running state before the maintained installer takes over. Backups stay outside homebrew, in the sibling `decky-runtime-backups` directory by default. Use `--backup-dir` to choose another location with enough space.
+
+To restore the previous backend and service configuration:
+
+```sh
+DECK_IP=steamdeck bash scripts/install-to-deck.sh --undo
+```
+
+Rollback uses small recovery tools retained under `homebrew/services/.decky-deploy`; it does not need GitHub access. It does not restore the separate user-data archive automatically. Keep that recovery directory and your backups.
+
+Use `--help` for custom paths, service names, and candidate overrides. `DECK_USER` selects the SSH/plugin account, and `DECK_PORT` overrides the SSH port for both SSH and SCP. Interactive runs can ask for the Deck's sudo password; `--non-interactive` requires SSH keys and non-interactive sudo access. The script stays pinned while other runtime builds are investigated.
+
+
 The [dependency audit](backend-rust/audit.sh) must pass security, source, and dependency-use checks. The [VM validation tools](backend-rust/benchmark_vm.py) use owned clones rather than replacing the normal installation. Their results do not establish compatibility with every third-party plugin or replace physical Steam Deck testing.
 
 ## 📜 Credits
