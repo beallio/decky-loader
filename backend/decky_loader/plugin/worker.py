@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import platform
+import stat
 import sys
 import sysconfig
 from pathlib import Path
@@ -247,34 +248,125 @@ def _selected_user(user: str) -> Any:
     return account
 
 
-def _ensure_user_directory(path: Path, uid: int, gid: int, mode: int) -> None:
+def _absolute_storage_path(path: Path) -> Path:
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
+def _open_directory_at(parent_fd: int, name: str, path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
-        if path.is_symlink():
-            raise WorkerError(f"refusing to use a symlink for plugin storage: {path}")
-        if path.exists() and not path.is_dir():
-            raise WorkerError(f"expected a directory but found another file: {path}")
-        path.mkdir(parents=True, exist_ok=True)
-        status = path.stat()
-        if os.geteuid() == 0:
-            if status.st_uid != uid or status.st_gid != gid:
-                os.chown(path, uid, gid)
-            os.chmod(path, mode)
-        else:
-            if status.st_uid != uid:
-                raise WorkerError(f"directory is not owned by selected user {uid}: {path}")
-            os.chmod(path, mode)
-        if not os.access(path, os.R_OK | os.W_OK | os.X_OK):
-            raise WorkerError(f"selected user cannot read, write, and traverse directory: {path}")
+        directory_fd = os.open(name, flags, dir_fd=parent_fd)
     except OSError as error:
-        raise WorkerError(f"could not prepare directory for selected user: {path}: {error}") from error
+        try:
+            status = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError:
+            status = None
+        if status is not None:
+            if stat.S_ISLNK(status.st_mode):
+                raise WorkerError(
+                    f"refusing to use a symlink for plugin storage: {path}"
+                ) from error
+            if not stat.S_ISDIR(status.st_mode):
+                raise WorkerError(
+                    f"expected a directory but found another file: {path}"
+                ) from error
+        raise
+
+    try:
+        if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+            raise WorkerError(f"expected a directory but found another file: {path}")
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
 
 
-def _prepare_plugin_storage(homebrew: Path, directory_name: str, user: Any) -> None:
-    _ensure_user_directory(homebrew, user.pw_uid, user.pw_gid, 0o755)
-    for root_name in ("settings", "data", "logs"):
-        storage_root = homebrew / root_name
-        _ensure_user_directory(storage_root, user.pw_uid, user.pw_gid, 0o755)
-        _ensure_user_directory(storage_root / directory_name, user.pw_uid, user.pw_gid, 0o700)
+def _open_or_create_directory_at(parent_fd: int, name: str, path: Path) -> int:
+    try:
+        return _open_directory_at(parent_fd, name, path)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, 0o777, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        return _open_directory_at(parent_fd, name, path)
+
+
+def _open_or_create_storage_path(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptors = [os.open(os.sep, flags)]
+    try:
+        for component in path.parts[1:]:
+            if component == "..":
+                if len(descriptors) > 1:
+                    os.close(descriptors.pop())
+                continue
+            if component in ("", "."):
+                continue
+            descriptors.append(
+                _open_or_create_directory_at(descriptors[-1], component, path)
+            )
+        return descriptors.pop()
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+def _ensure_user_directory_fd(
+    directory_fd: int, path: Path, uid: int, gid: int, mode: int
+) -> None:
+    status = os.fstat(directory_fd)
+    if not stat.S_ISDIR(status.st_mode):
+        raise WorkerError(f"expected a directory but found another file: {path}")
+
+    if os.geteuid() == 0:
+        if status.st_uid != uid or status.st_gid != gid:
+            os.fchown(directory_fd, uid, gid)
+        os.fchmod(directory_fd, mode)
+    else:
+        if status.st_uid != uid:
+            raise WorkerError(f"directory is not owned by selected user {uid}: {path}")
+        os.fchmod(directory_fd, mode)
+
+    if not os.access(".", os.R_OK | os.W_OK | os.X_OK, dir_fd=directory_fd):
+        raise WorkerError(f"selected user cannot read, write, and traverse directory: {path}")
+
+
+def _prepare_plugin_storage(homebrew: Path, directory_name: str, user: Any) -> Path:
+    if directory_name in ("", ".", "..") or os.sep in directory_name:
+        raise WorkerError(f"invalid plugin storage directory name: {directory_name!r}")
+
+    homebrew = _absolute_storage_path(homebrew)
+    homebrew_fd: int | None = None
+    try:
+        homebrew_fd = _open_or_create_storage_path(homebrew)
+        _ensure_user_directory_fd(homebrew_fd, homebrew, user.pw_uid, user.pw_gid, 0o755)
+        for root_name in ("settings", "data", "logs"):
+            storage_root = homebrew / root_name
+            storage_fd = _open_or_create_directory_at(homebrew_fd, root_name, storage_root)
+            try:
+                _ensure_user_directory_fd(storage_fd, storage_root, user.pw_uid, user.pw_gid, 0o755)
+                plugin_path = storage_root / directory_name
+                plugin_fd = _open_or_create_directory_at(storage_fd, directory_name, plugin_path)
+                try:
+                    _ensure_user_directory_fd(plugin_fd, plugin_path, user.pw_uid, user.pw_gid, 0o700)
+                finally:
+                    os.close(plugin_fd)
+            finally:
+                os.close(storage_fd)
+    except WorkerError:
+        raise
+    except OSError as error:
+        raise WorkerError(
+            f"could not prepare directory for selected user: {homebrew}: {error}"
+        ) from error
+    finally:
+        if homebrew_fd is not None:
+            os.close(homebrew_fd)
+    return homebrew
 
 
 def _configure_environment(plugin_root: Path, homebrew: Path, user: str) -> None:
@@ -303,12 +395,12 @@ def launch(args: argparse.Namespace) -> None:
         raise WorkerError(f"plugin {name!r} requires root privileges, but the worker is not running as root")
 
     try:
-        homebrew = Path(args.homebrew).expanduser().resolve()
-        homebrew.mkdir(parents=True, exist_ok=True)
+        homebrew = _prepare_plugin_storage(Path(args.homebrew), plugin_directory.name, account)
     except OSError as error:
-        raise WorkerError(f"could not prepare isolated homebrew directory {args.homebrew}: {error}") from error
+        raise WorkerError(
+            f"could not prepare isolated homebrew directory {args.homebrew}: {error}"
+        ) from error
     _configure_environment(root, homebrew, args.user)
-    _prepare_plugin_storage(homebrew, plugin_directory.name, account)
 
     socket_path = Path(args.socket).expanduser().absolute()
     if not socket_path.parent.is_dir():
