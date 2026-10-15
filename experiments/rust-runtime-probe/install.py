@@ -48,6 +48,7 @@ RUST_EXECUTABLE = 'decky-rust-runtime-probe'
 WORKER_EXECUTABLE = 'DeckyPluginWorker'
 MAX_HTTP_HEADERS = 65536
 MAX_WEBSOCKET_FRAME = 1024 * 1024
+HEALTH_RPC_IDS = (-1, -2, -3)
 
 
 class InstallerError(RuntimeError):
@@ -1117,6 +1118,8 @@ def _websocket_call(connection: socket.socket, call_id: int, route: str) -> obje
         current_opcode = 0
         if not isinstance(response, dict) or response.get('id') != call_id:
             continue
+        acknowledgement = json.dumps({'type': 3, 'id': call_id}, separators=(',', ':')).encode('utf-8')
+        _websocket_send(connection, 1, acknowledgement)
         if response.get('type') != 1:
             _fail(f'service RPC {route} failed: {response.get("error", response)}')
         return response.get('result')
@@ -1139,6 +1142,7 @@ def _api_health(paths: dict[str, Path], listen: str) -> None:
                 denied = response.status == 403
         except urllib.error.HTTPError as error:
             denied = error.code == 403
+            error.close()
         if not denied:
             _fail('service did not reject an invalid authentication token')
         authorized = urllib.request.Request(f'{base}/auth/token?installer-health=1', headers={'X-Decky-Auth': token}, method='GET')
@@ -1188,13 +1192,13 @@ def _api_health(paths: dict[str, Path], listen: str) -> None:
                 response_headers[name.strip().lower()] = value.strip()
         if response_headers.get('sec-websocket-accept') != accept:
             _fail('service returned an invalid WebSocket handshake accept key')
-        ping = _websocket_call(connection, 1, 'utilities/ping')
+        ping = _websocket_call(connection, HEALTH_RPC_IDS[0], 'utilities/ping')
         if ping != 'pong':
             _fail(f'utilities/ping returned an unexpected value: {ping!r}')
-        plugins = _websocket_call(connection, 2, 'loader/get_plugins')
+        plugins = _websocket_call(connection, HEALTH_RPC_IDS[1], 'loader/get_plugins')
         if not isinstance(plugins, list):
             _fail('loader/get_plugins did not return a list')
-        version = _websocket_call(connection, 3, 'updater/get_version_info')
+        version = _websocket_call(connection, HEALTH_RPC_IDS[2], 'updater/get_version_info')
         if not isinstance(version, dict) or not isinstance(version.get('current'), str) or not version['current']:
             _fail('updater/get_version_info did not return a current version')
         if paths['active'].exists():
