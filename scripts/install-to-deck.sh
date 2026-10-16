@@ -10,7 +10,7 @@ show_help() {
     cat <<'HELP'
 Usage: bash install-to-deck.sh [options]
 
-Without --bundle, download the pinned v3.2.10-rust.7-rc.1 CI artifact publicly
+Without --bundle, download the pinned v3.2.10-rust.7-rc.2 CI artifact publicly
 through nightly.link. No GitHub account, token, or GitHub CLI is required.
 Run this saved script on the Deck in Desktop Mode. Local execution is the default;
 no IP address or SSH is needed. No Rust/Python build tools are needed.
@@ -19,8 +19,8 @@ The automatic download requires curl and unzip.
   --remote HOST            Deploy over SSH instead of installing on this machine
   --bundle ZIP             Use the inner runtime ZIP from a CI artifact
   --sha256 HASH            Expected runtime ZIP checksum (default: pinned RC)
-  --run-id ID              GitHub Actions run (default: 38834434941)
-  --version STRING         Expected bundle release (default: v3.2.10-rust.7-rc.1)
+  --run-id ID              GitHub Actions run (default: 38864117913)
+  --version STRING         Expected bundle release (default: v3.2.10-rust.7-rc.2)
   --check                  Verify the bundle and target without changing the service
   --status                 Report installer state using the retained offline kit
   --undo                   Run the maintained installer's rollback, without downloads
@@ -52,13 +52,28 @@ target_installer() {
     python3 -B "$installer" "$@"
 }
 
+target_stop_service() {
+    python3 -B - "$1" "$2" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from install import InstallerError, stop_service
+try:
+    stop_service(sys.argv[2])
+except InstallerError as error:
+    raise SystemExit(str(error)) from None
+PY
+}
+
 target_cleanup() {
     local result=$?
     trap - EXIT
     # Finish recovery even if closing the terminal sends another signal.
     trap '' INT TERM HUP
     if (( restart_needed )); then
-        if ! systemctl start "$unit"; then
+        if ! target_stop_service "$stage/bundle" "$unit"; then
+            printf 'Error: selected-service shutdown is incomplete; refusing to start another backend. See the process details above.\n' >&2
+            result=1
+        elif ! systemctl start "$unit"; then
             printf 'Error: could not restart the original service after backup; check %s\n' "$unit" >&2
             result=1
         fi
@@ -199,27 +214,14 @@ PY
     backup=$(mktemp -d "$backup_base/$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")
     printf 'Full backup: %s\n' "$backup"
     systemctl show "$unit" --property=LoadState --property=ActiveState --property=SubState --property=UnitFileState --property=FragmentPath --property=DropInPaths > "$backup/service-before.txt"
-    local active control_group
+    local active
     active=$(systemctl show "$unit" --property=ActiveState --value)
-    control_group=$(systemctl show "$unit" --property=ControlGroup --value)
     if [[ $active == active ]]; then
         restart_needed=1
-        systemctl stop "$unit"
     elif [[ $active != inactive && $state != not-found ]]; then
         fail "Refusing backup while selected service is $active"
     fi
-    if [[ -n $control_group ]]; then
-        python3 - "$stage/bundle" "$control_group" <<'PY'
-import sys, time
-sys.path.insert(0, sys.argv[1])
-from process_observer import cgroup_processes
-deadline = time.monotonic() + 10
-while cgroup_processes(sys.argv[2]):
-    if time.monotonic() >= deadline:
-        raise SystemExit('Selected service still has processes; backup cancelled')
-    time.sleep(0.05)
-PY
-    fi
+    target_stop_service "$stage/bundle" "$unit"
     local -a paths=()
     [[ ! -e $homebrew ]] || paths+=("${homebrew#/}")
     fragment=$(systemctl show "$unit" --property=FragmentPath --value)
@@ -259,9 +261,9 @@ fi
 action=install
 remote_host=''
 bundle_archive=''
-expected=662fd6c530b1f9c7d03c580274f80680c1b4bbc880f3fba0ab7e93c462cb8348
-version=v3.2.10-rust.7-rc.1
-run_id=38834434941
+expected=3f5935c8a91f14f6cd0b207e87d8f52d4f5a7d164644e3635faa24abc251a3c5
+version=v3.2.10-rust.7-rc.2
+run_id=38864117913
 user=${DECK_USER:-deck}
 homebrew="/home/$user/homebrew"
 service=plugin_loader

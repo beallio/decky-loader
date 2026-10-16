@@ -165,7 +165,7 @@ Save [install-to-deck.sh](scripts/install-to-deck.sh) on the Deck. Switch to Des
 
 The script uses Bash, curl, unzip, and the Deck's system Python. It asks for your user's sudo password when needed. If you have not set a password, run `passwd` in Konsole first. Plugins use the included Python runtime. The Deck does not need Rust, Poetry, pnpm, or pip packages.
 
-The script downloads the pinned `v3.2.10-rust.7-rc.1` bundle through [nightly.link](https://nightly.link). Save the updated script again if you have an older copy. No GitHub account, token, or GitHub CLI is required. It checks the runtime ZIP against the pinned SHA256 before it changes the installation. CI artifacts can expire. To use a saved runtime ZIP instead, add `--bundle /path/to/decky-loader-runtime-linux-x86_64.zip`. Use the inner runtime ZIP, not the outer Actions download.
+The script downloads the pinned `v3.2.10-rust.7-rc.2` bundle through [nightly.link](https://nightly.link). Save the updated script again if you have an older copy. No GitHub account, token, or GitHub CLI is required. It checks the runtime ZIP against the pinned SHA256 before it changes the installation. CI artifacts can expire. To use a saved runtime ZIP instead, add `--bundle /path/to/decky-loader-runtime-linux-x86_64.zip`. Use the inner runtime ZIP, not the outer Actions download.
 
 Run these commands as your normal Deck user. The script requests sudo itself:
 
@@ -177,7 +177,7 @@ bash install-to-deck.sh --status
 
 `--check` verifies the bundle and basic target requirements without stopping the service or changing the installation. Installation briefly stops the selected service to make a full backup of homebrew and its service configuration, then restores its running state before the maintained installer takes over. Backups stay outside homebrew, in the sibling `decky-runtime-backups` directory by default. Use `--backup-dir` to choose another location with enough space.
 
-The maintained installer lets the main process stop first. If helper processes remain, it stops only processes tracked as part of the selected service. If they do not exit, installation stops and reports their PIDs. It does not continue while those processes can still change files.
+Before backup or activation, the installer lets the main process stop first. If helper processes remain, it stops only processes tracked as part of the selected service. If they do not exit, installation stops and reports their PIDs. It does not continue while those processes can still change files.
 
 Space checks cover temporary files, the installed runtime, and the full backup. The check adds these requirements together when they share a storage volume. It checks separate volumes independently, including a separate volume mounted at `homebrew/services`. If space is too low, the script stops before it changes the service or creates a backup.
 
@@ -189,7 +189,7 @@ bash install-to-deck.sh --undo
 
 Rollback uses small recovery tools retained under `homebrew/services/.decky-deploy`; it does not need GitHub access. It does not restore the separate user-data archive automatically. Keep that recovery directory and your backups.
 
-If an interruption occurs after the backend installer starts, the script runs its recovery before removing temporary files. This includes closing the terminal. An interrupted backup instead attempts to restart the previously running service. Use `--status` to check the service after an interruption. Installer recovery output is kept in `homebrew/services/.decky-deploy/plugin_loader.service/interrupted-recovery.log` for the default service.
+If an interruption occurs after the backend installer starts, the script runs its recovery before removing temporary files. This includes closing the terminal. An interrupted backup instead completes the selected service's shutdown before it attempts to restart the previous backend. If helpers cannot be stopped, it does not start another backend alongside them. Use `--status` to check the service after an interruption. Installer recovery output is kept in `homebrew/services/.decky-deploy/plugin_loader.service/interrupted-recovery.log` for the default service.
 
 Use `--help` for custom paths, service names, and candidate overrides. `DECK_USER` selects the plugin account and defaults to `deck`. `--non-interactive` disables password prompts. The script stays pinned while other runtime builds are investigated.
 
