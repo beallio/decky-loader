@@ -165,7 +165,7 @@ Save [install-to-deck.sh](scripts/install-to-deck.sh) on the Deck. Switch to Des
 
 The script uses Bash, curl, unzip, and the Deck's system Python. It asks for your user's sudo password when needed. If you have not set a password, run `passwd` in Konsole first. Plugins use the included Python runtime. The Deck does not need Rust, Poetry, pnpm, or pip packages.
 
-The script downloads the pinned `v3.2.10-rust.7-rc.2` bundle through [nightly.link](https://nightly.link). Save the updated script again if you have an older copy. No GitHub account, token, or GitHub CLI is required. It checks the runtime ZIP against the pinned SHA256 before it changes the installation. CI artifacts can expire. To use a saved runtime ZIP instead, add `--bundle /path/to/decky-loader-runtime-linux-x86_64.zip`. Use the inner runtime ZIP, not the outer Actions download.
+The script downloads the pinned `v3.2.10-rust.7-rc.4` bundle through [nightly.link](https://nightly.link). Save the updated script again if you have an older copy. No GitHub account, token, or GitHub CLI is required. It checks the runtime ZIP against the pinned SHA256 before it changes the installation. CI artifacts can expire. To use a saved runtime ZIP instead, add `--bundle /path/to/decky-loader-runtime-linux-x86_64.zip`. Use the inner runtime ZIP, not the outer Actions download.
 
 Run these commands as your normal Deck user. The script requests sudo itself:
 
@@ -191,7 +191,7 @@ Rollback uses small recovery tools retained under `homebrew/services/.decky-depl
 
 If an interruption occurs after the backend installer starts, the script runs its recovery before removing temporary files. This includes closing the terminal. If shutdown cannot be confirmed, recovery stays pending and does not start another backend.
 
-During backup, the previous backend can restart only after the initial shutdown has completed. If that shutdown fails or is interrupted, the script does not restart the backend. Keep the original process details and resolve the reported processes before you try again. If archive creation fails after shutdown has completed, the script restarts the previous backend.
+During backup, the previous backend can restart only after the initial shutdown has completed. If that shutdown fails or is interrupted, the script does not restart the backend. Keep the original process details and resolve the reported processes before you try again. For the default service, use `sudo systemctl start plugin_loader` to start the previous backend only after those processes are gone. Then try installation again. If archive creation fails after shutdown has completed, the script restarts the previous backend.
 
 Use `--status` to check the service after an interruption. If the first backup failed before the recovery tools were installed, use `systemctl status plugin_loader` instead. Installer recovery output is kept in `homebrew/services/.decky-deploy/plugin_loader.service/interrupted-recovery.log` for the default service.
 
