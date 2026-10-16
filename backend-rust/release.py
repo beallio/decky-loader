@@ -12,10 +12,58 @@ import subprocess
 import sys
 import zipfile
 
-from build import ARTIFACT_NAME, CONFIG, REPO, digest
+from build import ARTIFACT_NAME, CONFIG, REPO, SOURCE_ROOTS, digest, snapshot_excluded
 
 ASSET_NAME = ARTIFACT_NAME + '.zip'
 TAG_PATTERN = r'v[0-9]+\.[0-9]+\.[0-9]+-rust\.[0-9]+(?:-rc\.[0-9]+)?'
+PYTHON_RELEASE_REPOSITORY = 'steamdeckhomebrew/decky-loader'
+
+
+def source_inventory(source_commit: str) -> set[str]:
+    kind = subprocess.check_output(['git', 'cat-file', '-t', source_commit], cwd=REPO, text=True).strip()
+    if kind != 'commit':
+        raise ValueError('release source must identify a commit, not a tag or other Git object')
+    names = subprocess.check_output(
+        ['git', 'ls-tree', '--full-tree', '-r', '-z', '--name-only', source_commit, '--', *SOURCE_ROOTS],
+        cwd=REPO).decode().split('\0')
+    return {name for name in names if name and not snapshot_excluded(Path(name))}
+
+
+def publication_repository(repository: str) -> None:
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
+        raise ValueError('publication requires repository owner/repository')
+    if repository.lower() == PYTHON_RELEASE_REPOSITORY:
+        raise ValueError('Rust candidates must use a separate experimental repository, not the public Python update feed')
+
+
+def existing_tag_commit(repository: str, tag: str) -> str | None:
+    refs = json.loads(subprocess.check_output(
+        ['gh', 'api', f'repos/{repository}/git/matching-refs/tags/{tag}'], text=True))
+    matches = [ref for ref in refs if ref.get('ref') == f'refs/tags/{tag}']
+    if not matches:
+        return None
+    target = matches[0]['object']
+    seen = set()
+    while target['type'] == 'tag':
+        identifier = target['sha']
+        if identifier in seen:
+            raise ValueError('release tag contains an annotation cycle')
+        seen.add(identifier)
+        target = json.loads(subprocess.check_output(
+            ['gh', 'api', f'repos/{repository}/git/tags/{identifier}'], text=True))['object']
+    if target['type'] != 'commit':
+        raise ValueError('release tag does not resolve to a commit')
+    return target['sha']
+
+
+def ensure_release_tag(repository: str, tag: str, source_commit: str) -> None:
+    current = existing_tag_commit(repository, tag)
+    if current is not None:
+        if current != source_commit:
+            raise ValueError('existing release tag points to a different source commit')
+        return
+    subprocess.run(['gh', 'api', '--method', 'POST', f'repos/{repository}/git/refs',
+                    '-f', f'ref=refs/tags/{tag}', '-f', f'sha={source_commit}'], check=True)
 
 
 def validate(directory: Path, tag: str, source_commit: str) -> dict[str, object]:
@@ -57,8 +105,14 @@ def validate(directory: Path, tag: str, source_commit: str) -> dict[str, object]
         if record.get('files') != len(hashes):
             raise ValueError('build record file count differs from the manifest inventory')
         executable_names = {'decky-loader-runtime', 'DeckyPluginWorker'}
-        if not executable_names.issubset(hashes):
-            raise ValueError('runtime bundle lacks a backend or worker executable')
+        required = executable_names | {'install.py', 'process_observer.py', 'assets/index.js', 'locales/en-US.json'}
+        packaging = manifest.get('worker_packaging')
+        if packaging == 'onedir':
+            required |= {'_internal/libpython3.11.so.1.0', '_internal/base_library.zip'}
+        elif packaging != 'onefile':
+            raise ValueError('runtime bundle must declare its worker packaging')
+        if not required.issubset(hashes):
+            raise ValueError('runtime bundle lacks required installer, frontend, locale or worker payload')
         for info in infos:
             path = PurePosixPath(info.filename)
             mode = info.external_attr >> 16
@@ -77,6 +131,8 @@ def validate(directory: Path, tag: str, source_commit: str) -> dict[str, object]
     source_hashes = provenance.get('source_sha256')
     if not isinstance(source_hashes, dict) or not source_hashes:
         raise ValueError('bundle lacks exact build-source hashes')
+    if set(source_hashes) != source_inventory(source_commit):
+        raise ValueError('build-source inventory does not cover exactly the release commit snapshot')
     for name, expected in source_hashes.items():
         if not isinstance(name, str) or any(ord(char) < 32 for char in name):
             raise ValueError('invalid build-source path')
@@ -103,11 +159,14 @@ def main() -> int:
     if args.publish and (not args.repository or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repository)):
         parser.error('--publish requires --repository owner/repository')
     try:
+        if args.publish:
+            publication_repository(args.repository)
         result = validate(args.artifact_dir, args.tag, args.source_commit)
         if args.publish:
             assets = [args.artifact_dir / name for name in (ASSET_NAME, 'SHA256SUMS', 'build-result.json')]
+            ensure_release_tag(args.repository, args.tag, args.source_commit)
             subprocess.run(['gh', 'release', 'create', args.tag, '--repo', args.repository,
-                            '--target', args.source_commit, '--prerelease', '--latest=false',
+                            '--verify-tag', '--prerelease', '--latest=false',
                             '--title', args.tag, '--notes',
                             'Experimental Rust runtime candidate, not the default Decky release. '
                             f'SDK baseline {CONFIG["sdk"]["tag"]}; source {args.source_commit}. '

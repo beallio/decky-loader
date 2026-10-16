@@ -26,6 +26,7 @@ REPO = HERE.parent
 CONFIG = json.loads((HERE / 'build-config.json').read_text())
 RUNTIME_NAME = 'decky-loader-runtime'
 ARTIFACT_NAME = f'{RUNTIME_NAME}-linux-x86_64'
+SOURCE_ROOTS = ('backend', 'backend-rust', 'frontend')
 
 
 def run(arguments: list[str], *, cwd: Path = REPO, env: dict[str, str] | None = None) -> None:
@@ -45,22 +46,22 @@ def digest(path: Path) -> str:
     return result.hexdigest()
 
 
+def snapshot_excluded(relative: Path) -> bool:
+    parts = relative.parts
+    if any(part in {'target', 'node_modules', '.venv', '__pycache__', 'build', 'dist', '.git'}
+           or part.endswith(('.pyc', '.pyo')) for part in parts):
+        return True
+    return (parts[:2] == ('backend', 'plugins')
+            or parts[:3] == ('backend', 'decky_loader', 'static')
+            or parts[:2] == ('frontend', 'stats.html'))
+
+
 def source_snapshot(destination: Path) -> dict[str, str]:
-    ignored = {'target', 'node_modules', '.venv', '__pycache__', 'build', 'dist', '.git'}
-
     def ignore(directory: str, names: list[str]) -> set[str]:
-        selected = ignored.intersection(names)
-        selected.update(name for name in names if name.endswith(('.pyc', '.pyo')))
-        path = Path(directory)
-        if path == REPO / 'backend':
-            selected.add('plugins')
-        if path == REPO / 'backend/decky_loader':
-            selected.add('static')
-        if path == REPO / 'frontend':
-            selected.add('stats.html')
-        return selected
+        relative = Path(directory).relative_to(REPO)
+        return {name for name in names if snapshot_excluded(relative / name)}
 
-    for name in ('backend', 'backend-rust', 'frontend'):
+    for name in SOURCE_ROOTS:
         shutil.copytree(REPO / name, destination / name, ignore=ignore)
     return {
         path.relative_to(destination).as_posix(): digest(path)
