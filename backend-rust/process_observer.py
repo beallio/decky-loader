@@ -62,7 +62,9 @@ class ProcessObserver:
         self.proc_root = proc_root
         self._tracked: dict[int, int] = {}
 
-    def snapshot(self) -> dict[int, Process]:
+    def snapshot(self, *, retained: dict[int, int] | None = None) -> dict[int, Process]:
+        if retained:
+            self._tracked.update(retained)
         records = {}
         for directory in self.proc_root.iterdir():
             if not directory.name.isdecimal():
@@ -96,11 +98,11 @@ class ProcessObserver:
 _observers: dict[str, ProcessObserver] = {}
 
 
-def cgroup_processes(control_group: str | None) -> dict[int, Process]:
+def cgroup_processes(control_group: str | None, *, retained: dict[int, int] | None = None) -> dict[int, Process]:
     if not control_group:
         return {}
     observer = _observers.get(control_group)
     if observer is None:
         observer = ProcessObserver(control_group)
         _observers[control_group] = observer
-    return observer.snapshot()
+    return observer.snapshot(retained=retained)

@@ -1,13 +1,15 @@
-"""Real-process coverage for installer service shutdown signaling."""
+"""Installer shutdown ownership, retry, and real-process signaling coverage."""
 import importlib.util
 import os
 import select
 import signal
 import subprocess
 import sys
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 
 INSTALLER_PATH = Path(__file__).with_name("install.py")
@@ -17,7 +19,7 @@ installer = importlib.util.module_from_spec(_INSTALLER_SPEC)
 sys.modules[_INSTALLER_SPEC.name] = installer
 _INSTALLER_SPEC.loader.exec_module(installer)
 
-from process_observer import read_process
+from process_observer import ProcessObserver, read_process
 
 
 class ServiceShutdownSignalTests(unittest.TestCase):
@@ -127,6 +129,60 @@ class ServiceShutdownSignalTests(unittest.TestCase):
         self._assert_ping(child)
 
         self.assertIsNone(child.poll(), "a PID with a different start_ticks identity must not be signalled")
+
+
+class ServiceShutdownRetryTests(unittest.TestCase):
+    def test_retry_keeps_zombie_ownership_after_systemd_forgets_group(self):
+        for load_state in ("loaded", "not-found"):
+            with self.subTest(load_state=load_state), tempfile.TemporaryDirectory() as temporary:
+                proc = Path(temporary)
+                unit = f"decky-stop-retry-{load_state}.service"
+                group = f"/system.slice/{unit}"
+                child = proc / "42"
+                child.mkdir()
+                fields = ["Z", "20", "42", "42"] + ["0"] * 16
+                fields[19] = "100"
+                (child / "stat").write_text("42 (held worker) " + " ".join(fields) + "\n")
+                (child / "cgroup").write_text(f"0::{group}\n")
+                observer = ProcessObserver(group, proc)
+                properties = {
+                    "LoadState": "loaded", "ActiveState": "inactive",
+                    "MainPID": "0", "ControlGroup": group,
+                }
+                clock = [0.0]
+
+                def snapshot(control_group, *, retained=None):
+                    if control_group is None:
+                        return {}
+                    processes = observer.snapshot(retained=retained)
+                    # systemd can drop the unit/group while its zombie is unreaped.
+                    properties.update(LoadState=load_state, ControlGroup="")
+                    (child / "cgroup").write_text("0::/escaped\n")
+                    return processes
+
+                def sleep(seconds):
+                    clock[0] += seconds
+
+                with (
+                    patch.object(installer, "SERVICE_STOP_DIRECTORY", proc / "stop-state"),
+                    patch.object(
+                        installer, "_ensure_directory",
+                        side_effect=lambda path, *_, **__: path.mkdir(mode=0o700, exist_ok=True),
+                    ),
+                    patch.object(installer, "_unit_properties", side_effect=lambda _: dict(properties)),
+                    patch.object(installer, "_systemctl", side_effect=AssertionError("unit is already stopped")),
+                    patch.object(installer, "cgroup_processes", side_effect=snapshot),
+                    patch.object(installer.time, "monotonic", side_effect=lambda: clock[0]),
+                    patch.object(installer.time, "sleep", side_effect=sleep),
+                ):
+                    for attempt in range(2):
+                        observer = ProcessObserver(group, proc)
+                        with self.subTest(attempt=attempt):
+                            with self.assertRaisesRegex(installer.InstallerError, r"PID 42 .*state Z"):
+                                installer.stop_service(unit)
+                    # Reaping, not another retry, makes shutdown complete.
+                    (child / "stat").unlink()
+                    installer.stop_service(unit)
 
 
 if __name__ == "__main__":

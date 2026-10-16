@@ -65,5 +65,19 @@ class ProcessObserverTests(unittest.TestCase):
                          (999, 42, 'plugin ) name\n('))
 
 
+    def test_restored_identity_rediscovers_escaped_descendants(self):
+        self.process(10, group='/escaped', ticks=100)
+        self.process(11, group='/escaped-child', ppid=10)
+        self.process(12, group='/unrelated')
+        snapshot = self.observer.snapshot(retained={10: 100})
+        self.assertEqual(set(snapshot), {10, 11})
+        self.assertEqual((snapshot[10].start_ticks, snapshot[11].ppid), (100, 10))
+
+    def test_restored_pid_epoch_does_not_claim_reused_pid_or_its_children(self):
+        self.process(10, group='/unrelated', ticks=200)
+        self.process(11, group='/unrelated', ppid=10)
+        self.assertEqual(self.observer.snapshot(retained={10: 100}), {})
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -38,6 +38,7 @@ from process_observer import Process, cgroup_processes, read_process
 KIND = 'decky-loader-runtime'
 BASELINE_TAG = 'v3.2.10'
 UNIT_DIRECTORY = Path('/etc/systemd/system')
+SERVICE_STOP_DIRECTORY = Path('/run/decky-loader-runtime-stops')
 SYSTEMCTL_CANDIDATES = (Path('/usr/bin/systemctl'), Path('/bin/systemctl'))
 DEFAULT_LISTEN = '127.0.0.1:1337'
 DEFAULT_CEF_URL = 'http://127.0.0.1:8080'
@@ -879,21 +880,69 @@ def _signal_service_processes(processes: dict[int, Process], sig: signal.Signals
 
 
 def stop_service(service_name: str) -> None:
-    """Stop one selected unit and its owned helpers without creating installer state."""
+    """Stop one selected unit, retaining ownership until its helpers have drained."""
     _, unit_filename = _normalize_service_name(service_name)
     paths = {'unit': Path(unit_filename)}
+    # Recovery can run in a new process after systemd has forgotten the unit.
+    # /run is boot-scoped; also bind saved PID epochs to the current boot.
+    _ensure_directory(SERVICE_STOP_DIRECTORY, 0o700, managed=True)
+    state_file = SERVICE_STOP_DIRECTORY / f'{unit_filename}.json'
+    boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    saved = _read_json(state_file) if _lstat_regular_or_absent(state_file) is not None else None
+    pending_groups: set[str] = set()
+    retained: dict[int, int] = {}
+    if saved is not None:
+        groups, identities = saved.get('groups'), saved.get('identities')
+        if (
+            saved.get('schema') != 1 or saved.get('service') != unit_filename
+            or not isinstance(saved.get('boot_id'), str)
+            or not isinstance(groups, list) or not all(isinstance(group, str) for group in groups)
+            or not isinstance(identities, list)
+            or not all(
+                isinstance(identity, list) and len(identity) == 2
+                and type(identity[0]) is int and identity[0] > 1
+                and type(identity[1]) is int and identity[1] >= 0
+                for identity in identities
+            )
+            or (identities and not groups)
+        ):
+            _fail(f'invalid selected-service shutdown ownership: {state_file}')
+        if saved['boot_id'] == boot_id:
+            pending_groups.update(groups)
+            retained.update(identities)
+
+    def observe() -> dict[int, Process]:
+        return {
+            pid: process
+            for group in pending_groups
+            for pid, process in cgroup_processes(group, retained=retained).items()
+        }
+
+    def remember(processes: dict[int, Process]) -> None:
+        nonlocal saved, retained
+        retained = {pid: process.start_ticks for pid, process in processes.items()}
+        state = {
+            'schema': 1, 'service': unit_filename, 'boot_id': boot_id,
+            'groups': sorted(pending_groups),
+            'identities': [[pid, ticks] for pid, ticks in sorted(retained.items())],
+        }
+        if pending_groups and state != saved:
+            _write_json(state_file, state)
+            saved = state
+
     properties = _unit_properties(paths)
-    if properties.get('LoadState') == 'not-found':
-        return
+    control_group = properties.get('ControlGroup') or None
     try:
         main_pid = int(properties.get('MainPID', '0') or '0')
     except ValueError:
         _fail(f'systemd returned an invalid MainPID for {paths["unit"].name}')
-    control_group = properties.get('ControlGroup') or None
     if main_pid > 0:
         _service_cgroup_pids(properties, main_pid)
     elif control_group:
         cgroup_processes(control_group)
+    if control_group:
+        pending_groups.add(control_group)
+    remember(observe())
     if properties.get('ActiveState') == 'failed':
         if main_pid:
             _fail(f'failed service {paths["unit"].name} still has MainPID={main_pid}')
@@ -903,7 +952,7 @@ def stop_service(service_name: str) -> None:
             main_pid = int(properties.get('MainPID', '0') or '0')
         except ValueError:
             _fail(f'systemd returned an invalid MainPID for {paths["unit"].name}')
-    if properties.get('ActiveState') != 'inactive' or main_pid > 0:
+    if properties.get('LoadState') != 'not-found' and (properties.get('ActiveState') != 'inactive' or main_pid > 0):
         _systemctl(paths, 'stop', paths['unit'].name, timeout=45)
     started = time.monotonic()
     deadline = started + 20
@@ -913,11 +962,18 @@ def stop_service(service_name: str) -> None:
     remaining: dict[int, Process] = {}
     while time.monotonic() < deadline:
         current = _unit_properties(paths)
-        control_group = current.get('ControlGroup') or control_group
+        control_group = current.get('ControlGroup')
+        if control_group:
+            pending_groups.add(control_group)
         terminal = current.get('LoadState') == 'not-found' or current.get('ActiveState') in ('inactive', 'failed')
-        remaining = cgroup_processes(control_group)
+        remaining = observe()
+        if remaining:
+            remember(remaining)
         if terminal and current.get('MainPID', '0') == '0':
             if not remaining:
+                if saved is not None:
+                    state_file.unlink()
+                    _fsync_directory(SERVICE_STOP_DIRECTORY)
                 return
             elapsed = time.monotonic() - started
             escalation = signal.SIGKILL if elapsed >= 10 else signal.SIGTERM if elapsed >= 5 else None

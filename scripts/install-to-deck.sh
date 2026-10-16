@@ -70,7 +70,10 @@ target_cleanup() {
     # Finish recovery even if closing the terminal sends another signal.
     trap '' INT TERM HUP
     if (( restart_needed )); then
-        if ! target_stop_service "$stage/bundle" "$unit"; then
+        if (( ! backup_stop_confirmed )); then
+            printf 'Error: initial selected-service shutdown was not confirmed; refusing to restart the backend. See the original process details above.\n' >&2
+            result=1
+        elif ! target_stop_service "$stage/bundle" "$unit"; then
             printf 'Error: selected-service shutdown is incomplete; refusing to start another backend. See the process details above.\n' >&2
             result=1
         elif ! systemctl start "$unit"; then
@@ -97,6 +100,7 @@ target_action() {
     local kit backup='' state fragment wd unpacked
     # EXIT can run after function locals unwind, including on a failed preflight.
     restart_needed=0
+    backup_stop_confirmed=0
     installer_started=0
     stage=$(realpath -- "$(dirname -- "${BASH_SOURCE[0]}")")
     [[ $(basename -- "$stage") == decky-runtime-deploy.???????? ]] || fail 'Invalid target staging directory'
@@ -222,6 +226,7 @@ PY
         fail "Refusing backup while selected service is $active"
     fi
     target_stop_service "$stage/bundle" "$unit"
+    backup_stop_confirmed=1
     local -a paths=()
     [[ ! -e $homebrew ]] || paths+=("${homebrew#/}")
     fragment=$(systemctl show "$unit" --property=FragmentPath --value)
