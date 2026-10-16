@@ -43,13 +43,32 @@ Rollback restores backend/service state, not the separate user-data snapshot.
 HELP
 }
 
+target_installer() {
+    local installer=$1
+    shift
+    recovery_command=(python3 -B "$installer" status --homebrew "$homebrew" --service-name "$unit")
+    recovery_log="${installer%/*}/interrupted-recovery.log"
+    installer_started=1
+    python3 -B "$installer" "$@"
+}
+
 target_cleanup() {
     local result=$?
     trap - EXIT
+    # Finish recovery even if closing the terminal sends another signal.
+    trap '' INT TERM HUP
     if (( restart_needed )); then
         if ! systemctl start "$unit"; then
             printf 'Error: could not restart the original service after backup; check %s\n' "$unit" >&2
             result=1
+        fi
+    fi
+    if (( result != 0 && installer_started )); then
+        if ! "${recovery_command[@]}" > "$recovery_log" 2>&1; then
+            result=1
+            if ! printf 'Error: interrupted deployment recovery failed; see %s\n' "$recovery_log" >&2; then
+                result=1
+            fi
         fi
     fi
     rm -rf -- "$stage"
@@ -63,6 +82,7 @@ target_action() {
     local kit backup='' state fragment wd unpacked
     # EXIT can run after function locals unwind, including on a failed preflight.
     restart_needed=0
+    installer_started=0
     stage=$(realpath -- "$(dirname -- "${BASH_SOURCE[0]}")")
     [[ $(basename -- "$stage") == decky-runtime-deploy.???????? ]] || fail 'Invalid target staging directory'
     [[ $EUID == 0 ]] || fail 'The target operation requires sudo'
@@ -84,7 +104,7 @@ target_action() {
     if [[ $action == undo || $action == status ]]; then
         [[ -f $kit/install.py && -f $kit/process_observer.py ]] || fail "No retained deployment kit at $kit; this wrapper has not installed a bundle here"
         if [[ $action == undo ]]; then action=rollback; fi
-        python3 -B "$kit/install.py" "$action" --homebrew "$homebrew" --service-name "$unit"
+        target_installer "$kit/install.py" "$action" --homebrew "$homebrew" --service-name "$unit"
         exit 0
     fi
     state=$(systemctl show "$unit" --property=LoadState --value)
@@ -223,7 +243,7 @@ PY
     done
     install -d -m 0700 -- "$kit"
     install -m 0644 -- "$stage/bundle/install.py" "$stage/bundle/process_observer.py" "$kit/"
-    python3 -B "$kit/install.py" install --bundle "$stage/bundle" --homebrew "$homebrew" \
+    target_installer "$kit/install.py" install --bundle "$stage/bundle" --homebrew "$homebrew" \
         --user "$user" --service-name "$unit" --version "$version" --worker-mode fork \
         --listen "$listen" --cef-url "$cef" --inject-frontend "$inject"
     printf 'Installation complete. Full backup retained at %s\n' "$backup"

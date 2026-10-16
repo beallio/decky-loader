@@ -183,6 +183,8 @@ bash install-to-deck.sh --undo
 
 Rollback uses small recovery tools retained under `homebrew/services/.decky-deploy`; it does not need GitHub access. It does not restore the separate user-data archive automatically. Keep that recovery directory and your backups.
 
+If an interruption occurs after the backend installer starts, the script runs its recovery before removing temporary files. This includes closing the terminal. An interrupted backup instead attempts to restart the previously running service. Use `--status` to check the service after an interruption. Installer recovery output is kept in `homebrew/services/.decky-deploy/plugin_loader.service/interrupted-recovery.log` for the default service.
+
 Use `--help` for custom paths, service names, and candidate overrides. `DECK_USER` selects the plugin account and defaults to `deck`. `--non-interactive` disables password prompts. The script stays pinned while other runtime builds are investigated.
 
 For optional deployment from another Linux computer, use `--remote HOST`, such as `bash install-to-deck.sh --remote steamdeck --check`. Remote mode requires SSH and SCP on that computer and SSH access to the Deck. `DECK_USER` also selects the SSH account, and `DECK_PORT` overrides its port. Setting `DECK_IP` no longer selects a remote target; use `--remote` explicitly.
