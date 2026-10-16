@@ -115,7 +115,13 @@ python3 scripts/runtime/validation/benchmark_vm.py --help
 
 Run these tools in a Python 3.11-or-newer environment with the backend's locked dependencies installed. The HTTP/WebSocket verifier imports `aiohttp`; a bare system Python installation may not provide it.
 
-Stage the validation scripts with their documented support inputs and fixtures. Keep captured evidence and disposable controllers in `TMPDIR`, not in the repository. The tools use uniquely owned clones, process identities, and private network namespaces rather than replacing the normal installation. Do not remove those checks to simplify a campaign.
+Stage the validation scripts with their documented support inputs and fixtures. Keep captured evidence and disposable controllers in `TMPDIR`, not in the repository. The tools have different isolation and service effects:
+
+- `benchmark_vm.py` creates uniquely owned transient services in private network namespaces. It checks that the normal installation is unchanged and does not stop or reconfigure `plugin_loader.service`.
+- `verify.py` is an HTTP/WebSocket client for the supplied `--base` URL. It creates no service or network isolation. It makes plugin calls and reloads a fixture plugin, so point it at an owned test instance rather than treating it as a read-only health check.
+- `validate_root.py --verify-only` checks the staged bundle and packaged worker without running the disruptive lifecycle test.
+
+**Warning: `validate_root.py` without `--verify-only` interrupts the normal installation.** It stops `plugin_loader.service` and its remaining tracked processes, then runs the probe on the host network at `127.0.0.1:1337`, not in a private network namespace. Cleanup attempts to restart the normal service only after the probe's processes have drained. If cleanup cannot confirm drainage, the normal service can remain stopped. Run this mode only on a disposable VM or a dedicated test system during a planned maintenance window. Check the normal service afterward; do not use this mode as a non-disruptive benchmark or routine smoke check.
 
 The benchmark's Python baseline must be the approved Python executable; never pass an installed Rust binary as the Python variant. Its standard workflow expects an installed Python baseline. If the normal installation has already changed to Rust, use an independently verified historical Python copy and a separate reviewed campaign adapter. Do not replace the normal service merely to fit the benchmark's assumptions.
 
