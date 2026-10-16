@@ -165,7 +165,7 @@ Save [install-to-deck.sh](scripts/install-to-deck.sh) on the Deck. Switch to Des
 
 The script uses Bash, curl, unzip, and the Deck's system Python. It asks for your user's sudo password when needed. If you have not set a password, run `passwd` in Konsole first. Plugins use the included Python runtime. The Deck does not need Rust, Poetry, pnpm, or pip packages.
 
-The script downloads the pinned `v3.2.10-rust.6-rc.1` bundle through [nightly.link](https://nightly.link). No GitHub account, token, or GitHub CLI is required. It checks the runtime ZIP against the pinned SHA256 before it changes the installation. CI artifacts can expire. To use a saved runtime ZIP instead, add `--bundle /path/to/decky-loader-runtime-linux-x86_64.zip`. Use the inner runtime ZIP, not the outer Actions download.
+The script downloads the pinned `v3.2.10-rust.7-rc.1` bundle through [nightly.link](https://nightly.link). Save the updated script again if you have an older copy. No GitHub account, token, or GitHub CLI is required. It checks the runtime ZIP against the pinned SHA256 before it changes the installation. CI artifacts can expire. To use a saved runtime ZIP instead, add `--bundle /path/to/decky-loader-runtime-linux-x86_64.zip`. Use the inner runtime ZIP, not the outer Actions download.
 
 Run these commands as your normal Deck user. The script requests sudo itself:
 

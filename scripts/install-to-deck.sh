@@ -10,7 +10,7 @@ show_help() {
     cat <<'HELP'
 Usage: bash install-to-deck.sh [options]
 
-Without --bundle, download the pinned v3.2.10-rust.6-rc.1 CI artifact publicly
+Without --bundle, download the pinned v3.2.10-rust.7-rc.1 CI artifact publicly
 through nightly.link. No GitHub account, token, or GitHub CLI is required.
 Run this saved script on the Deck in Desktop Mode. Local execution is the default;
 no IP address or SSH is needed. No Rust/Python build tools are needed.
@@ -19,8 +19,8 @@ The automatic download requires curl and unzip.
   --remote HOST            Deploy over SSH instead of installing on this machine
   --bundle ZIP             Use the inner runtime ZIP from a CI artifact
   --sha256 HASH            Expected runtime ZIP checksum (default: pinned RC)
-  --run-id ID              GitHub Actions run (default: 38802815038)
-  --version STRING         Expected bundle release (default: v3.2.10-rust.6-rc.1)
+  --run-id ID              GitHub Actions run (default: 38834434941)
+  --version STRING         Expected bundle release (default: v3.2.10-rust.7-rc.1)
   --check                  Verify the bundle and target without changing the service
   --status                 Report installer state using the retained offline kit
   --undo                   Run the maintained installer's rollback, without downloads
@@ -259,9 +259,9 @@ fi
 action=install
 remote_host=''
 bundle_archive=''
-expected=61b549a6d2d7f99a5d9afd6cb4575d4d3d9c4c2cb277d6e465942b7c148f425c
-version=v3.2.10-rust.6-rc.1
-run_id=38802815038
+expected=662fd6c530b1f9c7d03c580274f80680c1b4bbc880f3fba0ab7e93c462cb8348
+version=v3.2.10-rust.7-rc.1
+run_id=38834434941
 user=${DECK_USER:-deck}
 homebrew="/home/$user/homebrew"
 service=plugin_loader
