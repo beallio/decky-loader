@@ -34,7 +34,7 @@ The frontend build writes application assets to `backend/decky_loader/static/` a
 
 Use the exact Rust, Node.js, pnpm, CPython, Poetry, and PyInstaller versions in [build-config.json](../backend-rust/build-config.json) for a complete runtime build. The builder rejects a different Rust, Node.js, or pnpm version. It uses the committed Cargo, Poetry, and pnpm lockfiles.
 
-For Rust work in OMP, install `rust-analyzer` and the standard-library source for the pinned Rust toolchain. The project configuration in `.omp/lsp.json` selects `backend-rust` when OMP starts at the repository root. Reload the LSP configuration after installation. Save-triggered Cargo checks are disabled; run the checks explicitly.
+For Rust work in OMP, install `rust-analyzer` and the standard-library source for the pinned Rust toolchain, then configure the local editor to use `backend-rust`. Agent configuration and state, including `.omp/`, `.codex/`, and `.agents/`, are local files rather than project source. Add these directories to `.git/info/exclude` in each checkout; Git exclude rules are not shared between clones. Run Cargo checks explicitly before submitting changes.
 
 ## Local checks
 
