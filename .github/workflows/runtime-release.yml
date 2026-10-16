@@ -1,0 +1,73 @@
+name: Runtime Prerelease
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Rust candidate tag, for example v3.2.10-rust.7-rc.1
+        required: true
+        type: string
+      publish:
+        description: Publish an experimental prerelease (never latest or stable)
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  validate-tag:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Require a distinct Rust candidate tag
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rust\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            printf 'Use a Rust candidate tag such as v3.2.10-rust.7-rc.1\n' >&2
+            exit 1
+          fi
+
+  build:
+    needs: validate-tag
+    uses: ./.github/workflows/runtime-build.yml
+    with:
+      release_version: ${{ inputs.release_tag }}
+
+  prerelease:
+    name: Validate payload and optionally publish a prerelease
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the selected source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Download the complete runtime artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: decky-loader-runtime-linux-x86_64
+          path: ${{ runner.temp }}/runtime-release
+
+      - name: Verify release identity and every payload checksum
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/runtime-release
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          PUBLISH: ${{ inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          publish_args=()
+          if [[ "$PUBLISH" == true ]]; then
+            publish_args=(--publish)
+          fi
+          python3 backend-rust/release.py \
+            --artifact-dir "$ARTIFACT_DIR" \
+            --tag "$RELEASE_TAG" \
+            --source-commit "$SOURCE_COMMIT" \
+            --repository "$RELEASE_REPOSITORY" \
+            "${publish_args[@]}"
