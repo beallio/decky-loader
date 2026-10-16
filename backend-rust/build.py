@@ -120,9 +120,23 @@ def build(output: Path, release_version: str, python_archive: Path | None) -> di
             raise ValueError(f'locked PyInstaller version differs from build configuration: {pyinstaller_version}')
         run(['pnpm', 'install', '--frozen-lockfile'], cwd=source / 'frontend', env=environment)
         run(['pnpm', 'run', 'build'], cwd=source / 'frontend', env=environment)
-        run(['cargo', 'build', '--release', '--locked', '--manifest-path',
+        run(['cargo', 'build', '--release', '--locked', '--package', RUNTIME_NAME, '--manifest-path',
              str(source / 'backend-rust/Cargo.toml'), '--target-dir', str(work / 'cargo-target')], env=environment)
-        worker_environment['DECKY_WORKER_ONEDIR'] = '1'
+        native_environment = dict(worker_environment, PYO3_PYTHON=str(worker_python))
+        run(['cargo', 'build', '--locked', '--profile', 'native', '--package', 'decky-native-json',
+             '--features', 'extension-module', '--manifest-path', str(source / 'backend-rust/Cargo.toml'),
+             '--target-dir', str(work / 'cargo-target')], env=native_environment)
+        native_modules = work / 'native-modules'
+        native_modules.mkdir()
+        extension_suffix = capture([str(worker_python), '-c',
+                                    'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))'],
+                                   env=worker_environment)
+        native_module = native_modules / f'_decky_native_json{extension_suffix}'
+        shutil.copy2(work / 'cargo-target/native/lib_decky_native_json.so', native_module)
+        run([str(worker_python), '-m', 'unittest', 'discover', '-s',
+             str(source / 'backend-rust/native-json'), '-p', 'test_*.py'],
+            env=dict(native_environment, PYTHONPATH=str(native_modules)))
+        worker_environment.update(DECKY_WORKER_ONEDIR='1', DECKY_NATIVE_JSON_DIR=str(native_modules))
         run([str(worker_python), '-m', 'PyInstaller', '--noconfirm', '--clean', '--distpath', str(work / 'worker-dist'),
              '--workpath', str(work / 'worker-build'), str(source / 'backend/worker.spec')], env=worker_environment)
         provenance = {
@@ -132,6 +146,8 @@ def build(output: Path, release_version: str, python_archive: Path | None) -> di
             'tools': {'rustc': rust_version, 'cargo': cargo_version, 'node': node_version, 'pnpm': pnpm_version, 'pyinstaller': pyinstaller_version},
             'python_packages': json.loads(capture([str(worker_python), '-m', 'pip', 'list', '--format=json'], env=worker_environment)),
             'tool_packages': json.loads(capture([str(tools_python), '-m', 'pip', 'list', '--format=json'], env=worker_environment)),
+            'native_json': {'module': '_decky_native_json', 'sha256': digest(native_module),
+                            'abi_suffix': extension_suffix, 'system_unwind_library': 'libgcc_s.so.1'},
         }
         from prepare_bundle import prepare
         result = prepare(work / 'worker-dist/DeckyPluginWorker/DeckyPluginWorker',

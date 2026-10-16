@@ -1,0 +1,16 @@
+[package]
+name = "decky-native-json"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+publish = false
+
+[lib]
+name = "_decky_native_json"
+crate-type = ["cdylib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+pyo3 = "=0.29.3"

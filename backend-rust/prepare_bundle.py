@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -70,7 +71,9 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
     worker_packaging = 'onedir' if onedir_runtime.is_dir() else 'onefile'
     if worker_packaging == 'onedir' and not any(onedir_runtime.rglob('*')):
         raise ValueError(f'worker onedir runtime directory is empty: {onedir_runtime}')
-    runtime = json.loads(subprocess.check_output([str(worker), '--describe'], text=True, timeout=20))
+    runtime = json.loads(subprocess.check_output(
+        [str(worker), '--describe'], text=True, timeout=20,
+        env=dict(os.environ, DECKY_JSON_ENCODER='rust')))
     if not runtime['frozen'] or runtime['python'] != BUILD_CONFIG['python']['version']:
         raise ValueError('the runtime requires the pinned frozen CPython version')
     if runtime['decky_version'] != BASELINE_TAG:
@@ -78,6 +81,20 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
     helper = runtime.get('sdk_sources', {}).get('decky_loader.helpers', {})
     if helper.get('sha256') != helper_sha256 or helper.get('code_matches_source') is not True:
         raise ValueError('worker helper source/code does not match this checkout; rebuild the worker')
+    encoder = runtime.get('json_encoder', {})
+    native = encoder.get('native') if isinstance(encoder, dict) else None
+    if (not isinstance(encoder, dict) or encoder.get('selected') != 'rust' or encoder.get('default') != 'rust'
+            or not isinstance(native, dict) or native.get('module') != '_decky_native_json'
+            or native.get('version') != '0.1.0' or not native.get('sha256')):
+        raise ValueError('worker lacks the default compiled Rust JSON encoder')
+    if build_provenance is not None and build_provenance.get('native_json', {}).get('sha256') != native['sha256']:
+        raise ValueError('packaged native encoder differs from the compiled build input')
+    if worker_packaging == 'onedir':
+        native_files = list(onedir_runtime.glob('_decky_native_json*.so'))
+        if len(native_files) != 1 or digest(native_files[0]) != native['sha256']:
+            raise ValueError('worker native encoder inventory or checksum differs from its description')
+        if any(path.name == 'libgcc_s.so.1' for path in onedir_runtime.rglob('*')):
+            raise ValueError('worker must use the target system unwind library, not a bundled libgcc_s.so.1')
     subprocess.run([str(rust), '--help'], check=True, stdout=subprocess.DEVNULL, timeout=10)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.decky-private-bundle-', dir=output.parent) as temporary:

@@ -1,3 +1,8 @@
+[workspace]
+members = [".", "native-json"]
+default-members = ["."]
+resolver = "3"
+
 [package]
 name = "decky-loader-runtime"
 version = "0.1.0"
@@ -33,3 +38,8 @@ incremental = false
 
 [profile.release]
 strip = true
+
+[profile.native]
+inherits = "release"
+lto = "thin"
+

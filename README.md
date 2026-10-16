@@ -151,6 +151,8 @@ The runtime workflow fetches the SDK release tag from the upstream repository, t
 
 Python plugins still run in separate processes. A shared Python parent loads common support code, then creates a child process for each active plugin. This can share memory without putting all plugins in one interpreter.
 
+New runtime builds use a compiled JSON encoder for plugin replies and events. Plugins still run in Python and keep their normal Python JSON library. This change does not alter the existing Decky interface.
+
 Plugin startup keeps the selected plugin information and Python imports together if the installed folder is moved or replaced. Normal plugin file paths and settings locations stay the same. This check covers imports managed by the loader, not every file or helper program that a plugin opens itself. Plugins with administrator access must still be trusted.
 
 The selected-file binding stays available until the worker process exits, including shutdown callbacks and failed startup.

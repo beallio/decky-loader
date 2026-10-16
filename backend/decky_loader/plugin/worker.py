@@ -283,9 +283,68 @@ class _SdkAliasFinder(MetaPathFinder):
         return spec
 
 
+def _json_encoder_mode() -> str:
+    default = "rust" if getattr(sys, "frozen", False) else "python"
+    selected = os.environ.get("DECKY_JSON_ENCODER", default)
+    if selected not in ("python", "rust"):
+        raise WorkerError(
+            f"invalid DECKY_JSON_ENCODER value {selected!r}; expected 'python' or 'rust'"
+        )
+    return selected
+
+
+def _native_json_module(required: bool) -> ModuleType | None:
+    try:
+        native = importlib.import_module("_decky_native_json")
+    except Exception as error:
+        if required:
+            raise WorkerError(f"could not load requested native JSON encoder: {error}") from error
+        return None
+    if not callable(getattr(native, "dumps", None)):
+        if required:
+            raise WorkerError("requested native JSON encoder does not export callable dumps")
+        return None
+    if not isinstance(getattr(native, "__version__", None), str):
+        if required:
+            raise WorkerError("requested native JSON encoder does not export a string __version__")
+        return None
+    return native
+
+def _json_encoder_description() -> dict[str, Any]:
+    selected = _json_encoder_mode()
+    default = "rust" if getattr(sys, "frozen", False) else "python"
+    required = selected == "rust" or bool(getattr(sys, "frozen", False))
+    native = _native_json_module(required=required)
+    native_info: dict[str, Any] | None = None
+    if native is not None:
+        module_path = getattr(native, "__file__", None)
+        if not isinstance(module_path, str):
+            if required:
+                raise WorkerError("requested native JSON encoder has no module file")
+        else:
+            try:
+                digest = hashlib.sha256(Path(module_path).read_bytes()).hexdigest()
+            except OSError as error:
+                if required:
+                    raise WorkerError(f"could not hash requested native JSON encoder: {error}") from error
+            else:
+                native_info = {
+                    "module": "_decky_native_json",
+                    "version": getattr(native, "__version__", None),
+                    "sha256": digest,
+                }
+    return {
+        "selected": selected,
+        "default": default,
+        "native": native_info,
+        "system_unwind_library": "libgcc_s.so.1",
+    }
+
+
 def prepare_runtime(bootstrap: str) -> None:
     if bootstrap in _prepared_bootstraps:
         return
+    selected = _json_encoder_mode()
     if bootstrap == "full":
         importlib.import_module("decky_loader.main")
     elif bootstrap == "lean":
@@ -298,7 +357,14 @@ def prepare_runtime(bootstrap: str) -> None:
     else:
         raise WorkerError(f"unknown worker bootstrap: {bootstrap}")
     importlib.import_module("decky_loader.localplatform.localsocket")
-    importlib.import_module("decky_loader.plugin.sandboxed_plugin")
+    from decky_loader.plugin import sandboxed_plugin
+    if selected == "rust":
+        native = _native_json_module(required=True)
+        if native is None:
+            raise WorkerError("requested native JSON encoder is unavailable")
+        sandboxed_plugin.dumps = native.dumps
+    else:
+        sandboxed_plugin.dumps = json.dumps
     auth_token = os.environ.get("DECKY_AUTH_TOKEN")
     if auth_token is not None:
         from decky_loader import helpers
@@ -333,6 +399,7 @@ def _helper_source_description() -> dict[str, Any]:
 def _runtime_description() -> dict[str, Any]:
     from decky_loader.helpers import get_loader_version
 
+    encoder_description = _json_encoder_description()
     return {
         "python": platform.python_version(),
         "abi": sysconfig.get_config_var("SOABI") or sys.implementation.cache_tag,
@@ -341,6 +408,7 @@ def _runtime_description() -> dict[str, Any]:
         "executable": sys.executable,
         "decky_version": get_loader_version(),
         "sdk_sources": {"decky_loader.helpers": _helper_source_description()},
+        "json_encoder": encoder_description,
     }
 
 
@@ -742,7 +810,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _argument_parser()
     args = parser.parse_args(argv)
     if args.describe:
-        print(json.dumps(_runtime_description(), ensure_ascii=False, separators=(",", ":")))
+        try:
+            print(json.dumps(_runtime_description(), ensure_ascii=False, separators=(",", ":")))
+        except Exception as error:
+            print(f"DeckyPluginWorker: {error}", file=sys.stderr)
+            return 1
         return 0
 
     _required_arguments(parser, args)

@@ -5,8 +5,18 @@ from PyInstaller.building.api import COLLECT, EXE, PYZ
 from PyInstaller.building.build_main import Analysis
 from PyInstaller.utils.hooks import collect_all, collect_submodules, copy_metadata
 
-
 backend_root = os.path.dirname(os.path.abspath(SPEC))
+native_json_dir = os.environ.get("DECKY_NATIVE_JSON_DIR")
+if not native_json_dir:
+    raise RuntimeError("DECKY_NATIVE_JSON_DIR is required to build the frozen worker")
+native_json_path = Path(native_json_dir).resolve()
+native_json_extensions = sorted(native_json_path.glob("_decky_native_json*"))
+if not native_json_path.is_dir() or not any(
+    path.is_file() and path.suffix == ".so" for path in native_json_extensions
+):
+    raise RuntimeError(
+        f"DECKY_NATIVE_JSON_DIR does not contain the compiled _decky_native_json module: {native_json_path}"
+    )
 runtime_packages = (
     "aiohttp",
     "aiohttp_cors",
@@ -38,6 +48,7 @@ hiddenimports = [
     "importlib.machinery",
     "importlib.metadata",
     "importlib.resources",
+    "_decky_native_json",
     "sysconfig",
 ]
 
@@ -77,11 +88,19 @@ datas += copy_metadata("decky_loader")
 
 a = Analysis(
     [os.path.join(backend_root, "worker_main.py")],
-    pathex=[backend_root],
+    pathex=[backend_root, str(native_json_path)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
 )
+
+# Use the target system's unwind library, not a bundled build-host copy.
+a.binaries = [
+    entry
+    for entry in a.binaries
+    if Path(entry[0]).name != "libgcc_s.so.1"
+    and Path(entry[1]).name != "libgcc_s.so.1"
+]
 pyz = PYZ(a.pure, a.zipped_data)
 
 onedir = os.environ.get("DECKY_WORKER_ONEDIR") == "1"

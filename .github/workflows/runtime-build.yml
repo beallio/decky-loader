@@ -73,9 +73,12 @@ jobs:
 
       - name: Check the runtime and installer
         working-directory: backend-rust
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.config.outputs.rust }}
         run: |
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked
+          cargo fmt --all --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace
           python3 -m unittest discover -s . -p 'test_*.py'
 
       - name: Build the complete pinned candidate
