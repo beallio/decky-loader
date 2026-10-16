@@ -30,7 +30,7 @@ tokio-tungstenite = "0.29"
 tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }
 unicode-casefold = "0.2"
-zip = { version = "9.0.2", default-features = false, features = ["deflate-flate2-zlib-rs", "bzip2", "lzma"] }
+zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2-zlib-rs", "bzip2", "lzma"] }
 
 [profile.dev]
 debug = 0
