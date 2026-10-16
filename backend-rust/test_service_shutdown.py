@@ -133,8 +133,10 @@ class ServiceShutdownSignalTests(unittest.TestCase):
 
 class ServiceShutdownRetryTests(unittest.TestCase):
     def test_retry_keeps_zombie_ownership_after_systemd_forgets_group(self):
-        for load_state in ("loaded", "not-found"):
-            with self.subTest(load_state=load_state), tempfile.TemporaryDirectory() as temporary:
+        for load_state, validation_failure in (
+            ("loaded", False), ("not-found", False), ("loaded", True), ("not-found", True),
+        ):
+            with self.subTest(load_state=load_state, validation_failure=validation_failure), tempfile.TemporaryDirectory() as temporary:
                 proc = Path(temporary)
                 unit = f"decky-stop-retry-{load_state}.service"
                 group = f"/system.slice/{unit}"
@@ -146,8 +148,8 @@ class ServiceShutdownRetryTests(unittest.TestCase):
                 (child / "cgroup").write_text(f"0::{group}\n")
                 observer = ProcessObserver(group, proc)
                 properties = {
-                    "LoadState": "loaded", "ActiveState": "inactive",
-                    "MainPID": "0", "ControlGroup": group,
+                    "LoadState": "loaded", "ActiveState": "active" if validation_failure else "inactive",
+                    "MainPID": "99" if validation_failure else "0", "ControlGroup": group,
                 }
                 clock = [0.0]
 
@@ -156,12 +158,16 @@ class ServiceShutdownRetryTests(unittest.TestCase):
                         return {}
                     processes = observer.snapshot(retained=retained)
                     # systemd can drop the unit/group while its zombie is unreaped.
-                    properties.update(LoadState=load_state, ControlGroup="")
+                    properties.update(LoadState=load_state, ActiveState="inactive", MainPID="0", ControlGroup="")
                     (child / "cgroup").write_text("0::/escaped\n")
                     return processes
 
                 def sleep(seconds):
                     clock[0] += seconds
+
+                def main_disappeared(*_):
+                    snapshot(group)
+                    raise installer.InstallerError("selected main disappeared during validation")
 
                 with (
                     patch.object(installer, "SERVICE_STOP_DIRECTORY", proc / "stop-state"),
@@ -172,14 +178,17 @@ class ServiceShutdownRetryTests(unittest.TestCase):
                     patch.object(installer, "_unit_properties", side_effect=lambda _: dict(properties)),
                     patch.object(installer, "_systemctl", side_effect=AssertionError("unit is already stopped")),
                     patch.object(installer, "cgroup_processes", side_effect=snapshot),
+                    patch.object(installer, "_service_cgroup_pids", side_effect=main_disappeared),
                     patch.object(installer.time, "monotonic", side_effect=lambda: clock[0]),
                     patch.object(installer.time, "sleep", side_effect=sleep),
                 ):
                     for attempt in range(2):
                         observer = ProcessObserver(group, proc)
                         with self.subTest(attempt=attempt):
-                            with self.assertRaisesRegex(installer.InstallerError, r"PID 42 .*state Z"):
+                            with self.assertRaises(installer.InstallerError) as refused:
                                 installer.stop_service(unit)
+                            if attempt or not validation_failure:
+                                self.assertRegex(str(refused.exception), r"PID 42 .*state Z")
                     # Reaping, not another retry, makes shutdown complete.
                     (child / "stat").unlink()
                     installer.stop_service(unit)

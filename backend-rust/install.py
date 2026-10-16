@@ -936,13 +936,11 @@ def stop_service(service_name: str) -> None:
         main_pid = int(properties.get('MainPID', '0') or '0')
     except ValueError:
         _fail(f'systemd returned an invalid MainPID for {paths["unit"].name}')
-    if main_pid > 0:
-        _service_cgroup_pids(properties, main_pid)
-    elif control_group:
-        cgroup_processes(control_group)
     if control_group:
         pending_groups.add(control_group)
     remember(observe())
+    if main_pid > 0:
+        _service_cgroup_pids(properties, main_pid)
     if properties.get('ActiveState') == 'failed':
         if main_pid:
             _fail(f'failed service {paths["unit"].name} still has MainPID={main_pid}')
