@@ -32,7 +32,7 @@ import uuid
 # Importing installer helpers must not add unlisted files to a checksummed bundle.
 sys.dont_write_bytecode = True
 
-from process_observer import cgroup_processes
+from process_observer import Process, cgroup_processes, read_process
 
 
 KIND = 'decky-loader-runtime'
@@ -854,7 +854,34 @@ def _stage_bytes(data: bytes, directory: Path, prefix: str, mode: int = 0o644) -
         raise
 
 
-def _stop_service(paths: dict[str, Path]) -> None:
+def _signal_service_processes(processes: dict[int, Process], sig: signal.Signals) -> None:
+    if any(process.pid <= 1 or process.pid == os.getpid() for process in processes.values()):
+        _fail('refusing to signal PID 1 or the installer itself')
+    for process in processes.values():
+        if process.state == 'Z':
+            continue
+        try:
+            descriptor = os.pidfd_open(process.pid)
+        except ProcessLookupError:
+            continue
+        except OSError as error:
+            raise InstallerError(f'cannot safely open remaining service PID {process.pid}: {error}') from error
+        try:
+            current = read_process(process.pid)
+            if current is not None and current.start_ticks == process.start_ticks:
+                signal.pidfd_send_signal(descriptor, sig)
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            raise InstallerError(f'cannot safely signal remaining service PID {process.pid}: {error}') from error
+        finally:
+            os.close(descriptor)
+
+
+def stop_service(service_name: str) -> None:
+    """Stop one selected unit and its owned helpers without creating installer state."""
+    _, unit_filename = _normalize_service_name(service_name)
+    paths = {'unit': Path(unit_filename)}
     properties = _unit_properties(paths)
     if properties.get('LoadState') == 'not-found':
         return
@@ -878,15 +905,51 @@ def _stop_service(paths: dict[str, Path]) -> None:
             _fail(f'systemd returned an invalid MainPID for {paths["unit"].name}')
     if properties.get('ActiveState') != 'inactive' or main_pid > 0:
         _systemctl(paths, 'stop', paths['unit'].name, timeout=45)
-    deadline = time.monotonic() + 20
+    started = time.monotonic()
+    deadline = started + 20
+    signalled: dict[signal.Signals, set[tuple[int, int]]] = {
+        signal.SIGTERM: set(), signal.SIGKILL: set(),
+    }
+    remaining: dict[int, Process] = {}
     while time.monotonic() < deadline:
         current = _unit_properties(paths)
         control_group = current.get('ControlGroup') or control_group
         terminal = current.get('LoadState') == 'not-found' or current.get('ActiveState') in ('inactive', 'failed')
-        if terminal and current.get('MainPID', '0') == '0' and not cgroup_processes(control_group):
-            return
+        remaining = cgroup_processes(control_group)
+        if terminal and current.get('MainPID', '0') == '0':
+            if not remaining:
+                return
+            elapsed = time.monotonic() - started
+            escalation = signal.SIGKILL if elapsed >= 10 else signal.SIGTERM if elapsed >= 5 else None
+            if escalation is not None:
+                targets = {
+                    pid: process for pid, process in remaining.items()
+                    if process.state != 'Z'
+                    and (pid, process.start_ticks) not in signalled[escalation]
+                }
+                if targets:
+                    details = ', '.join(
+                        f'PID {pid} ({process.comm!r}, state {process.state})'
+                        for pid, process in targets.items()
+                    )
+                    print(
+                        f'{unit_filename}: main process stopped; sending {escalation.name} '
+                        f'to remaining owned helpers: {details}',
+                        file=sys.stderr, flush=True,
+                    )
+                    _signal_service_processes(targets, escalation)
+                    signalled[escalation].update(
+                        (pid, process.start_ticks) for pid, process in targets.items()
+                    )
         time.sleep(0.2)
-    _fail(f'selected service {paths["unit"].name} did not stop cleanly')
+    details = ', '.join(
+        f'PID {pid} ({process.comm!r}, state {process.state}, parent {process.ppid})'
+        for pid, process in remaining.items()
+    )
+    _fail(
+        f'selected service {unit_filename} did not stop cleanly; '
+        f'remaining owned processes: {details or "none"}; backup or activation cancelled'
+    )
 
 
 def _set_enabled(paths: dict[str, Path], activation: dict[str, object]) -> None:
@@ -1262,7 +1325,7 @@ def _apply_activation(paths: dict[str, Path], activation: dict[str, object], che
         if check_running:
             _health(paths)
     else:
-        _stop_service(paths)
+        stop_service(paths['unit'].name)
 
 
 def _configured_listen(paths: dict[str, Path]) -> str:
@@ -1392,7 +1455,7 @@ def _validate_snapshot(transaction: Path, record: dict[str, Any]) -> None:
 def _restore_transaction(paths: dict[str, Path], transaction_id: str, record: dict[str, Any], activation: dict[str, Any]) -> None:
     transaction = paths['history'] / transaction_id
     _validate_snapshot(transaction, record)
-    _stop_service(paths)
+    stop_service(paths['unit'].name)
     files = record['files']
     assert isinstance(files, dict)
     for key, target in _record_paths(paths).items():
@@ -1513,7 +1576,7 @@ def _begin_journal(paths: dict[str, Path], transaction_id: str, operation: str, 
 
 def _activate_stages(paths: dict[str, Path], journal: dict[str, object], activation: dict[str, object], listen: str, reload_unit: bool, runtime_stage: Path | None = None, runtime_final: Path | None = None, binary_stage: Path | None = None, unit_stage: Path | None = None, active_stage: Path | None = None) -> None:
     _write_journal(paths, {**journal, 'phase': 'activating'})
-    _stop_service(paths)
+    stop_service(paths['unit'].name)
     if runtime_stage is not None and runtime_final is not None:
         if runtime_final.exists():
             _fail(f'runtime destination already exists: {runtime_final}')
@@ -1538,7 +1601,7 @@ def _activate_stages(paths: dict[str, Path], journal: dict[str, object], activat
     _wait_running(paths)
     _health(paths, listen)
     if not activation.get('running'):
-        _stop_service(paths)
+        stop_service(paths['unit'].name)
         _wait_stopped(paths)
     else:
         final = _unit_properties(paths)
@@ -1688,7 +1751,7 @@ def _run_rollback(args: argparse.Namespace) -> dict[str, object]:
     _write_journal(paths, journal)
     try:
         _write_journal(paths, {**journal, 'phase': 'activating'})
-        _stop_service(paths)
+        stop_service(paths['unit'].name)
         target_directory = paths['history'] / target_id
         for key, target in _record_paths(paths).items():
             state = target_files[key]

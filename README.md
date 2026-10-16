@@ -177,6 +177,8 @@ bash install-to-deck.sh --status
 
 `--check` verifies the bundle and basic target requirements without stopping the service or changing the installation. Installation briefly stops the selected service to make a full backup of homebrew and its service configuration, then restores its running state before the maintained installer takes over. Backups stay outside homebrew, in the sibling `decky-runtime-backups` directory by default. Use `--backup-dir` to choose another location with enough space.
 
+The maintained installer lets the main process stop first. If helper processes remain, it stops only processes tracked as part of the selected service. If they do not exit, installation stops and reports their PIDs. It does not continue while those processes can still change files.
+
 Space checks cover temporary files, the installed runtime, and the full backup. The check adds these requirements together when they share a storage volume. It checks separate volumes independently, including a separate volume mounted at `homebrew/services`. If space is too low, the script stops before it changes the service or creates a backup.
 
 To restore the previous backend and service configuration:
