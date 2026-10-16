@@ -9,7 +9,9 @@ import tempfile
 import unittest
 import zipfile
 
-sys.path.insert(0, str(Path(__file__).parent))
+REPO_ROOT = Path(__file__).resolve().parents[2]
+RUNTIME_TOOLS_PATH = REPO_ROOT / "scripts" / "runtime"
+sys.path.insert(0, str(RUNTIME_TOOLS_PATH))
 import release
 
 

@@ -20,8 +20,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-WORKER_PATH = Path(__file__).parents[1] / "backend" / "decky_loader" / "plugin" / "worker.py"
-SANDBOX_PATH = Path(__file__).parents[1] / "backend" / "decky_loader" / "plugin" / "sandboxed_plugin.py"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WORKER_PATH = REPO_ROOT / "backend" / "decky_loader" / "plugin" / "worker.py"
+SANDBOX_PATH = REPO_ROOT / "backend" / "decky_loader" / "plugin" / "sandboxed_plugin.py"
 WORKER_SPEC = importlib.util.spec_from_file_location("decky_worker_imports_test", WORKER_PATH)
 assert WORKER_SPEC is not None and WORKER_SPEC.loader is not None
 worker = importlib.util.module_from_spec(WORKER_SPEC)

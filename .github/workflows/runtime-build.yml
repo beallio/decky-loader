@@ -79,11 +79,15 @@ jobs:
           cargo fmt --all --check
           cargo clippy --locked --workspace --all-targets -- -D warnings
           cargo test --locked --workspace
-          python3 -m unittest discover -s . -p 'test_*.py'
+
+      - name: Check runtime and installer regression tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s tests/runtime -p 'test_*.py'
 
       - name: Build the complete pinned candidate
         run: |
-          python3 backend-rust/build.py \
+          python3 scripts/runtime/build.py \
             --release-version "$CANDIDATE_VERSION" \
             --output "$RUNNER_TEMP/decky-runtime"
 

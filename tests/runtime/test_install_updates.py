@@ -13,7 +13,8 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-INSTALLER_PATH = Path(__file__).with_name("install.py")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+INSTALLER_PATH = REPO_ROOT / "backend-rust" / "install.py"
 sys.path.insert(0, str(INSTALLER_PATH.parent))
 _INSTALLER_SPEC = importlib.util.spec_from_file_location("rust_runtime_installer", INSTALLER_PATH)
 installer = importlib.util.module_from_spec(_INSTALLER_SPEC)

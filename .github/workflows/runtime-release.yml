@@ -65,7 +65,7 @@ jobs:
           if [[ "$PUBLISH" == true ]]; then
             publish_args=(--publish)
           fi
-          python3 backend-rust/release.py \
+          python3 scripts/runtime/release.py \
             --artifact-dir "$ARTIFACT_DIR" \
             --tag "$RELEASE_TAG" \
             --source-commit "$SOURCE_COMMIT" \

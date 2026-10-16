@@ -25,6 +25,11 @@ import traceback
 import uuid
 from urllib.parse import quote
 
+_VALIDATION_DIR = Path(__file__).resolve().parent
+_OBSERVER_DIR = (_VALIDATION_DIR if (_VALIDATION_DIR / 'process_observer.py').is_file()
+                 else _VALIDATION_DIR.parents[2] / 'backend-rust')
+if not sys.path or sys.path[0] != str(_OBSERVER_DIR):
+    sys.path.insert(0, str(_OBSERVER_DIR))
 from process_observer import cgroup_processes
 
 HOME_BREW = Path('/home/deck/homebrew')
@@ -1853,7 +1858,7 @@ def prepare_inputs(args: argparse.Namespace, work_root: Path) -> dict[str, objec
 def run_benchmark(args: argparse.Namespace) -> int:
     if os.geteuid() != 0:
         raise BenchmarkError('run this harness as root so transient cgroups and namespace clients are owned safely')
-    repository_root = Path(__file__).resolve().parents[1]
+    repository_root = Path(__file__).resolve().parents[3]
     output = ensure_output_directory(Path(args.output), repository_root)
     if not (CGROUP_ROOT / 'cgroup.controllers').is_file():
         raise BenchmarkError('benchmark requires the systemd cgroup v2 hierarchy')

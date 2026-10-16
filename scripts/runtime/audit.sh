@@ -2,6 +2,8 @@
 set -euo pipefail
 
 DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd -- "$DIR/../.." && pwd)"
+RUST_DIR="$REPO/backend-rust"
 : "${RUSTSEC_ADVISORY_DB:?Set RUSTSEC_ADVISORY_DB to a fresh clone of https://github.com/RustSec/advisory-db}"
 
 for tool in cargo cargo-audit cargo-deny cargo-machete git; do
@@ -21,7 +23,7 @@ cargo deny --version
 cargo machete --version
 
 # Fetch locked sources for provenance and dependency inspection without building them.
-cargo fetch --locked --manifest-path "$DIR/Cargo.toml"
+cargo fetch --locked --manifest-path "$RUST_DIR/Cargo.toml"
 failed=0
 check() {
     printf '\nChecking: %s\n' "$1"
@@ -34,15 +36,15 @@ check() {
 }
 
 check 'RustSec vulnerabilities, unmaintained crates, and warnings' \
-    cargo audit --file "$DIR/Cargo.lock" --db "$RUSTSEC_ADVISORY_DB" --no-fetch --deny warnings
+    cargo audit --file "$RUST_DIR/Cargo.lock" --db "$RUSTSEC_ADVISORY_DB" --no-fetch --deny warnings
 check 'Source provenance, wildcard versions, and duplicate versions' \
-    cargo deny --locked --offline --manifest-path "$DIR/Cargo.toml" --config "$DIR/deny.toml" \
+    cargo deny --locked --offline --manifest-path "$RUST_DIR/Cargo.toml" --config "$RUST_DIR/deny.toml" \
         check sources bans --show-stats
-check 'Unused direct dependencies' cargo machete "$DIR"
+check 'Unused direct dependencies' cargo machete "$RUST_DIR"
 
 # License findings remain visible, but are not a gate for this private experiment.
 printf '\nLicense inventory (informational, not a validation gate)\n'
-if ! cargo deny --locked --offline --manifest-path "$DIR/Cargo.toml" --config "$DIR/deny.toml" \
+if ! cargo deny --locked --offline --manifest-path "$RUST_DIR/Cargo.toml" --config "$RUST_DIR/deny.toml" \
     check licenses --show-stats; then
     printf 'License findings recorded; continuing under the private-test policy.\n'
 fi

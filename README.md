@@ -104,60 +104,13 @@ There is no complete plugin development documentation yet. However a good starti
 
 ### 🤝 Contributing
 
-Please consult [the wiki page regarding development](https://wiki.deckbrew.xyz/en/loader-dev/development) for more information on installing development versions of Decky Loader. You can also install the Steam Deck UI on a Windows or Linux computer for testing by following [this YouTube guide](https://youtu.be/1IAbZte8e7E?t=112).
+See the [development guide](docs/development.md) for the repository layout, build commands, tests, dependency checks, and validation tools. The [upstream development wiki](https://wiki.deckbrew.xyz/en/loader-dev/development) has more information about contributing to Decky Loader.
 
-For Rust work in OMP, install `rust-analyzer` and the standard-library source for the pinned Rust 1.98.1 toolchain. The project configuration in `.omp/lsp.json` selects `backend-rust` when OMP starts at the repository root. Reload the LSP configuration after installation. Save-triggered Cargo checks are disabled; run the build and checks before submitting changes.
+### Experimental Rust runtime
 
-1. Clone the repository using the latest commit to main before starting your PR.
-1. In your clone of the repository, run these commands.
-   ```bash
-   cd frontend
-   pnpm i # NOTE: you may need to approve esbuild's build script with pnpm approve-builds
-   pnpm run build
-   ```
-1. If you are modifying the UI, these commands will need to be run before deploying the changes to your Steam Deck.
-1. Use the VS Code tasks or `deck.sh` script to deploy your changes to your Steam Deck to test them.
-1. You will be testing your changes with the Python script version. You will need to build, deploy, and reload each time.
+The experimental Rust version keeps the existing Decky interface and Python plugins. It is not the default public release. You do not need to build it yourself to use the pinned trial installer below.
 
-⚠️ If you are recieving build errors due to an out of date library, you should run this command inside of your repository.
-
-```bash
-pnpm update @decky/ui --latest
-```
-
-Source control and deploying plugins are left to each respective contributor for the cloned repos in order to keep dependencies up to date.
-
-### Private Rust runtime
-
-The [Rust backend](backend-rust) keeps Python plugins and the existing Decky interface. It is a private candidate, not the default public release. Physical Steam Deck and full Steam interface checks remain deferred. Building it does not change an installed copy of Decky Loader.
-
-The `Runtime Builder` workflow checks dependencies and builds a complete Linux x86-64 bundle. Its artifact contains an installable ZIP, `SHA256SUMS`, and a build record. The ZIP contains the Rust backend, Python launcher and workers, Python plugin support code, interface files, installer, and file checksums. The existing public Python release workflow is unchanged; the runtime workflow does not publish a release.
-
-The separate `Runtime Prerelease` workflow prepares a tagged test build and verifies its source, version, complete file lists, and every payload checksum. It publishes nothing by default. A maintainer must select publication explicitly to create a prerelease with lasting ZIP, checksum, and build-record downloads. Publication must use a separate experimental repository, not the official Python release feed. An existing tag must match the build's exact source commit. The workflow never marks the prerelease as the latest stable release. The Deck installer stays pinned to its selected trial build; preparing or publishing another candidate does not change it.
-
-To build locally, install the GitHub CLI and the Rust, Node.js, and pnpm versions listed in [build-config.json](backend-rust/build-config.json). The build downloads a checksum-verified CPython archive and installs Python dependencies in temporary environments. It uses the committed Cargo, Poetry, and pnpm lockfiles.
-
-```sh
-python3 backend-rust/build.py \
-  --release-version dev \
-  --output "${TMPDIR:-/var/tmp/omp-1000}/decky-runtime"
-```
-
-Choose an output directory that does not already exist. The output includes `bundle/`, an installable ZIP, `SHA256SUMS`, and `build-result.json`. The bundle manifest records source hashes, tool versions, package versions, and the separate Rust release identity. These records support repeatable builds; they do not promise byte-for-byte identical binaries on different build hosts.
-
-The Python plugin support code and interface remain based on `v3.2.10`. Bundle assembly verifies that baseline, records the startup changes, and checks the packaged helper code against its source. The Rust release identity is separate; `dev` builds do not offer updates.
-
-The runtime workflow fetches the SDK release tag from the upstream repository, then verifies its pinned commit and source hashes. A fork does not need its own copy of that tag.
-
-Python plugins still run in separate processes. A shared Python parent loads common support code, then creates a child process for each active plugin. This can share memory without putting all plugins in one interpreter.
-
-New runtime builds use a compiled JSON encoder for plugin replies and events. Plugins still run in Python and keep their normal Python JSON library. This change does not alter the existing Decky interface.
-
-Plugin startup keeps the selected plugin information and Python imports together if the installed folder is moved or replaced. Normal plugin file paths and settings locations stay the same. This check covers imports managed by the loader, not every file or helper program that a plugin opens itself. Plugins with administrator access must still be trusted.
-
-The selected-file binding stays available until the worker process exits, including shutdown callbacks and failed startup.
-
-The [installer](backend-rust/install.py) supports new installs, replacement of an existing install, and rollback. A failed activation restores the previous backend and service file once the selected service's processes have stopped. User plugins, settings, and data remain in place. Use its `--help` before installing a private candidate.
+Build instructions and implementation details are in the [development guide](docs/development.md).
 
 #### Install the private candidate on the Deck
 
@@ -200,9 +153,6 @@ Use `--help` for custom paths, service names, and candidate overrides. `DECK_USE
 For optional deployment from another Linux computer, use `--remote HOST`, such as `bash install-to-deck.sh --remote steamdeck --check`. Remote mode requires SSH and SCP on that computer and SSH access to the Deck. `DECK_USER` also selects the SSH account, and `DECK_PORT` overrides its port. Setting `DECK_IP` no longer selects a remote target; use `--remote` explicitly.
 
 After installation, open Decky in Gaming Mode. Open each plugin and use its main function. Check that settings persist after a plugin reload and after a reboot. Check suspend and resume. Keep the pinned candidate and backups until these checks pass on your Deck. If the interface or plugins fail, use `--undo` and check the previous installation again.
-
-
-The [dependency audit](backend-rust/audit.sh) must pass security, source, and dependency-use checks. The [VM validation tools](backend-rust/benchmark_vm.py) use owned clones rather than replacing the normal installation. Their results do not establish compatibility with every third-party plugin or replace physical Steam Deck testing.
 
 ## 📜 Credits
 

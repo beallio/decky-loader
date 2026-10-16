@@ -17,6 +17,11 @@ import time
 import uuid
 import urllib.request
 
+_VALIDATION_DIR = Path(__file__).resolve().parent
+_OBSERVER_DIR = (_VALIDATION_DIR if (_VALIDATION_DIR / 'process_observer.py').is_file()
+                 else _VALIDATION_DIR.parents[2] / 'backend-rust')
+if not sys.path or sys.path[0] != str(_OBSERVER_DIR):
+    sys.path.insert(0, str(_OBSERVER_DIR))
 from process_observer import cgroup_processes
 
 BASE = Path('/home/deck/.local/share/decky-loader-runtime')

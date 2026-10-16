@@ -137,7 +137,7 @@ def validate(directory: Path, tag: str, source_commit: str) -> dict[str, object]
         if not isinstance(name, str) or any(ord(char) < 32 for char in name):
             raise ValueError('invalid build-source path')
         path = PurePosixPath(name)
-        if (not path.parts or path.parts[0] not in ('backend', 'backend-rust', 'frontend')
+        if (not path.parts or not any(name.startswith(f'{root}/') for root in SOURCE_ROOTS)
                 or '..' in path.parts or path.as_posix() != name):
             raise ValueError('unsupported build-source path: ' + name)
         original = subprocess.check_output(['git', 'show', f'{source_commit}:{name}'], cwd=REPO)

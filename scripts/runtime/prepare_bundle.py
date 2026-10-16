@@ -20,8 +20,9 @@ import subprocess
 import tempfile
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parent
-BUILD_CONFIG = json.loads((HERE / 'build-config.json').read_text())
+REPO = HERE.parents[1]
+BACKEND_RUST = REPO / 'backend-rust'
+BUILD_CONFIG = json.loads((BACKEND_RUST / 'build-config.json').read_text())
 BASELINE_TAG = BUILD_CONFIG['sdk']['tag']
 SDK_OVERLAYS = (
     'backend/decky_loader/plugin/worker.py',
@@ -109,8 +110,8 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
             for path in (bundle / '_internal').rglob('*'):
                 path.chmod(0o755)
         shutil.copy2(rust, bundle / 'decky-loader-runtime')
-        shutil.copy2(HERE / 'install.py', bundle / 'install.py')
-        shutil.copy2(HERE / 'process_observer.py', bundle / 'process_observer.py')
+        shutil.copy2(BACKEND_RUST / 'install.py', bundle / 'install.py')
+        shutil.copy2(BACKEND_RUST / 'process_observer.py', bundle / 'process_observer.py')
         shutil.copytree(assets, bundle / 'assets')
         shutil.copytree(locales, bundle / 'locales')
         manifest = {
@@ -123,7 +124,7 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
             'runtime': runtime,
             'source_baseline': source_baseline,
             'sdk_overlays': {path: digest(REPO / path) for path in SDK_OVERLAYS},
-            'cargo_lock_sha256': digest(HERE / 'Cargo.lock'),
+            'cargo_lock_sha256': digest(BACKEND_RUST / 'Cargo.lock'),
             'build': build_provenance,
             'sha256': {path.relative_to(bundle).as_posix(): digest(path) for path in sorted(bundle.rglob('*')) if path.is_file()},
         }
@@ -135,16 +136,16 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
         ):
             plugin = fixtures / directory
             (plugin / 'dist').mkdir(parents=True)
-            shutil.copy2(HERE / 'fixtures/main.py', plugin / 'main.py')
-            shutil.copy2(HERE / 'fixtures' / frontend, plugin / 'dist/index.js')
+            shutil.copy2(REPO / 'tests/fixtures/runtime/main.py', plugin / 'main.py')
+            shutil.copy2(REPO / 'tests/fixtures/runtime' / frontend, plugin / 'dist/index.js')
             (plugin / 'plugin.json').write_text(json.dumps({'name': name, 'author': 'Private compatibility proof', 'api_version': api_version, 'flags': []}))
             package = {'name': directory.lower(), 'version': '0.0.0'}
             if api_version:
                 package['type'] = 'module'
             (plugin / 'package.json').write_text(json.dumps(package))
         for script in ('verify.py', 'validate_root.py'):
-            shutil.copy2(HERE / script, staging / script)
-        shutil.copy2(HERE / 'process_observer.py', staging / 'process_observer.py')
+            shutil.copy2(HERE / 'validation' / script, staging / script)
+        shutil.copy2(BACKEND_RUST / 'process_observer.py', staging / 'process_observer.py')
         staging.rename(output)
     return {'output': str(output), 'files': len(manifest['sha256']), 'runtime': runtime, 'source_baseline': source_baseline, 'private_only': True}
 

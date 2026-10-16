@@ -1,7 +1,11 @@
 """Ownership boundaries for the Linux process observer."""
+import sys
 import tempfile
 from pathlib import Path
 import unittest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "backend-rust"))
 
 from process_observer import ProcessObserver
 

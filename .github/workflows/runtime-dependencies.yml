@@ -32,5 +32,4 @@ jobs:
         run: gh repo clone RustSec/advisory-db "$RUSTSEC_ADVISORY_DB" -- --depth 1
 
       - name: Check the complete locked dependency graph
-        working-directory: backend-rust
-        run: ./audit.sh
+        run: scripts/runtime/audit.sh

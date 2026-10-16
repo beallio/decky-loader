@@ -2,7 +2,7 @@
 """Build the complete Linux x86-64 runtime bundle without installing it.
 
 Run from any directory with Node, pnpm, Rust, Git, gh and tar available.
-Tool versions and the verified CPython archive are pinned in build-config.json.
+Tool versions and the verified CPython archive are pinned in backend-rust/build-config.json.
 Python tools, source snapshots and compiler output live in TMPDIR and are removed
 when the build finishes. The selected output directory must not already exist.
 This creates a private candidate; it does not publish or activate a release.
@@ -22,11 +22,11 @@ import tempfile
 import zipfile
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parent
-CONFIG = json.loads((HERE / 'build-config.json').read_text())
+REPO = HERE.parents[1]
+CONFIG = json.loads((REPO / 'backend-rust/build-config.json').read_text())
 RUNTIME_NAME = 'decky-loader-runtime'
 ARTIFACT_NAME = f'{RUNTIME_NAME}-linux-x86_64'
-SOURCE_ROOTS = ('backend', 'backend-rust', 'frontend')
+SOURCE_ROOTS = ('backend', 'backend-rust', 'frontend', 'scripts/runtime', 'tests')
 
 
 def run(arguments: list[str], *, cwd: Path = REPO, env: dict[str, str] | None = None) -> None:
@@ -134,7 +134,7 @@ def build(output: Path, release_version: str, python_archive: Path | None) -> di
         native_module = native_modules / f'_decky_native_json{extension_suffix}'
         shutil.copy2(work / 'cargo-target/native/lib_decky_native_json.so', native_module)
         run([str(worker_python), '-m', 'unittest', 'discover', '-s',
-             str(source / 'backend-rust/native-json'), '-p', 'test_*.py'],
+             str(source / 'tests/native-json'), '-p', 'test_*.py'],
             env=dict(native_environment, PYTHONPATH=str(native_modules)))
         worker_environment.update(DECKY_WORKER_ONEDIR='1', DECKY_NATIVE_JSON_DIR=str(native_modules))
         run([str(worker_python), '-m', 'PyInstaller', '--noconfirm', '--clean', '--distpath', str(work / 'worker-dist'),
