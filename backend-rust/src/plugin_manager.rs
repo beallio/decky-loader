@@ -889,6 +889,7 @@ fn download_info(backend: &Backend, percent: u64, translation: &str) {
     );
 }
 
+/// Starts the store install-count POST in the background; the install does not wait for it.
 async fn increment_install_count(backend: &Backend, request: &InstallRequest, is_update: bool) {
     let store = backend.setting("store", json!(0)).await;
     let store_url = match store.as_u64().unwrap_or(0) {
@@ -908,7 +909,24 @@ async fn increment_install_count(backend: &Backend, request: &InstallRequest, is
         encode_path_segment(&request.version),
         if is_update { "true" } else { "false" },
     );
-    let _ = backend.client.post(url).send().await;
+    let client = backend.client.clone();
+    tokio::spawn(async move { send_install_count(&client, url, INSTALL_COUNT_TIMEOUT).await });
+}
+
+// The count is informational. The timeout only bounds the background task (upstream #984).
+const INSTALL_COUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn send_install_count(client: &reqwest::Client, url: String, timeout: std::time::Duration) {
+    match client.post(&url).timeout(timeout).send().await {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => eprintln!(
+            "Plugin store did not accept the install count ({})",
+            response.status()
+        ),
+        Err(error) => {
+            eprintln!("Could not send the install count: {error}")
+        }
+    }
 }
 
 fn encode_path_segment(segment: &str) -> String {
@@ -1446,6 +1464,28 @@ fn with_rollback_error(error: String, rollback_error: Option<String>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn install_count_gives_up_when_the_store_never_answers() {
+        // Accept the connection but never reply, like a stalled store (upstream #984).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            drop(socket);
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let started = std::time::Instant::now();
+        send_install_count(
+            &client,
+            format!("http://{address}/plugin/versions/1/increment?isUpdate=false"),
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        server.abort();
+    }
 
     #[test]
     fn archive_paths_reject_escape_and_absolute_forms() {
