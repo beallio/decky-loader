@@ -3753,6 +3753,7 @@ def _check_legacy_migration(
         'user_unit_directory': str(unit_directory),
         'previously_running': bool(activation.get('running')),
         'enabled': bool(activation.get('enabled')),
+        'root_owned_user_data': _user_data_ownership(homebrew, user, apply=False),
     }
 
 
@@ -4207,6 +4208,92 @@ def _handoff_services_directory(
     _write_legacy_record(record_path, record)
 
 
+def _user_data_ownership(homebrew: Path, user: pwd.struct_passwd, *, apply: bool) -> int:
+    """Count, or hand to the user, root-owned homebrew data outside services/.
+
+    A root loader leaves plugins/, each plugin directory, plugin.json files and
+    settings it wrote owned by root. A user service cannot use or secure them.
+    The walk uses directory descriptors and never follows symbolic links.
+    """
+    count = 0
+    nofollow_dir = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+    def adopt(parent_fd: int, name: str, info: os.stat_result, label: str) -> None:
+        nonlocal count
+        if info.st_uid != 0:
+            return
+        count += 1
+        if not apply:
+            return
+        if stat.S_ISREG(info.st_mode):
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent_fd)
+            try:
+                current = os.fstat(descriptor)
+                if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino) or current.st_nlink != 1:
+                    _fail(f'homebrew file changed during ownership handoff: {label}')
+                os.fchown(descriptor, user.pw_uid, user.pw_gid)
+            finally:
+                os.close(descriptor)
+        else:
+            # Directories were opened by descriptor; symlinks change only themselves.
+            os.chown(name, user.pw_uid, user.pw_gid, dir_fd=parent_fd, follow_symlinks=False)
+
+    def visit(directory_fd: int, label: str) -> None:
+        nonlocal count
+        for name in sorted(os.listdir(directory_fd)):
+            if not label and name == 'services':
+                continue
+            child_label = f'{label}/{name}' if label else name
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                try:
+                    child_fd = os.open(name, nofollow_dir, dir_fd=directory_fd)
+                except PermissionError:
+                    if apply or info.st_uid != 0:
+                        raise
+                    # An unprivileged preflight cannot read a private root directory.
+                    count += 1
+                    continue
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                        _fail(f'homebrew directory changed during ownership handoff: {child_label}')
+                    if info.st_uid == 0:
+                        count += 1
+                        if apply:
+                            os.fchown(child_fd, user.pw_uid, user.pw_gid)
+                    visit(child_fd, child_label)
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(info.st_mode):
+                if info.st_uid == 0 and info.st_nlink != 1:
+                    _fail(f'refusing to hand over a multiply-linked root-owned file: {child_label}')
+                adopt(directory_fd, name, info, child_label)
+            elif stat.S_ISLNK(info.st_mode):
+                adopt(directory_fd, name, info, child_label)
+            elif info.st_uid == 0:
+                _fail(f'unsupported root-owned homebrew object: {child_label}')
+
+    # Checked in preflight too, so a migration never stops the service and then fails here.
+    try:
+        protected = Path('/proc/sys/fs/protected_hardlinks').read_text().strip()
+    except OSError:
+        protected = ''
+    if protected != '1':
+        _fail('fs.protected_hardlinks must be enabled before handing homebrew data to the service account')
+    homebrew_fd = os.open(homebrew, nofollow_dir)
+    try:
+        info = os.fstat(homebrew_fd)
+        if info.st_uid == 0:
+            count += 1
+            if apply:
+                os.fchown(homebrew_fd, user.pw_uid, user.pw_gid)
+        visit(homebrew_fd, '')
+    finally:
+        os.close(homebrew_fd)
+    return count
+
+
 def _legacy_user_manager_environment(user: pwd.struct_passwd) -> dict[str, str]:
     runtime = _user_runtime_directory(user)
     return {
@@ -4430,9 +4517,12 @@ def _run_legacy_migration(args: argparse.Namespace) -> dict[str, object]:
         os.close(services_fd)
         os.close(homebrew_fd)
     _handoff_services_directory(homebrew, user, record, record_path)
+    # The root service is drained, so it cannot re-lock plugin directories now.
+    adopted = _user_data_ownership(homebrew, user, apply=True)
     return {
         'ok': True,
         'command': 'migrate-legacy-system',
+        'user_data_adopted': adopted,
         'service': paths['unit'].name,
         'user': user.pw_name,
         'state': str(record_path),

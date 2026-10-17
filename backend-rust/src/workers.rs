@@ -1472,6 +1472,23 @@ fn set_plugin_permissions_on_approved(
     } else {
         Mode::from_bits_truncate(0o700)
     };
+    if effective_user_ids.0 != 0 {
+        let owner = fstat(&root).map_err(io::Error::from).map_err(|error| {
+            WorkerError::Error(format!(
+                "Could not inspect plugin directory {}: {error}",
+                directory_path.display()
+            ))
+        })?;
+        if owner.st_uid != effective_user_ids.0 {
+            // A previous root loader leaves plugin directories owned by root.
+            return Err(WorkerError::Error(format!(
+                "Plugin directory {} is owned by uid {}, not the service user (uid {}); change its owner to the service user",
+                directory_path.display(),
+                owner.st_uid,
+                effective_user_ids.0
+            )));
+        }
+    }
 
     lock_directory(&root, effective_user_ids, locked_mode).map_err(|error| {
         WorkerError::Error(format!(
