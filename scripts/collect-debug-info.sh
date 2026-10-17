@@ -21,7 +21,7 @@ if args.output.exists():
 if not args.service or args.service.startswith('-') or '/' in args.service:
     parser.error('--service must be a service name')
 
-base = Path(os.environ.get('TMPDIR') or '/var/tmp/omp-1000')
+base = Path(os.environ.get('TMPDIR') or '/var/tmp')
 base.mkdir(mode=0o700, parents=True, exist_ok=True)
 with tempfile.TemporaryDirectory(prefix='decky-debug-', dir=base) as temporary:
     work = Path(temporary)

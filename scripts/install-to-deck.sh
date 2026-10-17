@@ -1042,7 +1042,7 @@ target_action() {
     [[ $unit =~ ^[a-zA-Z0-9][a-zA-Z0-9_.@-]*\.service$ ]] || fail 'Invalid service name'
     [[ $inject == true || $inject == false ]] || fail 'inject-frontend must be true or false'
     [[ $migrate_legacy == true || $migrate_legacy == false ]] || fail 'Invalid legacy migration selection'
-    export PYTHONDONTWRITEBYTECODE=1 TMPDIR="${TMPDIR:-/var/tmp/omp-1000}"
+    export PYTHONDONTWRITEBYTECODE=1 TMPDIR="${TMPDIR:-/var/tmp}"
     [[ $TMPDIR == /* ]] || fail 'TMPDIR must be absolute'
     [[ -d $TMPDIR ]] || mkdir -p -- "$TMPDIR"
     [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'This bundle requires Linux x86-64'
@@ -1357,7 +1357,7 @@ need rm
 if [[ $action == install || $action == check ]]; then
     need sha256sum
 fi
-tmpbase=${TMPDIR:-/var/tmp/omp-1000}
+tmpbase=${TMPDIR:-/var/tmp}
 [[ $tmpbase == /* ]] || fail 'TMPDIR must be absolute'
 [[ -d $tmpbase ]] || mkdir -p -- "$tmpbase"
 work=$(mktemp -d "$tmpbase/decky-user-install.XXXXXXXX")
@@ -1464,7 +1464,7 @@ if [[ -n $remote_host ]]; then
     target="$user@$remote_host"
     scp_target=$target
     if [[ $remote_host == *:* && $remote_host != \[*\] ]]; then scp_target="$user@[$remote_host]"; fi
-    remote_stage=$(ssh "${ssh_opts[@]}" "$target" 'set -eu; umask 077; base=${TMPDIR:-/var/tmp/omp-1000}; if [ ! -d "$base" ]; then mkdir -p -- "$base"; fi; mktemp -d "$base/decky-user-deploy.XXXXXXXX"')
+    remote_stage=$(ssh "${ssh_opts[@]}" "$target" 'set -eu; umask 077; base=${TMPDIR:-/var/tmp}; if [ ! -d "$base" ]; then mkdir -p -- "$base"; fi; mktemp -d "$base/decky-user-deploy.XXXXXXXX"')
     [[ $remote_stage == /* && $remote_stage != *$'\n'* && $(basename -- "$remote_stage") == decky-user-deploy.???????? ]] || fail 'Unexpected remote staging path'
     scp "${scp_opts[@]}" -- "$(realpath -- "${BASH_SOURCE[0]}")" "$scp_target:$remote_stage/deploy.sh"
     if [[ $action == install || $action == check ]]; then

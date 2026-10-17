@@ -2569,9 +2569,12 @@ fn socket_filename() -> String {
 }
 
 fn create_socket_directory(user_ids: (u32, u32)) -> Result<PathBuf> {
-    let temporary_directory = std::env::var_os("TMPDIR")
+    // Prefer the private per-user runtime directory that systemd --user provides.
+    let temporary_directory = ["TMPDIR", "XDG_RUNTIME_DIR"]
+        .into_iter()
+        .find_map(|name| std::env::var_os(name).filter(|value| !value.is_empty()))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/var/tmp/omp-1000"));
+        .unwrap_or_else(std::env::temp_dir);
     if !temporary_directory.exists() {
         use std::os::unix::fs::DirBuilderExt;
         fs::DirBuilder::new()
