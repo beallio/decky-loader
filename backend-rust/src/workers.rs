@@ -47,6 +47,9 @@ use crate::{
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+// A new worker is often ready within a few milliseconds. Check soon, then back off
+// to SOCKET_RETRY_INTERVAL so a slow plugin does not cause many connection attempts.
+const SOCKET_FIRST_RETRY: Duration = Duration::from_millis(2);
 // Quiet time after the last directory attribute change before a refused plugin is retried.
 const OWNERSHIP_RETRY_DEBOUNCE: Duration = Duration::from_secs(1);
 
@@ -366,6 +369,8 @@ impl PluginRegistry {
             install_transactions_changed: Notify::new(),
         };
 
+        let started = Instant::now();
+        let mut running = 0_usize;
         for plugin in metadata.into_values() {
             if shutdown_requested(&shutdown) {
                 registry.shutdown().await;
@@ -418,7 +423,10 @@ impl PluginRegistry {
                         )
                         .await
                         {
-                            Ok(worker) => runtime.worker = Some(worker),
+                            Ok(worker) => {
+                                runtime.worker = Some(worker);
+                                running += 1;
+                            }
                             Err(WorkerLaunchError::Failed(error)) => {
                                 runtime.start_error = Some(error)
                             }
@@ -445,6 +453,10 @@ impl PluginRegistry {
             return Err(anyhow::anyhow!("Plugin startup interrupted by shutdown"));
         }
 
+        eprintln!(
+            "Started {running} plugin backends in {} ms",
+            started.elapsed().as_millis()
+        );
         Ok(registry)
     }
 
@@ -2943,6 +2955,7 @@ async fn launch_worker(
     }
 
     let start = Instant::now();
+    let mut retry = SOCKET_FIRST_RETRY;
     let stream = loop {
         if shutdown_requested(shutdown) {
             let mut supervisor = supervisor;
@@ -3005,7 +3018,7 @@ async fn launch_worker(
                             return Err(WorkerLaunchError::Interrupted);
                         }
                     }
-                    _ = sleep(SOCKET_RETRY_INTERVAL) => {}
+                    _ = sleep(retry) => retry = (retry * 2).min(SOCKET_RETRY_INTERVAL),
                 }
             }
         }
