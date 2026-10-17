@@ -767,7 +767,11 @@ def launch(args: argparse.Namespace) -> None:
                 else:
                     self.server_ready = True
 
-        _append_system_pythonpaths(get_system_pythonpaths)
+        system_pythonpaths = getattr(args, "system_pythonpaths", None)
+        if system_pythonpaths is None:
+            _append_system_pythonpaths(get_system_pythonpaths)
+        else:
+            _append_system_pythonpaths(lambda: system_pythonpaths)
 
         tracked_socket = TrackedLocalSocket()
         tracked_socket.socket_addr = str(socket_path)

@@ -31,6 +31,7 @@ _stopping = False
 _children_changed = False
 _wake_read = -1
 _wake_write = -1
+_system_pythonpaths: dict[str, list[str]] = {}
 
 
 @dataclass
@@ -39,6 +40,26 @@ class _Child:
     pid: int
     gate_fd: int | None
     wait_status: int | None = None
+
+
+def _shared_system_pythonpaths(user: str) -> list[str]:
+    # Every plugin asks the system Python for the same module paths. Ask once
+    # before forking so that children do not each start python3.
+    paths = _system_pythonpaths.get(user)
+    if paths is None:
+        from decky_loader.helpers import get_system_pythonpaths
+
+        previous = os.environ.get("UNPRIVILEGED_USER")
+        os.environ["UNPRIVILEGED_USER"] = user
+        try:
+            paths = get_system_pythonpaths()
+        finally:
+            if previous is None:
+                del os.environ["UNPRIVILEGED_USER"]
+            else:
+                os.environ["UNPRIVILEGED_USER"] = previous
+        _system_pythonpaths[user] = paths
+    return paths
 
 
 def _write_message(message: dict[str, Any]) -> None:
@@ -60,6 +81,7 @@ def _worker_child(
     parent_pid: int, inherited_fds: tuple[int, ...],
 ) -> None:
     try:
+        gc.enable()
         signal.set_wakeup_fd(-1)
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
         for descriptor in inherited_fds:
@@ -160,8 +182,10 @@ def _start_child(
         arguments[key] = _request(request, key, str)
     arguments["approved_launch"] = _request(request, "approved_launch", dict)
     arguments["bootstrap"] = bootstrap
+    arguments["system_pythonpaths"] = _shared_system_pythonpaths(arguments["user"])
 
     _assert_fork_safe()
+    gc.freeze()
     gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
     parent_pid = os.getpid()
     try:
@@ -288,8 +312,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         worker.prepare_runtime(args.bootstrap)
         _assert_fork_safe()
-        gc.collect()
-        gc.freeze()
         _write_message({"ok": True, "op": "ready", "pid": os.getpid()})
 
         while not _stopping:
