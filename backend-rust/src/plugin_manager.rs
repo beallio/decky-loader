@@ -913,7 +913,7 @@ async fn increment_install_count(backend: &Backend, request: &InstallRequest, is
     tokio::spawn(async move { send_install_count(&client, url, INSTALL_COUNT_TIMEOUT).await });
 }
 
-// The count is informational. The timeout only bounds the background task (upstream #984).
+// The count is informational. The timeout only bounds the background task.
 const INSTALL_COUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn send_install_count(client: &reqwest::Client, url: String, timeout: std::time::Duration) {
@@ -1467,7 +1467,7 @@ mod tests {
 
     #[tokio::test]
     async fn install_count_gives_up_when_the_store_never_answers() {
-        // Accept the connection but never reply, like a stalled store (upstream #984).
+        // Accept the connection but never reply, like a stalled store.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {

@@ -1192,7 +1192,7 @@ fn parse_filepicker_options(args: &[Value]) -> Result<FilePickerOptions, RpcErro
 }
 
 fn filepicker_listing(home: &str, options: FilePickerOptions) -> Result<Value, RpcError> {
-    // A missing or empty start path opens the home folder (upstream #951).
+    // A missing or empty start path opens the home folder.
     let requested_path = match options.path.as_deref() {
         None | Some("") => home,
         Some(path) => path,
@@ -1200,7 +1200,7 @@ fn filepicker_listing(home: &str, options: FilePickerOptions) -> Result<Value, R
     let resolved = Path::new(requested_path)
         .canonicalize()
         .map_err(|error| filepicker_io_error(error, requested_path))?;
-    // A file as the start path opens the folder that holds it (upstream #952).
+    // A file as the start path opens the folder that holds it.
     // `listed_path` tells the frontend which folder it now shows.
     let (resolved, listed_path) = if resolved.is_file() {
         let parent = resolved.parent().unwrap_or(&resolved).to_path_buf();
