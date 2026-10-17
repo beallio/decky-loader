@@ -69,6 +69,8 @@ After this, `--restore-legacy` cannot work.
 bash install-to-deck.sh --status
 ```
 
+The output also has a `resources` section. It shows CPU and memory for each plugin and for the whole service.
+
 ## Problems
 
 - **Decky does not appear.** Restart the Deck. If it is still missing, run `--status`, then install again.

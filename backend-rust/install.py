@@ -11,6 +11,7 @@ import hashlib
 import ipaddress
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
 import pwd
@@ -2775,6 +2776,255 @@ def _run_status(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+_UNKNOWN_PLUGIN = '(unknown plugin)'
+_PLUGIN_TITLE = re.compile(r'(.+) \(([^()]*)\)')
+_SMAPS_FIELDS = {'Pss': 'pss_kb', 'Private_Dirty': 'private_dirty_kb'}
+
+
+@dataclass(frozen=True)
+class _StatSample:
+    comm: str
+    ppid: int
+    cpu_ticks: int
+    start_ticks: int
+
+
+@dataclass(frozen=True)
+class _ProcessInfo:
+    pid: int
+    ppid: int
+    comm: str
+    argv: tuple[str, ...]
+
+
+def _parse_stat_sample(text: str) -> _StatSample:
+    """Read /proc/<pid>/stat. The comm field may hold spaces and parentheses, so split at the last ')'."""
+    head, separator, tail = text.rpartition(')')
+    if not separator or ' (' not in head:
+        raise ValueError('invalid process stat')
+    fields = tail.split()
+    if len(fields) < 20:
+        raise ValueError('process stat is too short')
+    # After comm, fields[0] is stat field 3: ppid=4, utime=14, stime=15, starttime=22.
+    return _StatSample(head.partition(' (')[2], int(fields[1]), int(fields[11]) + int(fields[12]), int(fields[19]))
+
+
+def _parse_smaps_rollup(text: str) -> dict[str, int | None]:
+    """Read Pss and Private_Dirty (kB) from /proc/<pid>/smaps_rollup; a missing field is None."""
+    found: dict[str, int | None] = {'pss_kb': None, 'private_dirty_kb': None}
+    for line in text.splitlines():
+        key, separator, rest = line.partition(':')
+        field = _SMAPS_FIELDS.get(key)
+        parts = rest.split()
+        if field and separator and len(parts) == 2 and parts[1] == 'kB' and parts[0].isdecimal():
+            found[field] = int(parts[0])
+    return found
+
+
+def _parse_cmdline(raw: bytes) -> tuple[str, ...]:
+    return tuple(part for part in raw.decode('utf-8', 'replace').split('\0') if part)
+
+
+def _worker_identity(argv: tuple[str, ...]) -> tuple[str, str] | None:
+    """Plugin name from a worker command line, and where it came from.
+
+    A running worker sets its title to "<plugin name> (<entry file>)", which replaces argv.
+    An exec-mode worker that has not set its title yet still has --plugin-directory in argv.
+    """
+    if '--plugin-directory' in argv:
+        index = argv.index('--plugin-directory')
+        if index + 1 < len(argv) and argv[index + 1]:
+            return argv[index + 1], 'plugin-directory'
+    match = _PLUGIN_TITLE.fullmatch(' '.join(argv))
+    if match:
+        return match.group(1), 'title'
+    return None
+
+
+def _attribute_one(
+    info: _ProcessInfo,
+    is_backend: bool,
+    parent: tuple[str, str | None, str | None] | None,
+) -> tuple[str, str | None, str | None]:
+    if is_backend:
+        return 'backend', None, None
+    if parent is None:
+        return 'unattributed', None, None
+    role = parent[0]
+    if role in ('backend', 'shared launcher'):
+        # The worker title rewrites argv into one space-joined string, so split it again.
+        if role == 'backend' and '--launcher' in ' '.join(info.argv).split():
+            return 'shared launcher', None, None
+        identity = _worker_identity(info.argv)
+        if identity:
+            return 'plugin worker', identity[0], identity[1]
+        if role == 'shared launcher':
+            return 'plugin worker', _UNKNOWN_PLUGIN, 'unknown'
+        return 'backend child', None, None
+    if role in ('plugin worker', 'plugin child'):
+        return 'plugin child', parent[1], parent[2]
+    return role, None, None
+
+
+def _attribute_processes(
+    infos: dict[int, _ProcessInfo], main_pid: int,
+) -> dict[int, tuple[str, str | None, str | None]]:
+    """Give each process a (role, plugin, name source) from its place in the process tree.
+
+    The backend is MainPID. A direct child of the backend that has --launcher is the shared launcher.
+    A direct child of the backend (exec mode) or of the launcher (fork mode) that has a plugin identity
+    is a plugin worker. Every deeper descendant belongs to the nearest worker above it.
+    """
+    result: dict[int, tuple[str, str | None, str | None]] = {}
+    for start in infos:
+        chain: list[int] = []
+        pid = start
+        while pid not in result:
+            chain.append(pid)
+            parent_pid = infos[pid].ppid
+            if pid == main_pid or parent_pid not in infos or parent_pid in chain:
+                break
+            pid = parent_pid
+        for pid in reversed(chain):
+            if pid not in result:
+                result[pid] = _attribute_one(infos[pid], pid == main_pid, result.get(infos[pid].ppid))
+    return result
+
+
+def _totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    def total(key: str) -> int | float | None:
+        values = [row[key] for row in rows if row[key] is not None]
+        return sum(values) if values else None
+
+    seconds = total('cpu_seconds_total')
+    percent = total('cpu_percent')
+    return {
+        'process_count': len(rows),
+        'pids': [row['pid'] for row in rows],
+        'cpu_seconds_total': None if seconds is None else round(seconds, 2),
+        'cpu_percent': None if percent is None else round(percent, 1),
+        'pss_kb': total('pss_kb'),
+        'private_dirty_kb': total('private_dirty_kb'),
+        'memory_unreadable_processes': sum(1 for row in rows if row['pss_kb'] is None or row['private_dirty_kb'] is None),
+    }
+
+
+def _resource_report(
+    infos: dict[int, _ProcessInfo],
+    samples: dict[int, _StatSample],
+    previous: dict[int, _StatSample],
+    memory: dict[int, dict[str, int | None]],
+    main_pid: int,
+    clock_ticks: int,
+    elapsed: float,
+) -> dict[str, Any]:
+    """Build per-process, per-plugin, per-role and whole-service resource numbers from parsed samples."""
+    attribution = _attribute_processes(infos, main_pid)
+    rows: list[dict[str, Any]] = []
+    for pid in sorted(infos):
+        info, sample = infos[pid], samples[pid]
+        role, plugin, source = attribution[pid]
+        before = previous.get(pid)
+        percent = None
+        if elapsed > 0 and before is not None and before.start_ticks == sample.start_ticks:
+            percent = max(0.0, (sample.cpu_ticks - before.cpu_ticks) / clock_ticks / elapsed * 100)
+        used = memory.get(pid) or {}
+        rows.append({
+            'pid': pid,
+            'ppid': info.ppid,
+            'role': role,
+            'plugin': plugin,
+            'name_source': source,
+            'comm': info.comm,
+            'command_line': ' '.join(info.argv),
+            'cpu_seconds_total': sample.cpu_ticks / clock_ticks,
+            'cpu_percent': percent,
+            'pss_kb': used.get('pss_kb'),
+            'private_dirty_kb': used.get('private_dirty_kb'),
+        })
+    plugins = sorted({row['plugin'] for row in rows if row['plugin'] is not None})
+    for row in rows:
+        row['cpu_seconds_total'] = round(row['cpu_seconds_total'], 2)
+        if row['cpu_percent'] is not None:
+            row['cpu_percent'] = round(row['cpu_percent'], 1)
+    return {
+        'processes': rows,
+        'plugins': [{'name': name, **_totals([row for row in rows if row['plugin'] == name])} for name in plugins],
+        'by_role': {
+            role: _totals([row for row in rows if row['role'] == role])
+            for role in sorted({row['role'] for row in rows})
+        },
+        'service': _totals(rows),
+    }
+
+
+def _read_stat_sample(pid: int) -> _StatSample | None:
+    try:
+        return _parse_stat_sample(Path(f'/proc/{pid}/stat').read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _service_resources(paths: dict[str, Path], sample_seconds: float) -> dict[str, Any]:
+    """Per-process CPU and memory of the selected service from readable /proc files only."""
+    def unavailable(reason: str) -> dict[str, Any]:
+        return {'available': False, 'reason': reason, 'sample_seconds': sample_seconds}
+
+    try:
+        properties = _unit_properties(paths)
+        control_group = properties.get('ControlGroup') or ''
+        main_pid = int(properties.get('MainPID', '0') or '0')
+    except (InstallerError, OSError, ValueError) as error:
+        return unavailable(f'cannot read service state: {error}')
+    if main_pid <= 0 or not control_group:
+        return unavailable('the service is not running')
+    clock_ticks = os.sysconf('SC_CLK_TCK')
+    try:
+        previous: dict[int, _StatSample] = {}
+        window_start = 0.0
+        if sample_seconds > 0:
+            for pid in cgroup_processes(control_group):
+                sample = _read_stat_sample(pid)
+                if sample is not None:
+                    previous[pid] = sample
+            window_start = time.monotonic()
+            time.sleep(sample_seconds)
+        members = cgroup_processes(control_group)
+    except (OSError, ValueError) as error:
+        return unavailable(f'cannot observe service processes: {error}')
+    samples: dict[int, _StatSample] = {}
+    for pid, member in members.items():
+        sample = _read_stat_sample(pid)
+        if sample is not None and sample.start_ticks == member.start_ticks:
+            samples[pid] = sample
+    elapsed = time.monotonic() - window_start if sample_seconds > 0 else 0.0
+    infos: dict[int, _ProcessInfo] = {}
+    memory: dict[int, dict[str, int | None]] = {}
+    for pid, sample in samples.items():
+        try:
+            argv = _parse_cmdline(Path(f'/proc/{pid}/cmdline').read_bytes())
+        except OSError:
+            argv = ()
+        infos[pid] = _ProcessInfo(pid, sample.ppid, sample.comm, argv)
+        try:
+            memory[pid] = _parse_smaps_rollup(Path(f'/proc/{pid}/smaps_rollup').read_text())
+        except (OSError, UnicodeError):
+            pass
+    if not infos:
+        return unavailable('no service process could be read')
+    report = _resource_report(infos, samples, previous, memory, main_pid, clock_ticks, elapsed)
+    return {
+        'available': True,
+        'reason': None,
+        'sample_seconds': sample_seconds,
+        'window_seconds': round(elapsed, 3),
+        'clock_ticks_per_second': clock_ticks,
+        'control_group': control_group,
+        'main_pid': main_pid,
+        **report,
+    }
+
+
 def _legacy_migration_directory(
     homebrew: Path,
     service_name: str,
@@ -5240,6 +5490,16 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--service-name', required=True, metavar='NAME')
 
 
+def _sample_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'not a number: {value!r}') from None
+    if not 0 <= seconds <= 60:
+        raise argparse.ArgumentTypeError('must be from 0 to 60 seconds')
+    return seconds
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -5260,6 +5520,7 @@ def main() -> int:
     _add_common(rollback)
     status = subparsers.add_parser('status', help='report selected service and recoverable installer state')
     _add_common(status)
+    status.add_argument('--sample-seconds', type=_sample_seconds, default=1.0, metavar='SECONDS', help='CPU percentage sampling window; 0 skips sampling (default 1)')
     check_bundle = subparsers.add_parser('check-bundle', help='verify a bundle and user-service target without installing')
     check_bundle.add_argument('--bundle', required=True, metavar='DIR')
     check_bundle.add_argument('--version', required=True, metavar='STRING')
@@ -5411,6 +5672,8 @@ def main() -> int:
                 finally:
                     fcntl.flock(descriptor, fcntl.LOCK_UN)
                     os.close(descriptor)
+                if args.command == 'status':
+                    output['resources'] = _service_resources(paths, args.sample_seconds)
         print(json.dumps(output, sort_keys=True))
         return 0
     except (InstallerError, OSError, KeyError, ValueError) as error:
