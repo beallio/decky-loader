@@ -33,7 +33,6 @@ import Logger from './logger';
 import { NotificationService } from './notification-service';
 import { DisabledPlugin, InstallType, Plugin, PluginLoadType } from './plugin';
 import RouterHook from './router-hook';
-import { deinitSteamFixes, initSteamFixes } from './steamfixes';
 import { checkForPluginUpdates } from './store';
 import TabsHook from './tabs-hook';
 import Toaster from './toaster';
@@ -82,7 +81,12 @@ class PluginLoader extends Logger {
 
   private reloadLock: boolean = false;
   // stores a list of plugin names which requested to be reloaded
-  private pluginReloadQueue: { name: string; version?: string; loadType: PluginLoadType }[] = [];
+  private pluginReloadQueue: {
+    name: string;
+    version?: string;
+    loadType: PluginLoadType;
+    backendError?: string | null;
+  }[] = [];
 
   private loaderUpdateToast?: ToastNotification;
   private pluginUpdateToast?: ToastNotification;
@@ -144,8 +148,6 @@ class PluginLoader extends Logger {
       );
     });
 
-    initSteamFixes();
-
     initFilepickerPatches();
 
     this.initPluginBackendAPI();
@@ -178,7 +180,7 @@ class PluginLoader extends Logger {
 
   private getPluginsFromBackend = DeckyBackend.callable<
     [],
-    { name: string; version: string; load_type: PluginLoadType; disabled: boolean }[]
+    { name: string; version: string; load_type: PluginLoadType; disabled: boolean; error?: string | null }[]
   >('loader/get_plugins');
 
   private restartWebhelper = DeckyBackend.callable<[], void>('utilities/restart_webhelper');
@@ -209,7 +211,9 @@ class PluginLoader extends Logger {
         this.deckyState.setDisabledPlugins(disabledPlugins);
       } else {
         if (!this.hasPlugin(plugin.name))
-          pluginLoadPromises.push(this.importPlugin(plugin.name, plugin.version, plugin.load_type, false));
+          pluginLoadPromises.push(
+            this.importPlugin(plugin.name, plugin.version, plugin.load_type, false, undefined, plugin.error),
+          );
       }
     }
     await Promise.all(pluginLoadPromises);
@@ -374,7 +378,6 @@ class PluginLoader extends Logger {
   public deinit() {
     this.routerHook.removeRoute('/decky/store');
     this.routerHook.removeRoute('/decky/settings');
-    deinitSteamFixes();
     deinitFilepickerPatches();
     this.routerHook.deinit();
     this.tabsHook.deinit();
@@ -408,10 +411,11 @@ class PluginLoader extends Logger {
     loadType: PluginLoadType = PluginLoadType.ESMODULE_V1,
     useQueue: boolean = true,
     timeoutMS?: number,
+    backendError?: string | null,
   ) {
     if (useQueue && this.reloadLock) {
       this.log(`Reload currently in progress, adding ${getPluginDisplayName(name, version)} to queue`);
-      this.pluginReloadQueue.push({ name, version: version, loadType });
+      this.pluginReloadQueue.push({ name, version: version, loadType, backendError });
       return;
     }
 
@@ -422,7 +426,7 @@ class PluginLoader extends Logger {
       this.unloadPlugin(name, true);
       const startTime = performance.now();
 
-      await this.importReactPlugin(name, version, loadType, timeoutMS);
+      await this.importReactPlugin(name, version, loadType, timeoutMS, backendError);
       const endTime = performance.now();
 
       this.deckyState.setDisabledPlugins(this.deckyState.publicState().disabledPlugins.filter((d) => d.name !== name));
@@ -435,7 +439,14 @@ class PluginLoader extends Logger {
         this.reloadLock = false;
         const nextPlugin = this.pluginReloadQueue.shift();
         if (nextPlugin) {
-          this.importPlugin(nextPlugin.name, nextPlugin.version, nextPlugin.loadType, true, timeoutMS);
+          this.importPlugin(
+            nextPlugin.name,
+            nextPlugin.version,
+            nextPlugin.loadType,
+            true,
+            timeoutMS,
+            nextPlugin.backendError,
+          );
         }
       }
     }
@@ -446,6 +457,7 @@ class PluginLoader extends Logger {
     version?: string,
     loadType: PluginLoadType = PluginLoadType.ESMODULE_V1,
     timeoutMS?: number,
+    backendError?: string | null,
   ) {
     let spExists = this.checkForSP();
     const timeoutException = new Error(
@@ -454,6 +466,7 @@ class PluginLoader extends Logger {
     let timeout: number | undefined;
 
     try {
+      if (backendError) throw new Error(backendError);
       switch (loadType) {
         case PluginLoadType.ESMODULE_V1:
           const importJS = () => import(`http://127.0.0.1:1337/plugins/${name}/dist/index.js?t=${Date.now()}`);
@@ -528,15 +541,15 @@ class PluginLoader extends Logger {
             </div>
           </PanelSectionRow>
           <PanelSectionRow>
-            <pre style={{ overflowX: 'scroll' }}>
-              <code>{e instanceof Error ? '' + e.stack : JSON.stringify(e)}</code>
+            <pre style={{ overflowX: 'scroll', whiteSpace: backendError ? 'pre-wrap' : undefined }}>
+              <code>{backendError ? backendError : e instanceof Error ? '' + e.stack : JSON.stringify(e)}</code>
             </pre>
           </PanelSectionRow>
           <PanelSectionRow>
             <div className={quickAccessMenuClasses.Text}>
               <TranslationHelper
                 transClass={TranslationClass.PLUGIN_LOADER}
-                transText="plugin_error_uninstall"
+                transText={backendError ? 'plugin_backend_error' : 'plugin_error_uninstall'}
                 i18nArgs={{ name: name }}
               />
             </div>

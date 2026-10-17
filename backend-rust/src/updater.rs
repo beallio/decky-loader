@@ -22,6 +22,7 @@ use uuid::Uuid;
 use zip::ZipArchive;
 
 use crate::backend::{Backend, RpcError, exact, string};
+use crate::service_manager::systemctl_output;
 
 const INITIAL_CHECK_DELAY: Duration = Duration::from_secs(30);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -173,20 +174,11 @@ impl Updater {
 
     async fn selected_branch(&self, backend: &Backend) -> Result<i64, RpcError> {
         let branch = backend.setting("branch", json!(-1)).await;
-        if branch.as_i64() == Some(-1) {
-            let current = backend.version.as_str();
-            let detected = if current.starts_with('v') && current.contains("-pre") {
-                1
-            } else {
-                0
-            };
-            backend.set_setting("branch", json!(detected)).await?;
-            Ok(detected)
-        } else {
-            branch
-                .as_i64()
-                .ok_or_else(|| RpcError::invalid("update branch setting must be an integer"))
+        let (selected, is_default) = resolve_branch(&branch, backend.version.as_str())?;
+        if is_default {
+            backend.set_setting("branch", json!(selected)).await?;
         }
+        Ok(selected)
     }
 
     async fn check_for_updates(&self, backend: &Backend) -> Result<Value, RpcError> {
@@ -376,6 +368,24 @@ impl Default for Updater {
         Self::new()
     }
 }
+pub(crate) fn is_preview_version(version: &str) -> bool {
+    version.starts_with('v') && (version.contains("-rc.") || version.contains("-pre"))
+}
+
+pub(crate) fn default_branch(version: &str) -> i64 {
+    if is_preview_version(version) { 1 } else { 0 }
+}
+
+fn resolve_branch(setting: &Value, current_version: &str) -> Result<(i64, bool), RpcError> {
+    if setting.as_i64() == Some(-1) {
+        Ok((default_branch(current_version), true))
+    } else {
+        setting
+            .as_i64()
+            .map(|branch| (branch, false))
+            .ok_or_else(|| RpcError::invalid("update branch setting must be an integer"))
+    }
+}
 
 async fn wait_or_stop(duration: Duration, stopped: &mut oneshot::Receiver<()>) -> bool {
     tokio::select! {
@@ -418,7 +428,8 @@ fn filter_releases(releases: Vec<Value>, branch: i64) -> Result<Vec<Value>, RpcE
                     .get("prerelease")
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
-                    && !tag.contains("-pre"))
+                    && !tag.contains("-pre")
+                    && !tag.contains("-rc"))
         })
         .collect())
 }
@@ -461,6 +472,18 @@ async fn checked_response(response: Response, context: &str) -> Result<Response,
     }
 }
 
+fn secure_staging_directory(directory: &Path, effective_uid: u32) -> Result<(), RpcError> {
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|error| io_failure("inspecting updater staging directory", error))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != effective_uid {
+        return Err(RpcError::failure(format!(
+            "updater staging directory must be a real directory owned by effective UID {effective_uid}"
+        )));
+    }
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        .map_err(|error| io_failure("securing updater staging directory", error))
+}
+
 struct UpdateFiles {
     directory: PathBuf,
     paths: Vec<PathBuf>,
@@ -472,17 +495,7 @@ impl UpdateFiles {
         tokio::fs::create_dir_all(&directory)
             .await
             .map_err(|error| io_failure("creating updater staging directory", error))?;
-        let metadata = tokio::fs::symlink_metadata(&directory)
-            .await
-            .map_err(|error| io_failure("inspecting updater staging directory", error))?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != 0 {
-            return Err(RpcError::failure(
-                "updater staging directory must be a root-owned real directory",
-            ));
-        }
-        tokio::fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
-            .await
-            .map_err(|error| io_failure("securing updater staging directory", error))?;
+        secure_staging_directory(&directory, crate::platform::effective_user_ids().0)?;
         Ok(Self {
             directory,
             paths: Vec::new(),
@@ -803,12 +816,7 @@ async fn queue_install_bundle(
 }
 
 async fn restart_service(backend: &Backend) -> Result<(), RpcError> {
-    let reload = Command::new("systemctl")
-        .arg("daemon-reload")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
+    let reload = systemctl_output(&["daemon-reload"])
         .await
         .map_err(|error| {
             RpcError::failure(format!("starting systemctl daemon-reload failed: {error}"))
@@ -816,14 +824,7 @@ async fn restart_service(backend: &Backend) -> Result<(), RpcError> {
     if !reload.status.success() {
         return Err(process_failure("systemctl daemon-reload", &reload));
     }
-    let output = Command::new("systemctl")
-        .arg("restart")
-        .arg(&backend.config.service_name)
-        .arg("--no-block")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
+    let output = systemctl_output(&["restart", &backend.config.service_name, "--no-block"])
         .await
         .map_err(|error| {
             RpcError::failure(format!("starting systemctl restart failed: {error}"))
@@ -836,14 +837,7 @@ async fn restart_service(backend: &Backend) -> Result<(), RpcError> {
 }
 
 async fn stop_service(backend: &Backend) -> Result<(), RpcError> {
-    let output = Command::new("systemctl")
-        .arg("--no-block")
-        .arg("stop")
-        .arg(&backend.config.service_name)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
+    let output = systemctl_output(&["--no-block", "stop", &backend.config.service_name])
         .await
         .map_err(|error| {
             RpcError::failure(format!(
@@ -877,11 +871,15 @@ fn io_failure(operation: &str, error: io::Error) -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::{
-        RUST_BUNDLE_ASSET, RUST_TESTING_ARTIFACT, filter_releases, rust_bundle_asset,
-        rust_testing_artifact,
+        RUST_BUNDLE_ASSET, RUST_TESTING_ARTIFACT, default_branch, filter_releases, resolve_branch,
+        rust_bundle_asset, rust_testing_artifact, secure_staging_directory,
     };
     use crate::backend::RpcError;
     use serde_json::{Value, json};
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+    };
 
     fn rust_asset() -> Value {
         json!({
@@ -894,12 +892,12 @@ mod tests {
     #[test]
     fn release_discovery_only_exposes_versions_with_the_rust_bundle() {
         let releases = vec![
-            json!({"tag_name":"v3.2.10", "prerelease":false, "assets":[rust_asset()]}),
+            json!({"tag_name":"v3.2.10-rust.1", "prerelease":false, "assets":[rust_asset()]}),
             json!({"tag_name":"v3.2.11-pre1", "prerelease":true, "assets":[rust_asset()]}),
+            json!({"tag_name":"v3.2.11-rust.2-rc.1", "prerelease":false, "assets":[rust_asset()]}),
             json!({"tag_name":"v3.2.9", "prerelease":true, "assets":[rust_asset()]}),
             json!({"tag_name":"v3.2.12", "prerelease":false, "assets":[{"name":"PluginLoader", "browser_download_url":"https://example.invalid/PluginLoader"}]}),
             json!({"tag_name":"v3.2.13", "prerelease":false, "assets":[{"name":RUST_BUNDLE_ASSET, "browser_download_url":""}]}),
-            json!({"tag_name":"3.2.14", "prerelease":false, "assets":[rust_asset()]}),
         ];
 
         let stable = filter_releases(releases.clone(), 0).expect("stable branch is valid");
@@ -908,7 +906,7 @@ mod tests {
                 .iter()
                 .map(|release| release["tag_name"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["v3.2.10"]
+            ["v3.2.10-rust.1"]
         );
         assert!(rust_bundle_asset(&stable[0]).is_some());
 
@@ -918,8 +916,48 @@ mod tests {
                 .iter()
                 .map(|release| release["tag_name"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["v3.2.10", "v3.2.11-pre1", "v3.2.9"]
+            [
+                "v3.2.10-rust.1",
+                "v3.2.11-pre1",
+                "v3.2.11-rust.2-rc.1",
+                "v3.2.9"
+            ]
         );
+    }
+
+    #[test]
+    fn default_branch_detects_rc_versions_without_overriding_saved_choices() {
+        let preview = "v1.2.3-rust.4-rc.1";
+        let stable = "v1.2.3-rust.4";
+        assert_eq!(default_branch(preview), 1);
+        assert_eq!(default_branch(stable), 0);
+        assert_eq!(default_branch("v1.2.3-pre1"), 1);
+        assert_eq!(resolve_branch(&json!(-1), preview).unwrap(), (1, true));
+        assert_eq!(resolve_branch(&json!(-1), stable).unwrap(), (0, true));
+        assert_eq!(resolve_branch(&json!(0), preview).unwrap(), (0, false));
+        assert_eq!(resolve_branch(&json!(1), stable).unwrap(), (1, false));
+    }
+
+    #[test]
+    fn updater_staging_requires_effective_ownership_and_removes_write_access() {
+        let directory =
+            std::env::temp_dir().join(format!("decky-updater-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let uid = crate::platform::effective_user_ids().0;
+        secure_staging_directory(&directory, uid).unwrap();
+        let metadata = fs::metadata(&directory).unwrap();
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        assert!(secure_staging_directory(&directory, uid.wrapping_add(1)).is_err());
+
+        let target = directory.join("target");
+        let link = directory.join("link");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(secure_staging_directory(&link, uid).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

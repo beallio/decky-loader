@@ -18,6 +18,13 @@ import logging
 
 from typing import Any
 
+class _NativeJSON:
+    @staticmethod
+    def dumps(value: object, *, ensure_ascii: bool = True) -> str: ...
+
+
+native: _NativeJSON
+
 """
 Constants
 """

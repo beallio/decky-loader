@@ -187,12 +187,12 @@ class ServiceShutdownRetryTests(unittest.TestCase):
                         observer = ProcessObserver(group, proc)
                         with self.subTest(attempt=attempt):
                             with self.assertRaises(installer.InstallerError) as refused:
-                                installer.stop_service(unit)
+                                installer.stop_service(unit, scope="system")
                             if attempt or not validation_failure:
                                 self.assertRegex(str(refused.exception), r"PID 42 .*state Z")
                     # Reaping, not another retry, makes shutdown complete.
                     (child / "stat").unlink()
-                    installer.stop_service(unit)
+                    installer.stop_service(unit, scope="system")
 
 
 if __name__ == "__main__":

@@ -40,8 +40,7 @@ const vars = {
   panelXPadding: '20px',
 };
 
-export const startSSH = DeckyBackend.callable('utilities/start_ssh');
-export const starrCEFForwarding = DeckyBackend.callable('utilities/allow_remote_debugging');
+const startCEFForwarding = DeckyBackend.callable('utilities/allow_remote_debugging');
 
 function ipToString(ip: number) {
   return [(ip >>> 24) & 255, (ip >>> 16) & 255, (ip >>> 8) & 255, (ip >>> 0) & 255].join('.');
@@ -221,8 +220,8 @@ const DeckyErrorBoundary: FunctionComponent<DeckyErrorBoundaryProps> = ({ error,
             <div className={classes.flexRowWGap} style={{ alignItems: 'center', marginBottom: '8px' }}>
               <div className={classes.panelHeader}>Actions</div>
               <div style={{ fontSize: 'small', fontStyle: 'italic' }}>
-                Use the touch screen. Solutions are listed in the recommended order. If you are still experiencing
-                issues, please post in the #loader-support channel at decky.xyz/discord.
+                Use the touch screen. Try these actions in order. Report unresolved problems at
+                github.com/beallio/decky-loader/issues.
               </div>
             </div>
             <div className={classes.rowList}>
@@ -389,19 +388,22 @@ const DeckyErrorBoundary: FunctionComponent<DeckyErrorBoundaryProps> = ({ error,
               </div>
               {debugAllowed && (
                 <div className={joinClassNames(classes.rowItem, classes.buttonDescRow)}>
-                  Enable remote debugging and SSH until next boot (for developers)
+                  Allow anyone on your network to debug Steam (no SSH)
                   <button
                     onClick={async () => {
                       setDebugAllowed(false);
-                      addLogLine('Enabling CEF debugger forwarding...');
-                      await starrCEFForwarding();
-                      addLogLine('Enabling SSH...');
-                      await startSSH();
-                      addLogLine('Ready for debugging!');
-                      if (window?.SystemNetworkStore?.wirelessNetworkDevice?.ip4?.addresses?.[0]?.ip) {
-                        const ip = ipToString(window.SystemNetworkStore.wirelessNetworkDevice.ip4.addresses[0].ip);
-                        addLogLine(`CEF Debugger: http://${ip}:8081`);
-                        addLogLine(`SSH: deck@${ip}`);
+                      addLogLine('Starting remote debugging...');
+                      try {
+                        await startCEFForwarding();
+                        addLogLine('Remote debugging is ready until Decky stops.');
+                        if (window?.SystemNetworkStore?.wirelessNetworkDevice?.ip4?.addresses?.[0]?.ip) {
+                          const ip = ipToString(window.SystemNetworkStore.wirelessNetworkDevice.ip4.addresses[0].ip);
+                          addLogLine(`Debugger: http://${ip}:8081`);
+                        }
+                        addLogLine('SSH is unchanged. Set it up separately in Desktop Mode if needed.');
+                      } catch (error) {
+                        addLogLine(`Could not start remote debugging: ${String(error)}`);
+                        setDebugAllowed(true);
                       }
                     }}
                   >

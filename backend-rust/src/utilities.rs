@@ -33,8 +33,14 @@ use unicode_casefold::UnicodeCaseFold;
 use uuid::Uuid;
 
 use crate::backend::{Backend, RpcError, exact, string};
+use crate::service_manager::systemctl_output;
 
-const REMOTE_DEBUGGER_UNIT: &str = "steam-web-debug-portforward.service";
+// Keep SteamOS's remote CEF contract without its root-owned system unit.
+const REMOTE_DEBUGGER_BIND: &str = "0.0.0.0";
+const REMOTE_DEBUGGER_PORT: u16 = 8081;
+const CEF_DEBUGGER_HOST: &str = "127.0.0.1";
+const CEF_DEBUGGER_PORT: u16 = 8080;
+const SSHD_UNIT: &str = "sshd.service";
 const RDT_PORT: u16 = 8097;
 const RDT_BIND: &str = "127.0.0.1";
 
@@ -49,13 +55,15 @@ static CEF_SOCKET_CLOSE_LOCK: Mutex<()> = Mutex::const_new(());
 /// page state.
 pub struct Utilities {
     legacy_client: Client,
-    rdt_proxy: Mutex<Option<RdtProxy>>,
+    rdt_proxy: Mutex<Option<TcpProxy>>,
+    remote_debugger_proxy: Mutex<Option<TcpProxy>>,
     rdt_document: Mutex<Option<RdtDocument>>,
     rdt_lifecycle: Mutex<()>,
+    remote_debugger_lifecycle: Mutex<()>,
     shutdown_tx: watch::Sender<bool>,
 }
 
-struct RdtProxy {
+struct TcpProxy {
     stop: watch::Sender<bool>,
     task: JoinHandle<Result<(), String>>,
 }
@@ -97,8 +105,10 @@ impl Utilities {
                 .build()
                 .expect("default HTTP client configuration is valid"),
             rdt_proxy: Mutex::new(None),
+            remote_debugger_proxy: Mutex::new(None),
             rdt_document: Mutex::new(None),
             rdt_lifecycle: Mutex::new(()),
+            remote_debugger_lifecycle: Mutex::new(()),
             shutdown_tx,
         }
     }
@@ -107,11 +117,13 @@ impl Utilities {
         self.shutdown_tx.send_replace(true);
     }
 
-    /// Stop every owned RDT listener, stream and setup operation before CEF teardown.
+    /// Stop every owned listener, stream and setup operation before CEF teardown.
     pub async fn shutdown(&self, backend: &Backend) -> Result<(), RpcError> {
         self.cancel_setup();
-        let _lifecycle = self.rdt_lifecycle.lock().await;
-        let proxy_result = self.stop_rdt_proxy().await;
+        let _rdt_lifecycle = self.rdt_lifecycle.lock().await;
+        let rdt_result = self.stop_rdt_proxy().await;
+        let _debugger_lifecycle = self.remote_debugger_lifecycle.lock().await;
+        let debugger_result = self.stop_remote_debugger_proxy().await;
         let document = self.rdt_document.lock().await.clone();
         let page_result = match document.as_ref() {
             Some(document) => clear_rdt_document(backend, document).await.map(|_| ()),
@@ -120,14 +132,23 @@ impl Utilities {
         if page_result.is_ok() && document.is_some() {
             *self.rdt_document.lock().await = None;
         }
-        match (proxy_result, page_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(proxy_error), Err(page_error)) => Err(RpcError::failure(format!(
-                "{}; additionally failed to clear RDT page state: {}",
-                rpc_error_message(&proxy_error),
-                rpc_error_message(&page_error)
-            ))),
+        let mut failures = Vec::with_capacity(3);
+        if let Err(error) = rdt_result {
+            failures.push(rpc_error_message(&error));
+        }
+        if let Err(error) = debugger_result {
+            failures.push(rpc_error_message(&error));
+        }
+        if let Err(error) = page_result {
+            failures.push(format!(
+                "failed to clear RDT page state: {}",
+                rpc_error_message(&error)
+            ));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(RpcError::failure(failures.join("; ")))
         }
     }
 
@@ -201,17 +222,25 @@ impl Utilities {
                     .await
             }
             "utilities/get_tab_id" => self.call_legacy_method(backend, "get_tab_id", args).await,
-            "utilities/allow_remote_debugging" | "utilities/start_ssh" | "utilities/stop_ssh" => {
+            "utilities/allow_remote_debugging" => {
                 exact(&args, 0)?;
-                service_start(REMOTE_DEBUGGER_UNIT).await.map(Value::Bool)
+                self.allow_remote_debugging().await.map(Value::Bool)
             }
             "utilities/disallow_remote_debugging" => {
                 exact(&args, 0)?;
-                service_stop(REMOTE_DEBUGGER_UNIT).await.map(Value::Bool)
+                self.disallow_remote_debugging().await.map(Value::Bool)
+            }
+            "utilities/start_ssh" => {
+                exact(&args, 0)?;
+                start_ssh().await.map(Value::Bool)
+            }
+            "utilities/stop_ssh" => {
+                exact(&args, 0)?;
+                stop_ssh().await.map(Value::Bool)
             }
             "utilities/restart_webhelper" => {
                 exact(&args, 0)?;
-                restart_webhelper().await.map(Value::Bool)
+                restart_webhelper(&backend.user).await.map(Value::Bool)
             }
             "utilities/close_cef_socket" => {
                 exact(&args, 0)?;
@@ -807,6 +836,95 @@ impl Utilities {
         Ok(())
     }
 
+    async fn allow_remote_debugging(&self) -> Result<bool, RpcError> {
+        let _lifecycle = self.remote_debugger_lifecycle.lock().await;
+        if *self.shutdown_tx.borrow() {
+            return Err(RpcError::failure("utilities are shutting down"));
+        }
+        let finished = {
+            let mut proxy = self.remote_debugger_proxy.lock().await;
+            if proxy
+                .as_ref()
+                .is_some_and(|proxy| !proxy.task.is_finished())
+            {
+                return Ok(true);
+            }
+            proxy.take()
+        };
+        if let Some(proxy) = finished {
+            return match proxy.task.await {
+                Ok(Ok(())) => Err(RpcError::failure(
+                    "CEF debugger forwarder stopped unexpectedly",
+                )),
+                Ok(Err(error)) => Err(RpcError::failure(format!(
+                    "CEF debugger forwarder failed: {error}"
+                ))),
+                Err(error) => Err(RpcError::failure(format!(
+                    "CEF debugger forwarder task failed: {error}"
+                ))),
+            };
+        }
+        let mut cancelled = self.shutdown_tx.subscribe();
+        let listener = tokio::select! {
+            changed = cancelled.changed() => {
+                let _ = changed;
+                return Err(RpcError::failure("CEF debugger forwarding cancelled during shutdown"));
+            }
+            listener = TcpListener::bind((REMOTE_DEBUGGER_BIND, REMOTE_DEBUGGER_PORT)) => {
+                listener.map_err(|error| RpcError::failure(format!(
+                    "failed to bind CEF debugger forwarder on {REMOTE_DEBUGGER_BIND}:{REMOTE_DEBUGGER_PORT}: {error}"
+                )))?
+            }
+        };
+        if *cancelled.borrow() {
+            return Err(RpcError::failure(
+                "CEF debugger forwarding cancelled during shutdown",
+            ));
+        }
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(run_tcp_forwarder(
+            listener,
+            CEF_DEBUGGER_HOST.to_owned(),
+            CEF_DEBUGGER_PORT,
+            "CEF debugger forwarder",
+            stopped,
+        ));
+        *self.remote_debugger_proxy.lock().await = Some(TcpProxy { stop, task });
+        Ok(true)
+    }
+
+    async fn disallow_remote_debugging(&self) -> Result<bool, RpcError> {
+        let _lifecycle = self.remote_debugger_lifecycle.lock().await;
+        let owns_proxy = self.remote_debugger_proxy.lock().await.is_some();
+        self.stop_remote_debugger_proxy().await?;
+        if !owns_proxy {
+            ensure_listener_available(
+                REMOTE_DEBUGGER_BIND,
+                REMOTE_DEBUGGER_PORT,
+                "CEF debugger forwarding",
+            )
+            .await?;
+        }
+        Ok(true)
+    }
+
+    async fn stop_remote_debugger_proxy(&self) -> Result<(), RpcError> {
+        let proxy = self.remote_debugger_proxy.lock().await.take();
+        let Some(proxy) = proxy else {
+            return Ok(());
+        };
+        let _ = proxy.stop.send(true);
+        match proxy.task.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(RpcError::failure(format!(
+                "CEF debugger forwarder stopped with an error: {error}"
+            ))),
+            Err(error) => Err(RpcError::failure(format!(
+                "CEF debugger forwarder task failed: {error}"
+            ))),
+        }
+    }
+
     async fn start_rdt_proxy(
         &self,
         host: String,
@@ -825,8 +943,14 @@ impl Utilities {
             return Err(RpcError::failure("RDT setup cancelled during shutdown"));
         }
         let (stop, stopped) = watch::channel(false);
-        let task = tokio::spawn(run_rdt_proxy(listener, host, stopped));
-        *self.rdt_proxy.lock().await = Some(RdtProxy { stop, task });
+        let task = tokio::spawn(run_tcp_forwarder(
+            listener,
+            host,
+            RDT_PORT,
+            "RDT proxy",
+            stopped,
+        ));
+        *self.rdt_proxy.lock().await = Some(TcpProxy { stop, task });
         Ok(())
     }
 
@@ -850,6 +974,20 @@ impl Default for Utilities {
     fn default() -> Self {
         Self::new()
     }
+}
+
+async fn ensure_listener_available(
+    bind: &str,
+    port: u16,
+    description: &str,
+) -> Result<(), RpcError> {
+    let listener = TcpListener::bind((bind, port)).await.map_err(|error| {
+        RpcError::failure(format!(
+            "{description} at {bind}:{port} is held by an external listener: {error}"
+        ))
+    })?;
+    drop(listener);
+    Ok(())
 }
 
 fn legacy_args(method: &str, kwargs: &Value) -> Result<Vec<Value>, String> {
@@ -1735,9 +1873,15 @@ fn service_manager() -> String {
 
 async fn service_active(unit: &str, manager: &str) -> Result<bool, RpcError> {
     let output = match manager {
-        "systemd" => run_command("systemctl", &["is-active", unit]).await?,
+        "systemd" => systemctl_output(&["is-active", unit])
+            .await
+            .map_err(|error| RpcError::failure(format!("failed to execute systemctl: {error}")))?,
         "openrc" => openrc_command(unit, "status").await?,
-        _ => return Ok(true),
+        _ => {
+            return Err(RpcError::failure(format!(
+                "unsupported service manager '{manager}'"
+            )));
+        }
     };
     Ok(output.status.success())
 }
@@ -1759,9 +1903,15 @@ async fn service_start(unit: &str) -> Result<bool, RpcError> {
         return Ok(true);
     }
     let started = match manager.as_str() {
-        "systemd" => run_command("systemctl", &["start", unit]).await?,
+        "systemd" => systemctl_output(&["start", unit])
+            .await
+            .map_err(|error| RpcError::failure(format!("failed to execute systemctl: {error}")))?,
         "openrc" => openrc_command(unit, "start").await?,
-        _ => return Ok(true),
+        _ => {
+            return Err(RpcError::failure(format!(
+                "unsupported service manager '{manager}'"
+            )));
+        }
     };
     if !started.status.success() {
         return Err(command_error("service start", unit, &started));
@@ -1772,10 +1922,14 @@ async fn service_start(unit: &str) -> Result<bool, RpcError> {
 async fn service_stop(unit: &str) -> Result<bool, RpcError> {
     let manager = service_manager();
     if manager != "systemd" && manager != "openrc" {
-        return Ok(true);
+        return Err(RpcError::failure(format!(
+            "unsupported service manager '{manager}'"
+        )));
     }
     if manager == "systemd" {
-        let active = run_command("systemctl", &["is-active", unit]).await?;
+        let active = systemctl_output(&["is-active", unit])
+            .await
+            .map_err(|error| RpcError::failure(format!("failed to execute systemctl: {error}")))?;
         if !active.status.success() {
             if active.status.code() == Some(3)
                 && String::from_utf8_lossy(&active.stdout).trim() == "inactive"
@@ -1788,7 +1942,9 @@ async fn service_stop(unit: &str) -> Result<bool, RpcError> {
         return Ok(true);
     }
     let stopped = match manager.as_str() {
-        "systemd" => run_command("systemctl", &["stop", unit]).await?,
+        "systemd" => systemctl_output(&["stop", unit])
+            .await
+            .map_err(|error| RpcError::failure(format!("failed to execute systemctl: {error}")))?,
         "openrc" => openrc_command(unit, "stop").await?,
         _ => unreachable!("unsupported managers returned above"),
     };
@@ -1798,8 +1954,38 @@ async fn service_stop(unit: &str) -> Result<bool, RpcError> {
     Ok(true)
 }
 
-async fn restart_webhelper() -> Result<bool, RpcError> {
-    let output = run_command("killall", &["-s", "SIGTERM", "steamwebhelper"]).await?;
+fn require_root_authority(operation: &str, effective_uid: u32) -> Result<(), RpcError> {
+    if effective_uid == 0 {
+        Ok(())
+    } else {
+        Err(RpcError::failure(format!(
+            "{operation} requires root privileges and is unavailable in the user service"
+        )))
+    }
+}
+
+async fn start_ssh() -> Result<bool, RpcError> {
+    require_root_authority(
+        "starting the system SSH daemon",
+        crate::platform::effective_user_ids().0,
+    )?;
+    service_start(SSHD_UNIT).await
+}
+
+async fn stop_ssh() -> Result<bool, RpcError> {
+    require_root_authority(
+        "stopping the system SSH daemon",
+        crate::platform::effective_user_ids().0,
+    )?;
+    service_stop(SSHD_UNIT).await
+}
+
+async fn restart_webhelper(user: &str) -> Result<bool, RpcError> {
+    let output = if crate::platform::effective_user_ids().0 == 0 {
+        run_command("killall", &["-s", "SIGTERM", "steamwebhelper"]).await?
+    } else {
+        run_command("killall", &["-s", "SIGTERM", "-u", user, "steamwebhelper"]).await?
+    };
     if !output.status.success() {
         return Err(command_error(
             "killall -s SIGTERM",
@@ -1816,12 +2002,11 @@ async fn close_cef_socket() -> Result<(), RpcError> {
     {
         return Ok(());
     }
-    // The original Linux workaround requires Decky to run as root to inject
-    // close(2) into steamwebhelper with gdb.
-    if crate::platform::effective_user_ids().0 != 0 {
-        eprintln!("Can't close CEF socket because Decky isn't running as root.");
-        return Ok(());
-    }
+    // The original Linux workaround requires root to inject close(2) into CEF.
+    require_root_authority(
+        "CEF socket close workaround",
+        crate::platform::effective_user_ids().0,
+    )?;
     let _lock = CEF_SOCKET_CLOSE_LOCK.lock().await;
     let output = run_command("lsof", &["-F", "-iTCP:8080", "-sTCP:LISTEN"]).await?;
     if !output.status.success() || output.stdout.is_empty() {
@@ -1907,9 +2092,11 @@ fn command_error(action: &str, target: &str, output: &Output) -> RpcError {
     ))
 }
 
-async fn run_rdt_proxy(
+async fn run_tcp_forwarder(
     listener: TcpListener,
     host: String,
+    port: u16,
+    label: &'static str,
     mut stopped: watch::Receiver<bool>,
 ) -> Result<(), String> {
     let mut connections = JoinSet::new();
@@ -1921,13 +2108,15 @@ async fn run_rdt_proxy(
                 }
             }
             accepted = listener.accept() => {
-                let (stream, _) = accepted.map_err(|error| format!("RDT proxy accept failed: {error}"))?;
+                let (stream, _) = accepted.map_err(|error| format!("{label} accept failed: {error}"))?;
                 let host = host.clone();
-                connections.spawn(async move { forward_rdt_connection(stream, host).await });
+                connections.spawn(async move {
+                    forward_tcp_connection(stream, host, port, label).await
+                });
             }
             Some(joined) = connections.join_next(), if !connections.is_empty() => {
                 if let Err(error) = joined {
-                    eprintln!("RDT proxy connection task failed: {error}");
+                    eprintln!("{label} connection task failed: {error}");
                 }
             }
         }
@@ -1937,23 +2126,36 @@ async fn run_rdt_proxy(
     Ok(())
 }
 
-async fn forward_rdt_connection(mut local: TcpStream, host: String) {
-    let mut remote = match TcpStream::connect((host.as_str(), RDT_PORT)).await {
+async fn forward_tcp_connection(
+    mut local: TcpStream,
+    host: String,
+    port: u16,
+    label: &'static str,
+) {
+    let mut remote = match TcpStream::connect((host.as_str(), port)).await {
         Ok(remote) => remote,
         Err(error) => {
-            eprintln!("Failed to connect RDT proxy client to {host}:{RDT_PORT}: {error}");
+            eprintln!("Failed to connect {label} client to {host}:{port}: {error}");
             return;
         }
     };
     if let Err(error) = copy_bidirectional(&mut local, &mut remote).await {
-        eprintln!("RDT proxy stream forwarding failed: {error}");
+        eprintln!("{label} stream forwarding failed: {error}");
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FilePickerOptions, filepicker_listing};
+    use super::{
+        FilePickerOptions, ensure_listener_available, filepicker_listing, require_root_authority,
+        run_tcp_forwarder,
+    };
     use std::{fs, path::PathBuf};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::watch,
+    };
     use uuid::Uuid;
 
     struct TestDir(PathBuf);
@@ -1970,6 +2172,62 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn external_forwarder_port_is_not_reported_as_stopped() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let error = ensure_listener_available("127.0.0.1", port, "test forwarding")
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("held by an external listener"));
+
+        drop(listener);
+        ensure_listener_available("127.0.0.1", port, "test forwarding")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_forwarder_relays_full_duplex_streams_and_stops_cleanly() {
+        let destination = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let destination_address = destination.local_addr().unwrap();
+        let forwarding_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let forwarding_address = forwarding_listener.local_addr().unwrap();
+        let destination_task = tokio::spawn(async move {
+            let (mut stream, _) = destination.accept().await.unwrap();
+            let mut request = [0; 7];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"request");
+            stream.write_all(b"response").await.unwrap();
+        });
+
+        let (stop, stopped) = watch::channel(false);
+        let forwarder = tokio::spawn(run_tcp_forwarder(
+            forwarding_listener,
+            destination_address.ip().to_string(),
+            destination_address.port(),
+            "test forwarder",
+            stopped,
+        ));
+        let mut client = TcpStream::connect(forwarding_address).await.unwrap();
+        client.write_all(b"request").await.unwrap();
+        let mut response = [0; 8];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"response");
+        drop(client);
+        destination_task.await.unwrap();
+
+        let _ = stop.send(true);
+        forwarder.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn user_service_reports_root_only_utility_refusal() {
+        let refusal = require_root_authority("starting the system SSH daemon", 1000).unwrap_err();
+        assert!(refusal.message().contains("requires root privileges"));
+        assert!(require_root_authority("starting the system SSH daemon", 0).is_ok());
     }
 
     #[test]

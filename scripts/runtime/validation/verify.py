@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import pwd
 from urllib.parse import quote
 
 import aiohttp
@@ -53,7 +54,8 @@ class Client:
             await self.socket.close()
 
 
-async def main(base: str, privileged: bool, expected_version: str):
+async def main(base: str, privileged: bool, expected_version: str, expected_user: str = 'deck', expect_root_rejection: bool = False):
+    account = pwd.getpwnam(expected_user)
     async with aiohttp.ClientSession(auto_decompress=False) as session:
         async with session.get(base + '/auth/token') as response:
             assert response.status == 200
@@ -79,21 +81,30 @@ async def main(base: str, privileged: bool, expected_version: str):
         await client.connect()
         try:
             plugins = await client.call('loader/get_plugins')
-            failures = [plugin for plugin in plugins if plugin.get('error')]
+            failures = [plugin for plugin in plugins if plugin.get('error') and not (
+                expect_root_rejection and plugin['name'] == 'Rust Probe Root'
+            )]
             assert not failures, failures
+            if expect_root_rejection:
+                root = next(plugin for plugin in plugins if plugin['name'] == 'Rust Probe Root')
+                assert root.get('error'), root
+                denied = await client.reply(await client.send(
+                    'loader/call_plugin_method', ['Rust Probe Root', 'compute', [3, 4]]
+                ))
+                assert denied['type'] == -1, denied
             assert await client.call('utilities/ping') == 'pong'
             user = await client.call('utilities/get_user_info')
-            assert user == {'username': 'deck', 'path': '/home/deck'}, user
+            assert user == {'username': account.pw_name, 'path': account.pw_dir}, user
             version = await client.call('updater/get_version_info')
             assert version['current'] == expected_version, version
             assert version['sdk_version'] == 'v3.2.10', version
 
             modern = await client.call('loader/call_plugin_method', 'Rust Probe Modern', 'compute', [3, 4])
-            assert modern['total'] == 25 and modern['alias'] and modern['user'] == 1000, modern
+            assert modern['total'] == 25 and modern['alias'] and modern['user'] == account.pw_uid, modern
             assert modern['python'].startswith('3.11.'), modern
             assert modern['native_modules'] == ['aiohttp._http_parser', 'multidict._multidict'], modern
             legacy = await client.call('loader/call_legacy_plugin_method', 'Rust Probe Legacy', 'compute', {'values': [3, 4]})
-            assert legacy['success'] and legacy['result']['total'] == 25 and legacy['result']['user'] == 1000, legacy
+            assert legacy['success'] and legacy['result']['total'] == 25 and legacy['result']['user'] == account.pw_uid, legacy
             modern_identity = await client.call('loader/call_plugin_method', 'Rust Probe Modern', 'process_identity')
             legacy_identity = await client.call('loader/call_legacy_plugin_method', 'Rust Probe Legacy', 'process_identity', {})
             assert legacy_identity['success'], legacy_identity
@@ -101,6 +112,14 @@ async def main(base: str, privileged: bool, expected_version: str):
             assert modern_identity['cmdline'] != legacy_identity['result']['cmdline'], (modern_identity, legacy_identity)
             authenticated = await client.call('loader/call_plugin_method', 'Rust Probe Modern', 'backend_ping')
             assert authenticated == {'status': 200, 'body': {'success': True, 'result': 'pong'}}, authenticated
+            native_value = {'text': '日本語', 'values': [None, True, 42, 1.5]}
+            for ascii_only in (True, False):
+                encoded = await client.call('loader/call_plugin_method', 'Rust Probe Modern', 'native_encode', ascii_only)
+                assert encoded == json.dumps(native_value, ensure_ascii=ascii_only), encoded
+            legacy_native = await client.call(
+                'loader/call_legacy_plugin_method', 'Rust Probe Legacy', 'native_encode', {'ensure_ascii': False}
+            )
+            assert legacy_native['success'] and json.loads(legacy_native['result']) == native_value, legacy_native
             event = next(frame for frame in client.events if frame['event'] == 'loader/plugin_event' and frame['args'][0]['plugin'] == 'Rust Probe Modern')
             assert event['args'][0]['event'] == 'calculated' and event['args'][0]['args'] == [25.0, '日本語'], event
 
@@ -156,7 +175,7 @@ async def main(base: str, privileged: bool, expected_version: str):
                 assert passive['type'] == -1, passive
                 real['passive_plugin'] = 'listed; backend calls rejected'
 
-            print(json.dumps({'release_version': version['current'], 'sdk_version': version['sdk_version'], 'http_auth_cors_assets': 'passed', 'sdk_authenticated_backend_call': 'passed', 'modern': modern, 'legacy': legacy['result'], 'events_unicode': 'passed', 'private_method_rejection': 'passed', 'duplicate_reply_replay': 'passed', 'inflight_full_sync': 'passed', 'reload_cancellation': 'passed', 'plugins': [{'name': item['name'], 'version': item['version'], 'load_type': item['load_type']} for item in plugins], 'real_plugins': real}, ensure_ascii=False))
+            print(json.dumps({'release_version': version['current'], 'sdk_version': version['sdk_version'], 'http_auth_cors_assets': 'passed', 'sdk_authenticated_backend_call': 'passed', 'public_native_json': 'passed', 'root_plugin_rejection': 'passed' if expect_root_rejection else 'not requested', 'worker_processes': {'modern': modern_identity, 'legacy': legacy_identity['result']}, 'modern': modern, 'legacy': legacy['result'], 'events_unicode': 'passed', 'private_method_rejection': 'passed', 'duplicate_reply_replay': 'passed', 'inflight_full_sync': 'passed', 'reload_cancellation': 'passed', 'plugins': [{'name': item['name'], 'version': item['version'], 'load_type': item['load_type']} for item in plugins], 'real_plugins': real}, ensure_ascii=False))
         finally:
             await client.close()
 
@@ -166,5 +185,7 @@ if __name__ == '__main__':
     parser.add_argument('--base', default='http://127.0.0.1:1339')
     parser.add_argument('--privileged', action='store_true')
     parser.add_argument('--expected-version', default='dev')
+    parser.add_argument('--expected-user', default='deck')
+    parser.add_argument('--expect-root-rejection', action='store_true')
     args = parser.parse_args()
-    asyncio.run(main(args.base, args.privileged, args.expected_version))
+    asyncio.run(main(args.base, args.privileged, args.expected_version, args.expected_user, args.expect_root_rejection))

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import errno
 import base64
+import ctypes
 import fcntl
 import hashlib
 import ipaddress
@@ -37,8 +38,8 @@ from process_observer import Process, cgroup_processes, read_process
 
 KIND = 'decky-loader-runtime'
 BASELINE_TAG = 'v3.2.10'
-UNIT_DIRECTORY = Path('/etc/systemd/system')
 SERVICE_STOP_DIRECTORY = Path('/run/decky-loader-runtime-stops')
+LEGACY_MIGRATION_ROOT = Path('/var/lib/decky-loader-runtime/legacy-migrations')
 SYSTEMCTL_CANDIDATES = (Path('/usr/bin/systemctl'), Path('/bin/systemctl'))
 DEFAULT_LISTEN = '127.0.0.1:1337'
 DEFAULT_CEF_URL = 'http://127.0.0.1:8080'
@@ -162,15 +163,192 @@ def _ensure_directory(path: Path, mode: int, *, managed: bool = False) -> None:
         path.mkdir(mode=mode)
         os.chmod(path, mode)
         _fsync_directory(path.parent)
-        return
+        result = path.lstat()
     if not stat.S_ISDIR(result.st_mode):
         _fail(f'refusing non-directory or symlink: {path}')
-    if managed and (result.st_uid != 0 or result.st_mode & 0o022):
-        _fail(f'managed installer directory must be root-owned and not group/world writable: {path}')
+    if managed and (result.st_uid != os.geteuid() or result.st_mode & 0o022):
+        _fail(f'managed installer directory must be owned by uid {os.geteuid()} and not group/world writable: {path}')
+
 
 def _require_root() -> None:
     if os.name != 'posix' or os.geteuid() != 0:
-        _fail('installer mutations and status require root on Linux')
+        _fail('legacy system-service migration and restore require root on Linux')
+
+
+def _current_user() -> pwd.struct_passwd:
+    try:
+        return pwd.getpwuid(os.geteuid())
+    except KeyError as error:
+        raise InstallerError(f'cannot resolve effective uid {os.geteuid()} to a Unix account') from error
+
+
+def _require_user(user: pwd.struct_passwd) -> None:
+    if os.name != 'posix' or os.geteuid() == 0:
+        _fail('ordinary installation and service management must run as the non-root service account')
+    if user.pw_uid == 0 or user.pw_uid != os.geteuid():
+        _fail('ordinary installation and service management must run as the account named by --user')
+
+
+def _user_runtime_directory(user: pwd.struct_passwd) -> Path:
+    runtime = Path(f'/run/user/{user.pw_uid}')
+    try:
+        info = runtime.lstat()
+    except OSError as error:
+        raise InstallerError(f'user runtime directory is unavailable: {error}') from error
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != user.pw_uid or info.st_mode & 0o077:
+        _fail(f'user runtime directory must be a private directory owned by {user.pw_name}: {runtime}')
+    return runtime
+
+
+def _manager_environment(user: pwd.struct_passwd) -> dict[str, str]:
+    runtime = _user_runtime_directory(user)
+    environment = os.environ.copy()
+    environment.pop('XDG_CONFIG_HOME', None)
+    environment.update({
+        'HOME': user.pw_dir,
+        'USER': user.pw_name,
+        'LOGNAME': user.pw_name,
+        'XDG_RUNTIME_DIR': str(runtime),
+        'DBUS_SESSION_BUS_ADDRESS': f'unix:path={runtime / "bus"}',
+    })
+    return environment
+
+
+def _busctl_path() -> Path:
+    for candidate in (Path('/usr/bin/busctl'), Path('/bin/busctl')):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    _fail('busctl was not found; cannot resolve the running user manager unit path')
+
+
+def _manager_unit_paths(user: pwd.struct_passwd) -> tuple[Path, ...]:
+    paths = {'unit': Path('systemd-manager.service'), 'scope': 'user', 'user': user}
+    command = [
+        _busctl_path().as_posix(), '--user', '--json=short', 'get-property',
+        'org.freedesktop.systemd1', '/org/freedesktop/systemd1',
+        'org.freedesktop.systemd1.Manager', 'UnitPath',
+    ]
+    result = _run_manager_command(paths, command, timeout=15)
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or f'exit status {result.returncode}'
+        _fail(f'cannot query {user.pw_name} user-manager UnitPath: {detail}')
+    try:
+        response = json.loads(result.stdout)
+        unit_paths = response['data']
+        if response['type'] != 'as' or not isinstance(unit_paths, list):
+            raise ValueError('UnitPath is not a string array')
+        raw_paths = tuple(Path(value) for value in unit_paths)
+        if any(not value.is_absolute() or '..' in value.parts for value in raw_paths):
+            raise ValueError('UnitPath contains a non-absolute or traversing path')
+        parsed = tuple(value.resolve(strict=False) for value in raw_paths)
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError, json.JSONDecodeError) as error:
+        _fail(f'user manager returned an invalid structured UnitPath: {error}')
+    return parsed
+
+
+def _validate_user_unit_directory(
+    directory: Path,
+    user: pwd.struct_passwd,
+    *,
+    create: bool,
+) -> None:
+    if (
+        not directory.is_absolute() or '..' in directory.parts
+        or directory.name != 'user' or directory.parent.name != 'systemd'
+    ):
+        _fail('user manager unit directory must be an absolute systemd/user search path')
+    base = directory.parent.parent
+    managed = {base, base / 'systemd', directory}
+    chain: list[Path] = []
+    current = Path(directory.anchor)
+    chain.append(current)
+    for component in directory.parts[1:]:
+        current = current / component
+        chain.append(current)
+    base_seen = False
+    for current in chain:
+        is_managed = current in managed
+        if current == base:
+            base_seen = True
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            if is_managed and create:
+                try:
+                    current.mkdir(mode=0o700)
+                except FileExistsError:
+                    pass
+                except OSError as error:
+                    raise InstallerError(f'cannot create user unit directory {current}: {error}') from error
+                else:
+                    os.chmod(current, 0o700)
+                    _fsync_directory(current.parent)
+                try:
+                    info = current.lstat()
+                except OSError as error:
+                    raise InstallerError(f'user unit directory is unavailable: {error}') from error
+            else:
+                if not is_managed and (create or base_seen):
+                    _fail(f'user unit directory parent is unavailable: {current}')
+                continue
+        except OSError as error:
+            raise InstallerError(f'user unit path is unavailable: {error}') from error
+        if not stat.S_ISDIR(info.st_mode):
+            _fail(f'refusing non-directory or symlink in user unit path: {current}')
+        if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+            _fail(f'user unit path has a group/world-writable parent: {current}')
+        if is_managed and (
+            info.st_uid != user.pw_uid or info.st_mode & 0o022
+        ):
+            _fail(f'user unit directory is not owned by {user.pw_name} or is group/world writable: {current}')
+    try:
+        base.lstat()
+    except FileNotFoundError:
+        parent = base.parent
+        try:
+            parent_info = parent.lstat()
+        except OSError as error:
+            raise InstallerError(f'user unit directory parent is unavailable: {error}') from error
+        if (
+            not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != user.pw_uid
+            or parent_info.st_mode & 0o022
+        ):
+            _fail(f'cannot safely create user unit directory beneath {parent}')
+
+
+def _user_unit_directory(
+    user: pwd.struct_passwd,
+    *,
+    create: bool = True,
+    value: str | None = None,
+) -> Path:
+    if value is not None:
+        directory = Path(value)
+        if not directory.is_absolute() or '..' in directory.parts:
+            _fail('user unit directory must be absolute and must not contain parent traversal')
+        try:
+            directory = directory.resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise InstallerError(f'cannot resolve user unit directory: {error}') from error
+        unit_paths = _manager_unit_paths(user)
+        if directory not in unit_paths:
+            _fail(f'user unit directory is not in {user.pw_name} manager UnitPath: {directory}')
+        _validate_user_unit_directory(directory, user, create=create)
+        return directory
+    unit_paths = _manager_unit_paths(user)
+    global_roots = tuple(Path(value) for value in (
+        '/etc/systemd/user', '/run/systemd/user', '/usr/lib/systemd/user',
+        '/usr/local/lib/systemd/user', '/lib/systemd/user', '/usr/share/systemd/user',
+        '/usr/local/share/systemd/user',
+    ))
+    for directory in unit_paths:
+        if directory.name != 'user' or directory.parent.name != 'systemd':
+            continue
+        if any(directory == root or root in directory.parents for root in global_roots):
+            continue
+        _validate_user_unit_directory(directory, user, create=create)
+        return directory
+    _fail(f'{user.pw_name} manager UnitPath has no safe user-owned systemd/user directory')
 
 
 def _normalize_service_name(value: str) -> tuple[str, str]:
@@ -185,46 +363,99 @@ def _normalize_service_name(value: str) -> tuple[str, str]:
     return base, f'{base}.service'
 
 
-def _homebrew_path(value: str, *, create: bool = False) -> Path:
+def _homebrew_path(
+    value: str,
+    *,
+    create: bool = False,
+    allow_missing: bool = False,
+) -> Path:
     path = Path(value)
     if not path.is_absolute():
         _fail('--homebrew must be an absolute path')
     try:
-        resolved = path.resolve(strict=not create)
-    except OSError as error:
+        resolved = path.resolve(strict=not create and not allow_missing)
+    except (OSError, RuntimeError) as error:
         raise InstallerError(f'homebrew directory is unavailable: {error}') from error
     if create and not resolved.exists():
         resolved.mkdir(mode=0o755, parents=True)
-    if not resolved.is_dir():
+    if not resolved.exists() and allow_missing:
+        try:
+            original = path.lstat()
+        except FileNotFoundError:
+            original = None
+        except OSError as error:
+            raise InstallerError(f'homebrew destination is unavailable: {error}') from error
+        if original is not None and stat.S_ISLNK(original.st_mode):
+            _fail(f'refusing dangling homebrew symlink: {path}')
+        ancestor = resolved
+        while True:
+            try:
+                info = ancestor.lstat()
+                break
+            except FileNotFoundError:
+                if ancestor.parent == ancestor:
+                    _fail(f'homebrew destination has no existing parent: {resolved}')
+                ancestor = ancestor.parent
+            except OSError as error:
+                raise InstallerError(f'homebrew destination parent is unavailable: {error}') from error
+        if not stat.S_ISDIR(info.st_mode):
+            _fail(f'homebrew destination parent is not a directory: {ancestor}')
+        if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            _fail(f'homebrew destination parent is not safely owned by uid {os.geteuid()}: {ancestor}')
+    elif not resolved.is_dir():
         _fail(f'homebrew path is not a directory: {resolved}')
     if any(character.isspace() or character in ('%', '$', '\\', '"') or ord(character) < 32 for character in str(resolved)):
         _fail('homebrew path contains characters unsafe for systemd unit expansion')
     return resolved
 
 
-def _unit_directory() -> Path:
-    for candidate in SYSTEMCTL_CANDIDATES:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            break
-    else:
-        _fail('systemctl was not found at /usr/bin/systemctl or /bin/systemctl')
-    try:
-        result = UNIT_DIRECTORY.lstat()
-    except OSError as error:
-        raise InstallerError(f'systemd unit directory is unavailable: {error}') from error
-    if not stat.S_ISDIR(result.st_mode):
-        _fail(f'refusing non-directory systemd unit path: {UNIT_DIRECTORY}')
-    return UNIT_DIRECTORY
+def _load_persisted_unit_directory(state: Path, user: pwd.struct_passwd) -> Path | None:
+    record_path = state / 'unit-directory.json'
+    info = _lstat_regular_or_absent(record_path)
+    if info is None:
+        return None
+    if (
+        info.st_uid != user.pw_uid or info.st_mode & 0o077 or info.st_nlink != 1
+    ):
+        _fail(f'persisted unit directory record is not protected for {user.pw_name}: {record_path}')
+    record = _read_json(record_path)
+    if (
+        type(record.get('schema')) is not int or record['schema'] != 1
+        or type(record.get('user_uid')) is not int or record['user_uid'] != user.pw_uid
+        or not isinstance(record.get('unit_directory'), str)
+    ):
+        _fail(f'persisted unit directory record is invalid: {record_path}')
+    return _user_unit_directory(user, create=True, value=record['unit_directory'])
 
 
-def _paths(homebrew: Path, service_name: str) -> dict[str, Path]:
+def _persisted_user_unit_directory(state: Path, user: pwd.struct_passwd) -> Path:
+    existing = _load_persisted_unit_directory(state, user)
+    if existing is not None:
+        return existing
+    directory = _user_unit_directory(user)
+    record = {
+        'schema': 1,
+        'user_uid': user.pw_uid,
+        'unit_directory': str(directory),
+    }
+    if _write_json_exclusive(state / 'unit-directory.json', record, mode=0o600):
+        return directory
+    existing = _load_persisted_unit_directory(state, user)
+    if existing is None:
+        _fail(f'persisted unit directory record disappeared during initialization: {state}')
+    return existing
+
+
+def _paths(homebrew: Path, service_name: str, user: pwd.struct_passwd | None = None) -> dict[str, Any]:
     _, unit_filename = _normalize_service_name(service_name)
+    user = user or _current_user()
+    _require_user(user)
     services = homebrew / 'services'
     _ensure_directory(services, 0o755)
-    service_root = services / '.decky-installer'
-    _ensure_directory(service_root, 0o755, managed=True)
+    service_root = services / '.decky-user-installer'
+    _ensure_directory(service_root, 0o700, managed=True)
     state = service_root / unit_filename
-    _ensure_directory(state, 0o755, managed=True)
+    _ensure_directory(state, 0o700, managed=True)
     runtimes = state / 'runtimes'
     _ensure_directory(runtimes, 0o755, managed=True)
     history = state / 'history'
@@ -233,7 +464,7 @@ def _paths(homebrew: Path, service_name: str) -> dict[str, Path]:
     queue = state / 'queue'
     _ensure_directory(queue, 0o700, managed=True)
     os.chmod(queue, 0o700)
-    unit_dir = _unit_directory()
+    unit_dir = _persisted_user_unit_directory(state, user)
     return {
         'homebrew': homebrew,
         'services': services,
@@ -248,8 +479,9 @@ def _paths(homebrew: Path, service_name: str) -> dict[str, Path]:
         'head': state / 'head.json',
         'active': state / 'active.json',
         'lock': state / 'lock',
+        'scope': 'user',
+        'user': user,
     }
-
 
 def _systemctl_path() -> Path:
     for candidate in SYSTEMCTL_CANDIDATES:
@@ -258,23 +490,60 @@ def _systemctl_path() -> Path:
     _fail('systemctl was not found')
 
 
-def _systemctl(paths: dict[str, Path], *arguments: str, check: bool = True, timeout: float = 30) -> subprocess.CompletedProcess[str]:
-    command = [_systemctl_path().as_posix(), '--system', *arguments]
+def _run_manager_command(paths: dict[str, Any], command: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    if paths.get('scope', 'user') != 'user':
+        try:
+            return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise InstallerError(f'cannot run system manager command for {paths["unit"].name}: {error}') from error
+    user = paths.get('user') or _current_user()
+    environment = _manager_environment(user)
+    options: dict[str, Any] = {}
+    if os.geteuid() != user.pw_uid:
+        if os.geteuid() != 0:
+            _fail(f'cannot access the user manager for {user.pw_name} from uid {os.geteuid()}')
+        try:
+            groups = os.getgrouplist(user.pw_name, user.pw_gid)
+        except AttributeError:
+            groups = [user.pw_gid]
+
+        def drop_privileges() -> None:
+            os.setgroups(groups)
+            os.setgid(user.pw_gid)
+            os.setuid(user.pw_uid)
+
+        options.update(cwd=user.pw_dir if Path(user.pw_dir).is_dir() else '/', preexec_fn=drop_privileges)
     try:
-        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+        return subprocess.run(
+            command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, check=False, env=environment, **options,
+        )
     except (OSError, subprocess.SubprocessError) as error:
-        raise InstallerError(f'cannot run systemctl for {paths["unit"].name}: {error}') from error
+        raise InstallerError(f'cannot run user manager command for {paths["unit"].name}: {error}') from error
+
+
+def _systemctl(paths: dict[str, Any], *arguments: str, check: bool = True, timeout: float = 30) -> subprocess.CompletedProcess[str]:
+    scope = paths.get('scope', 'user')
+    if scope not in ('user', 'system'):
+        _fail(f'unsupported systemd manager scope: {scope}')
+    command = [_systemctl_path().as_posix(), f'--{scope}', *arguments]
+    result = _run_manager_command(paths, command, timeout)
     if check and result.returncode:
         detail = result.stderr.strip() or result.stdout.strip() or f'exit status {result.returncode}'
         _fail(f'systemctl {arguments[0]} {paths["unit"].name} failed: {detail}')
     return result
 
 
-def _unit_properties(paths: dict[str, Path]) -> dict[str, str]:
+def _system_unit_paths(service_name: str) -> dict[str, Any]:
+    _, unit_filename = _normalize_service_name(service_name)
+    return {'unit': Path(unit_filename), 'scope': 'system'}
+
+
+def _unit_properties(paths: dict[str, Any]) -> dict[str, str]:
     result = _systemctl(
         paths,
         'show', paths['unit'].name,
-        '--property=LoadState,ActiveState,SubState,MainPID,UnitFileState,ControlGroup',
+        '--property=LoadState,ActiveState,SubState,MainPID,UnitFileState,ControlGroup,FragmentPath,DropInPaths',
         check=False,
         timeout=15,
     )
@@ -286,6 +555,254 @@ def _unit_properties(paths: dict[str, Path]) -> dict[str, str]:
         detail = result.stderr.strip() or result.stdout.strip()
         _fail(f'cannot inspect selected service {paths["unit"].name}: {detail}')
     return properties
+
+def _legacy_migration_record(
+    homebrew: Path,
+    service_name: str,
+    user_uid: int | None = None,
+) -> Path:
+    _, unit_filename = _normalize_service_name(service_name)
+    uid = os.getuid() if user_uid is None else user_uid
+    return LEGACY_MIGRATION_ROOT / str(uid) / unit_filename / 'status.json'
+
+
+def _open_directory_at(
+    parent: int,
+    name: str,
+    *,
+    create: bool,
+    mode: int,
+    private: bool = False,
+    exact_mode: bool = False,
+) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    created = False
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent)
+    except FileNotFoundError:
+        if not create:
+            raise
+        try:
+            os.mkdir(name, mode, dir_fd=parent)
+        except FileExistsError:
+            pass
+        else:
+            created = True
+            os.fsync(parent)
+        descriptor = os.open(name, flags, dir_fd=parent)
+    if created and stat.S_IMODE(os.fstat(descriptor).st_mode) != mode:
+        os.fchmod(descriptor, mode)
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+        or ((private or exact_mode) and stat.S_IMODE(info.st_mode) != mode)
+    ):
+        os.close(descriptor)
+        _fail(f'legacy migration directory is not protected: {name}')
+    return descriptor
+
+
+def _open_legacy_store(
+    user_uid: int,
+    service_name: str,
+    *,
+    create: bool,
+) -> tuple[Path, dict[str, int]]:
+    _, unit_filename = _normalize_service_name(service_name)
+    descriptors: dict[str, int] = {}
+    try:
+        root = os.open('/', os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0))
+        descriptors['root'] = root
+        current = root
+        relative = LEGACY_MIGRATION_ROOT.relative_to('/')
+        for index, component in enumerate(relative.parts):
+            child = _open_directory_at(
+                current,
+                component,
+                create=create,
+                mode=0o755,
+                exact_mode=True,
+            )
+            descriptors[f'path-{index}'] = child
+            current = child
+        store_fd = current
+        uid_fd = _open_directory_at(store_fd, str(user_uid), create=create, mode=0o755, exact_mode=True)
+        descriptors['uid'] = uid_fd
+        service_fd = _open_directory_at(uid_fd, unit_filename, create=create, mode=0o755, exact_mode=True)
+        descriptors['service'] = service_fd
+        private_fd = _open_directory_at(
+            service_fd,
+            'private',
+            create=create,
+            mode=0o700,
+            private=True,
+        )
+        descriptors['private'] = private_fd
+        helper_fd = _open_directory_at(
+            service_fd,
+            'helper',
+            create=create,
+            mode=0o755,
+            exact_mode=True,
+        )
+        descriptors['helper'] = helper_fd
+        return LEGACY_MIGRATION_ROOT / str(user_uid) / unit_filename, descriptors
+    except BaseException:
+        for descriptor in reversed(list(descriptors.values())):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def _open_legacy_public_directory(
+    user_uid: int,
+    service_name: str,
+) -> tuple[Path, dict[str, int]]:
+    _, unit_filename = _normalize_service_name(service_name)
+    descriptors: dict[str, int] = {}
+    try:
+        current = os.open('/', os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0))
+        descriptors['root'] = current
+        for index, component in enumerate(LEGACY_MIGRATION_ROOT.relative_to('/').parts):
+            current = _open_directory_at(
+                current, component, create=False, mode=0o755, exact_mode=True
+            )
+            descriptors[f'path-{index}'] = current
+        uid_fd = _open_directory_at(current, str(user_uid), create=False, mode=0o755, exact_mode=True)
+        descriptors['uid'] = uid_fd
+        service_fd = _open_directory_at(uid_fd, unit_filename, create=False, mode=0o755, exact_mode=True)
+        descriptors['service'] = service_fd
+        return LEGACY_MIGRATION_ROOT / str(user_uid) / unit_filename, descriptors
+    except BaseException:
+        for descriptor in reversed(list(descriptors.values())):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def _close_legacy_descriptors(descriptors: dict[str, int]) -> None:
+    for descriptor in reversed(list(descriptors.values())):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _read_json_at(directory_fd: int, name: str, *, mode: int, private: bool = False) -> dict[str, Any]:
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != mode
+            or info.st_mode & 0o022
+            or (private and info.st_mode & 0o077)
+        ):
+            _fail(f'legacy migration record is not protected: {name}')
+        with os.fdopen(descriptor, 'r', encoding='utf-8', closefd=False) as stream:
+            value = json.load(stream, object_pairs_hook=_unique_object)
+        if not isinstance(value, dict):
+            _fail(f'expected a JSON object in legacy migration record {name}')
+        return value
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise InstallerError(f'cannot read protected legacy migration record {name}: {error}') from error
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write_at(directory_fd: int, name: str, data: bytes, mode: int) -> None:
+    temporary = f'.{name}.{uuid.uuid4().hex}.tmp'
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(temporary, flags, mode, dir_fd=directory_fd)
+    try:
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, 'wb', closefd=False) as stream:
+            stream.write(data)
+            stream.flush()
+        os.fsync(descriptor)
+        os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(descriptor)
+
+
+def _read_legacy_status(homebrew: Path, service_name: str, user_uid: int) -> dict[str, Any] | None:
+    try:
+        _, descriptors = _open_legacy_public_directory(user_uid, service_name)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            os.stat('status.json', dir_fd=descriptors['service'], follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        status = _read_json_at(descriptors['service'], 'status.json', mode=0o644)
+        _, unit_filename = _normalize_service_name(service_name)
+        if (
+            set(status) != {'schema', 'user_uid', 'service', 'homebrew', 'phase'}
+            or status.get('schema') != 1
+            or status.get('user_uid') != user_uid
+            or status.get('service') != unit_filename
+            or status.get('homebrew') != str(homebrew)
+            or not isinstance(status.get('phase'), str)
+        ):
+            _fail('legacy migration public status is invalid')
+        return status
+    finally:
+        _close_legacy_descriptors(descriptors)
+
+def _assert_no_system_instance(paths: dict[str, Any]) -> dict[str, str]:
+    system = _unit_properties(_system_unit_paths(paths['unit'].stem))
+    load_state = system.get('LoadState', 'not-found')
+    user = paths.get('user') or _current_user()
+    status = _read_legacy_status(paths['homebrew'], paths['unit'].stem, user.pw_uid)
+    if load_state == 'not-found':
+        if status is None or status.get('phase') == 'restored':
+            return system
+        _fail('legacy migration state is incomplete; run restore-legacy-system before installing a user service')
+    if load_state == 'masked' and (
+        status is not None
+        and status.get('phase') in ('services-user-owned', 'installed')
+        and system.get('ActiveState') in ('inactive', 'failed')
+        and system.get('MainPID', '0') == '0'
+    ):
+        return system
+    _fail(
+        f'system service {paths["unit"].name} is present; run the explicit '
+        'migrate-legacy-system command before installing a user service'
+    )
+
+
+def _assert_user_unit_source(paths: dict[str, Any]) -> None:
+    properties = _unit_properties(paths)
+    if properties.get('LoadState') != 'loaded':
+        return
+    fragment = properties.get('FragmentPath', '')
+    try:
+        current = Path(fragment).resolve(strict=False)
+        expected = paths['unit'].resolve(strict=False)
+    except OSError as error:
+        raise InstallerError(f'cannot resolve selected user-service unit: {error}') from error
+    if current != expected:
+        _fail(
+            f'user service {paths["unit"].name} is defined outside the installer-owned unit path '
+            f'({fragment}); refusing to replace it'
+        )
 
 
 def _enabled_state(paths: dict[str, Path], load_state: str) -> tuple[bool, str]:
@@ -437,8 +954,8 @@ def _validate_bundle(bundle_value: str, user: pwd.struct_passwd) -> tuple[Path, 
     if not stat.S_ISREG(manifest_path.lstat().st_mode):
         _fail('bundle.json must be a regular file')
     manifest = _read_json(manifest_path)
-    if manifest.get('kind') != KIND or manifest.get('private_only') is not True or manifest.get('distribution_approved') is not False:
-        _fail('bundle is not the private Rust runtime compatibility bundle')
+    if manifest.get('kind') != KIND:
+        _fail('bundle has an unexpected runtime kind')
     if manifest.get('rust_executable') != RUST_EXECUTABLE:
         _fail('bundle names an unexpected Rust executable')
     release_version = manifest.get('release_version')
@@ -507,7 +1024,7 @@ def _validate_bundle(bundle_value: str, user: pwd.struct_passwd) -> tuple[Path, 
         missing = sorted(actual_paths - expected_paths)
         extra = sorted(expected_paths - actual_paths)
         _fail(f'bundle checksum file set does not match (unlisted={missing}, missing={extra})')
-    for required in (RUST_EXECUTABLE, WORKER_EXECUTABLE, 'install.py', 'assets/index.js', 'locales/en-US.json'):
+    for required in (RUST_EXECUTABLE, WORKER_EXECUTABLE, 'install.py', 'process_observer.py', 'assets/index.js', 'locales/en-US.json'):
         if required not in expected_paths:
             _fail(f'bundle is missing required member {required}')
     runtime_tree = bundle / '_internal'
@@ -553,16 +1070,8 @@ def _check_runtime_access(root: Path, user: pwd.struct_passwd, parents: tuple[Pa
 
 
 def _run_as_user(command: list[str], user: pwd.struct_passwd, timeout: float = 20) -> subprocess.CompletedProcess[str]:
-    if user.pw_uid == 0:
-        _fail('the service account must be non-root to validate bundle executables safely')
-    try:
-        groups = os.getgrouplist(user.pw_name, user.pw_gid)
-    except AttributeError:
-        groups = [user.pw_gid]
-    def drop_privileges() -> None:
-        os.setgroups(groups)
-        os.setgid(user.pw_gid)
-        os.setuid(user.pw_uid)
+    if user.pw_uid == 0 or os.geteuid() not in (0, user.pw_uid):
+        _fail('bundle validation must run as the non-root service account or root during migration')
     environment = {
         'HOME': user.pw_dir,
         'USER': user.pw_name,
@@ -571,18 +1080,25 @@ def _run_as_user(command: list[str], user: pwd.struct_passwd, timeout: float = 2
         'LANG': 'C.UTF-8',
         'LC_ALL': 'C.UTF-8',
     }
+    options: dict[str, Any] = {}
+    if os.geteuid() == 0:
+        try:
+            groups = os.getgrouplist(user.pw_name, user.pw_gid)
+        except AttributeError:
+            groups = [user.pw_gid]
+
+        def drop_privileges() -> None:
+            os.setgroups(groups)
+            os.setgid(user.pw_gid)
+            os.setuid(user.pw_uid)
+
+        options['preexec_fn'] = drop_privileges
     try:
         return subprocess.run(
-            command,
-            check=False,
+            command, check=False,
             cwd=user.pw_dir if Path(user.pw_dir).is_dir() else '/',
-            env=environment,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            start_new_session=True,
-            preexec_fn=drop_privileges,
+            env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, start_new_session=True, **options,
         )
     except subprocess.TimeoutExpired as error:
         raise InstallerError(f'bundle executable timed out: {command[0]}') from error
@@ -633,7 +1149,6 @@ def _make_runtime(bundle: Path, manifest: dict[str, Any], paths: dict[str, Path]
         if (bundle / '_internal').is_dir():
             _copytree_checked(bundle / '_internal', staging / '_internal')
         for path in (staging, *staging.rglob('*')):
-            os.chown(path, 0, 0, follow_symlinks=False)
             if path.is_dir():
                 os.chmod(path, 0o755)
             else:
@@ -674,7 +1189,6 @@ def _copy_stage_file(source: Path, directory: Path, prefix: str, mode_override: 
         _copy_regular(source, stage)
         if mode_override is not None:
             mode = mode_override
-        os.chown(stage, 0, 0)
         os.chmod(stage, mode)
         _fsync_file(stage)
         _fsync_directory(directory)
@@ -819,16 +1333,15 @@ def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_na
         '',
         '[Service]',
         'Type=simple',
-        'User=root',
         'Restart=always',
-        'KillMode=process',
+        'KillMode=mixed',
         'TimeoutStopSec=15',
         f'ExecStart={command}',
         f'WorkingDirectory={paths["services"]}',
         *environment,
         '',
         '[Install]',
-        'WantedBy=multi-user.target',
+        'WantedBy=default.target',
         '',
     ]
     return ('\n'.join(lines)).encode('utf-8')
@@ -843,7 +1356,6 @@ def _stage_bytes(data: bytes, directory: Path, prefix: str, mode: int = 0o644) -
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.chown(temporary, 0, 0)
         _fsync_directory(directory)
         return temporary
     except BaseException:
@@ -879,14 +1391,43 @@ def _signal_service_processes(processes: dict[int, Process], sig: signal.Signals
             os.close(descriptor)
 
 
-def stop_service(service_name: str) -> None:
+def _user_stop_record_directory(user: pwd.struct_passwd) -> Path:
+    runtime = _user_runtime_directory(user)
+    directory = runtime / 'decky-loader' / 'stop-records'
+    for current in (runtime / 'decky-loader', directory):
+        try:
+            current.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise InstallerError(f'cannot create user service stop-record directory {current}: {error}') from error
+        info = current.lstat()
+        if not stat.S_ISDIR(info.st_mode):
+            _fail(f'user service stop-record path is not a directory: {current}')
+        if os.geteuid() == 0 and info.st_uid != user.pw_uid:
+            os.chown(current, user.pw_uid, user.pw_gid, follow_symlinks=False)
+            info = current.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != user.pw_uid or info.st_mode & 0o077:
+            _fail(f'user service stop-record directory is not private and owned by {user.pw_name}: {current}')
+    return directory
+
+
+def _stop_record_directory(scope: str, user: pwd.struct_passwd | None) -> Path:
+    if scope == 'system':
+        _ensure_directory(SERVICE_STOP_DIRECTORY, 0o700, managed=True)
+        return SERVICE_STOP_DIRECTORY
+    if scope != 'user':
+        _fail(f'unsupported service stop scope: {scope}')
+    return _user_stop_record_directory(user or _current_user())
+
+
+def stop_service(service_name: str, *, scope: str = 'user', user: pwd.struct_passwd | None = None) -> None:
     """Stop one selected unit, retaining ownership until its helpers have drained."""
     _, unit_filename = _normalize_service_name(service_name)
-    paths = {'unit': Path(unit_filename)}
-    # Recovery can run in a new process after systemd has forgotten the unit.
-    # /run is boot-scoped; also bind saved PID epochs to the current boot.
-    _ensure_directory(SERVICE_STOP_DIRECTORY, 0o700, managed=True)
-    state_file = SERVICE_STOP_DIRECTORY / f'{unit_filename}.json'
+    paths: dict[str, Any] = {'unit': Path(unit_filename), 'scope': scope, 'user': user}
+    record_directory = _stop_record_directory(scope, user)
+
+    state_file = record_directory / f'{unit_filename}.json'
     boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
     saved = _read_json(state_file) if _lstat_regular_or_absent(state_file) is not None else None
     pending_groups: set[str] = set()
@@ -971,7 +1512,7 @@ def stop_service(service_name: str) -> None:
             if not remaining:
                 if saved is not None:
                     state_file.unlink()
-                    _fsync_directory(SERVICE_STOP_DIRECTORY)
+                    _fsync_directory(record_directory)
                 return
             elapsed = time.monotonic() - started
             escalation = signal.SIGKILL if elapsed >= 10 else signal.SIGTERM if elapsed >= 5 else None
@@ -1670,21 +2211,23 @@ def _commit(paths: dict[str, Path], journal: dict[str, object]) -> None:
 
 
 def _run_install(args: argparse.Namespace) -> dict[str, object]:
-    _require_root()
     _, service_file = _normalize_service_name(args.service_name)
-    homebrew = _homebrew_path(args.homebrew)
-    paths = _paths(homebrew, args.service_name)
     user = pwd.getpwnam(args.user)
-    if user.pw_uid == 0:
-        _fail('--user must resolve to a non-root service account')
+    _require_user(user)
     if args.user != user.pw_name:
         _fail('pass the resolved Unix account name with --user')
+    homebrew = _homebrew_path(args.homebrew)
+    paths = _paths(homebrew, args.service_name, user)
+    _assert_no_system_instance(paths)
+    _assert_user_unit_source(paths)
     bundle, manifest = _validate_bundle(args.bundle, user)
     listen = args.listen
     _listen_endpoint(listen)
     cef_url = _validate_cef_url(args.cef_url)
     inject_frontend = args.inject_frontend == 'true'
     worker_mode = args.worker_mode
+    if args.version is not None and args.version != manifest['release_version']:
+        _fail('--version must match the bundle release identity')
     version = args.version or manifest['release_version']
     if not version or any(ord(character) < 32 or ord(character) == 127 for character in version):
         _fail('--version must be a non-empty printable release identifier')
@@ -1781,9 +2324,10 @@ def _current_head(paths: dict[str, Path]) -> str | None:
 
 
 def _run_rollback(args: argparse.Namespace) -> dict[str, object]:
-    _require_root()
     _, service_file = _normalize_service_name(args.service_name)
     paths = _paths(_homebrew_path(args.homebrew), args.service_name)
+    _assert_no_system_instance(paths)
+    _assert_user_unit_source(paths)
     _recover(paths)
     target_id = _current_head(paths)
     if target_id is None:
@@ -1842,7 +2386,7 @@ def _systemd_run_path() -> str:
     _fail('systemd-run was not found')
 
 
-def _request_directory(paths: dict[str, Path], request_id: str) -> Path:
+def _request_directory(paths: dict[str, Any], request_id: str) -> Path:
     if not re.fullmatch(r'[0-9a-f]{32}', request_id):
         _fail('invalid updater handoff request identifier')
     directory = paths['queue'] / request_id
@@ -1850,8 +2394,9 @@ def _request_directory(paths: dict[str, Path], request_id: str) -> Path:
         info = directory.lstat()
     except OSError as error:
         raise InstallerError(f'updater handoff request is unavailable: {error}') from error
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-        _fail('updater handoff request directory is not a safe root-owned directory')
+    owner = paths['user'].pw_uid
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != owner or info.st_mode & 0o022:
+        _fail('updater handoff request directory is not a safe current-account directory')
     return directory
 
 
@@ -1915,11 +2460,11 @@ def _cleanup_handoff_payloads(directory: Path) -> None:
     _fsync_directory(directory)
 
 
-def _start_queued_activation(paths: dict[str, Path], request_id: str) -> dict[str, object]:
+def _start_queued_activation(paths: dict[str, Any], request_id: str) -> dict[str, object]:
     unit = f'decky-updater-{request_id}'
     command = [
         _systemd_run_path(),
-        '--system',
+        '--user',
         '--no-block',
         '--collect',
         '--unit', unit,
@@ -1933,13 +2478,10 @@ def _start_queued_activation(paths: dict[str, Path], request_id: str) -> dict[st
         '--service-name', paths['unit'].stem,
         '--request-id', request_id,
     ]
-    try:
-        started = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False)
-    except (OSError, subprocess.SubprocessError) as error:
-        raise InstallerError(f'cannot start independent updater activation service: {error}') from error
+    started = _run_manager_command(paths, command, 15)
     if started.returncode:
         detail = started.stderr.strip() or started.stdout.strip() or f'exit status {started.returncode}'
-        _fail(f'systemd-run could not queue updater activation: {detail}')
+        _fail(f'systemd-run could not queue user updater activation: {detail}')
     return {'request_id': request_id, 'unit': f'{unit}.service'}
 
 def _sync_bundle_tree(bundle: Path) -> None:
@@ -1959,12 +2501,12 @@ def _prepare_install_handoff(args: argparse.Namespace, paths: dict[str, Path]) -
     if not args.version or any(ord(character) < 32 or ord(character) == 127 for character in args.version):
         _fail('--version must be a non-empty printable release identifier')
     user = pwd.getpwnam(args.user)
-    if user.pw_uid == 0:
-        _fail('--user must resolve to a non-root service account')
+    _require_user(user)
     if args.user != user.pw_name:
         _fail('pass the resolved Unix account name with --user')
     bundle, manifest = _validate_bundle(args.bundle, user)
-    _listen_endpoint(args.listen)
+    if args.version != manifest['release_version']:
+        _fail('--version must match the bundle release identity')
     cef_url = _validate_cef_url(args.cef_url)
     was_running = bool(_capture_activation(paths)['running'])
     _cleanup_completed_handoffs(paths)
@@ -2119,13 +2661,16 @@ def _run_queued_activation(args: argparse.Namespace, paths: dict[str, Path]) -> 
         if request['inject_frontend'] not in ('true', 'false') or request['worker_mode'] not in ('fork', 'exec'):
             _fail('Rust bundle handoff configuration is unsupported')
         user = pwd.getpwnam(request['user'])
-        if user.pw_uid == 0 or user.pw_name != request['user']:
+        _require_user(user)
+        if user.pw_name != request['user']:
             _fail('Rust bundle handoff has an invalid service account')
         _listen_endpoint(request['listen'])
         _validate_cef_url(request['cef_url'])
         if bundle.is_symlink() or not bundle.is_dir():
             _fail('updater Rust bundle payload is missing or unsafe')
-        _validate_bundle(str(bundle), user)
+        _, manifest = _validate_bundle(str(bundle), user)
+        if request['version'] != manifest['release_version']:
+            _fail('updater handoff version does not match its bundle release identity')
         decision_path = directory / 'decision.json'
         if decision_path.exists():
             decision = _read_json(decision_path)
@@ -2192,9 +2737,10 @@ def _run_queued_activation(args: argparse.Namespace, paths: dict[str, Path]) -> 
         _cleanup_handoff_payloads(directory)
 
 def _run_status(args: argparse.Namespace) -> dict[str, object]:
-    _require_root()
     _, service_file = _normalize_service_name(args.service_name)
     paths = _paths(_homebrew_path(args.homebrew), args.service_name)
+    _assert_no_system_instance(paths)
+    _assert_user_unit_source(paths)
     _recover(paths)
     properties = _unit_properties(paths)
     enabled, scope = _enabled_state(paths, properties.get('LoadState', 'not-found'))
@@ -2229,14 +2775,2251 @@ def _run_status(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def _legacy_migration_directory(
+    homebrew: Path,
+    service_name: str,
+    *,
+    create: bool = False,
+    user_uid: int | None = None,
+) -> Path:
+    _, unit_filename = _normalize_service_name(service_name)
+    uid = os.getuid() if user_uid is None else user_uid
+    directory = LEGACY_MIGRATION_ROOT / str(uid) / unit_filename
+    if create:
+        path, descriptors = _open_legacy_store(uid, unit_filename, create=True)
+        try:
+            return path
+        finally:
+            _close_legacy_descriptors(descriptors)
+    return directory
+
+
+def _write_legacy_record(path: Path, record: dict[str, Any]) -> None:
+    try:
+        uid = int(record['user_uid'])
+        service_name = str(record['service'])
+        homebrew = str(record['homebrew'])
+        phase = str(record['phase'])
+    except (KeyError, ValueError, TypeError) as error:
+        raise InstallerError(f'cannot write incomplete legacy migration record: {error}') from error
+    _, descriptors = _open_legacy_store(uid, service_name, create=False)
+    try:
+        if path != LEGACY_MIGRATION_ROOT / str(uid) / service_name / 'private' / 'record.json':
+            _fail('legacy migration record path differs from its protected archive')
+        public = {
+            'schema': 1,
+            'user_uid': uid,
+            'service': service_name,
+            'homebrew': homebrew,
+            'phase': phase,
+        }
+        data = (json.dumps(record, sort_keys=True, indent=2) + '\n').encode('utf-8')
+        _atomic_write_at(descriptors['private'], 'record.json', data, 0o600)
+        _atomic_write_at(
+            descriptors['service'],
+            'status.json',
+            (json.dumps(public, sort_keys=True, indent=2) + '\n').encode('utf-8'),
+            0o644,
+        )
+    finally:
+        _close_legacy_descriptors(descriptors)
+
+
+def _read_legacy_record(
+    homebrew: Path,
+    service_name: str,
+    user_uid: int | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    _, unit_filename = _normalize_service_name(service_name)
+    uid = os.getuid() if user_uid is None else user_uid
+    directory, descriptors = _open_legacy_store(uid, unit_filename, create=False)
+    try:
+        try:
+            public = _read_json_at(descriptors['service'], 'status.json', mode=0o644)
+        except FileNotFoundError:
+            public = None
+        record = _read_json_at(descriptors['private'], 'record.json', mode=0o600, private=True)
+    finally:
+        _close_legacy_descriptors(descriptors)
+    phases = (
+        'prepared',
+        'system-stopped',
+        'parked',
+        'binary-removal-pending',
+        'binary-removed',
+        'services-handoff-pending',
+        'services-user-owned',
+        'installed',
+        'restoring',
+        'services-lock-pending',
+        'restored',
+    )
+    if (
+        record.get('phase') not in phases
+        or record.get('schema') != 1
+        or record.get('service') != unit_filename
+        or record.get('homebrew') != str(homebrew)
+        or not isinstance(record.get('user'), str)
+        or record.get('user_uid') != uid
+        or not isinstance(record.get('activation'), dict)
+        or not isinstance(record.get('binary'), dict)
+        or not isinstance(record.get('services_directory'), dict)
+        or not isinstance(record.get('files'), list)
+        or not isinstance(record.get('user_unit_directory'), str)
+    ):
+        _fail('legacy migration snapshot metadata is invalid')
+    private_phase = phases.index(record['phase'])
+    if public is not None:
+        if (
+            set(public) != {'schema', 'user_uid', 'service', 'homebrew', 'phase'}
+            or public.get('schema') != 1
+            or public.get('user_uid') != uid
+            or public.get('service') != unit_filename
+            or public.get('homebrew') != str(homebrew)
+            or public.get('phase') not in phases
+        ):
+            _fail('legacy migration public status is invalid')
+        public_phase = phases.index(public['phase'])
+        if public_phase > private_phase:
+            _fail('legacy migration public status is newer than its protected record')
+    else:
+        public_phase = -1
+    if public_phase < private_phase:
+        _write_legacy_record(directory / 'private' / 'record.json', record)
+    return directory, record
+
+
+def _legacy_store_preflight(user_uid: int, service_name: str) -> None:
+    _, unit_filename = _normalize_service_name(service_name)
+    current = Path('/')
+    missing = False
+    for component in (*LEGACY_MIGRATION_ROOT.relative_to('/').parts, str(user_uid), unit_filename):
+        current = current / component
+        if missing:
+            continue
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            missing = True
+            continue
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != 0
+            or info.st_mode & 0o022
+        ):
+            _fail(f'legacy migration target is not root-protected: {current}')
+
+
+def _install_legacy_helpers(directory: Path, user_uid: int, service_name: str) -> None:
+    _, descriptors = _open_legacy_store(user_uid, service_name, create=True)
+    try:
+        for source in (
+            Path(__file__),
+            Path(__file__).with_name('process_observer.py'),
+        ):
+            name = source.name
+            try:
+                before = source.lstat()
+                source_fd = os.open(
+                    source,
+                    os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NOATIME', 0),
+                )
+            except OSError as error:
+                raise InstallerError(f'cannot read trusted legacy helper source {source}: {error}') from error
+            temporary = f'.{name}.{uuid.uuid4().hex}.tmp'
+            destination_fd = -1
+            try:
+                opened = os.fstat(source_fd)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+                    or opened.st_size <= 0
+                ):
+                    _fail(f'legacy helper source is not a stable regular file: {source}')
+                destination_fd = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0),
+                    0o755 if name == 'install.py' else 0o644,
+                    dir_fd=descriptors['helper'],
+                )
+                mode = 0o755 if name == 'install.py' else 0o644
+                os.fchown(destination_fd, 0, 0)
+                os.fchmod(destination_fd, mode)
+                while True:
+                    chunk = os.read(source_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        count = os.write(destination_fd, view)
+                        view = view[count:]
+                after = os.fstat(source_fd)
+                if (
+                    (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                    != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                ):
+                    _fail(f'legacy helper source changed while being copied: {source}')
+                os.fsync(destination_fd)
+                os.replace(
+                    temporary,
+                    name,
+                    src_dir_fd=descriptors['helper'],
+                    dst_dir_fd=descriptors['helper'],
+                )
+                os.fsync(descriptors['helper'])
+            except BaseException:
+                try:
+                    os.unlink(temporary, dir_fd=descriptors['helper'])
+                except OSError:
+                    pass
+                raise
+            finally:
+                if destination_fd >= 0:
+                    os.close(destination_fd)
+                os.close(source_fd)
+    finally:
+        _close_legacy_descriptors(descriptors)
+
+def _discard_incomplete_legacy_snapshots(private_fd: int) -> None:
+    try:
+        root_info = os.stat('snapshots', dir_fd=private_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != 0
+        or stat.S_IMODE(root_info.st_mode) != 0o700
+    ):
+        _fail('incomplete legacy snapshot archive is not root-private')
+    root_fd = os.open(
+        'snapshots',
+        os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+        dir_fd=private_fd,
+    )
+    try:
+        opened = os.fstat(root_fd)
+        if (root_info.st_dev, root_info.st_ino) != (opened.st_dev, opened.st_ino):
+            _fail('incomplete legacy snapshot archive changed while opening')
+
+        def clear(directory_fd: int) -> None:
+            for name in os.listdir(directory_fd):
+                if name in ('', '.', '..') or '/' in name:
+                    _fail('incomplete legacy snapshot archive contains an unsafe name')
+                info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    child_fd = os.open(
+                        name,
+                        os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        child_info = os.fstat(child_fd)
+                        if (info.st_dev, info.st_ino) != (child_info.st_dev, child_info.st_ino):
+                            _fail('incomplete legacy snapshot directory changed while opening')
+                        clear(child_fd)
+                    finally:
+                        os.close(child_fd)
+                    os.rmdir(name, dir_fd=directory_fd)
+                elif stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                    os.unlink(name, dir_fd=directory_fd)
+                else:
+                    _fail(f'incomplete legacy snapshot contains an unsupported object: {name}')
+            os.fsync(directory_fd)
+
+        clear(root_fd)
+        current = os.stat('snapshots', dir_fd=private_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            _fail('incomplete legacy snapshot archive changed during cleanup')
+        os.rmdir('snapshots', dir_fd=private_fd)
+        os.fsync(private_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _open_services_directory(
+    homebrew: Path,
+    user: pwd.struct_passwd,
+) -> tuple[Path, int, int, os.stat_result]:
+    try:
+        homebrew_fd = os.open(
+            homebrew,
+            os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+        )
+        services_fd = os.open(
+            'services',
+            os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+            dir_fd=homebrew_fd,
+        )
+    except OSError as error:
+        try:
+            os.close(homebrew_fd)
+        except (UnboundLocalError, OSError):
+            pass
+        raise InstallerError(f'legacy services directory is unavailable: {error}') from error
+    info = os.fstat(services_fd)
+    try:
+        path_info = os.stat('services', dir_fd=homebrew_fd, follow_symlinks=False)
+    except OSError as error:
+        os.close(services_fd)
+        os.close(homebrew_fd)
+        raise InstallerError(f'legacy services directory changed while opening: {error}') from error
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or (info.st_dev, info.st_ino) != (path_info.st_dev, path_info.st_ino)
+        or info.st_uid not in (0, user.pw_uid)
+        or stat.S_IMODE(info.st_mode) & (0o022 | 0o6000)
+    ):
+        os.close(services_fd)
+        os.close(homebrew_fd)
+        _fail(f'legacy services directory has unsafe ownership or permissions: {homebrew / "services"}')
+    return homebrew / 'services', homebrew_fd, services_fd, info
+
+
+def _metadata_from_fd(descriptor: int, result: os.stat_result | None = None) -> dict[str, object]:
+    info = result or os.fstat(descriptor)
+    attributes: dict[str, str] = {}
+    if hasattr(os, 'listxattr') and hasattr(os, 'getxattr'):
+        try:
+            for name in os.listxattr(descriptor):
+                attributes[name] = base64.b64encode(os.getxattr(descriptor, name)).decode('ascii')
+        except OSError as error:
+            if error.errno not in (getattr(os, 'ENOTSUP', 95), getattr(os, 'EOPNOTSUPP', 95)):
+                raise InstallerError(f'cannot capture descriptor metadata: {error}') from error
+    return {
+        'mode': stat.S_IMODE(info.st_mode),
+        'uid': info.st_uid,
+        'gid': info.st_gid,
+        'atime_ns': info.st_atime_ns,
+        'mtime_ns': info.st_mtime_ns,
+        'xattrs': attributes,
+    }
+
+
+def _copy_descriptor(source_fd: int, destination: Path) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+    target_fd = os.open(destination, flags, 0o600)
+    try:
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                count = os.write(target_fd, view)
+                view = view[count:]
+        os.fsync(target_fd)
+    finally:
+        os.close(target_fd)
+
+
+def _snapshot_binary_at(services_fd: int, destination: Path) -> tuple[dict[str, Any], list[int] | None]:
+    try:
+        before = os.stat('PluginLoader', dir_fd=services_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return {'exists': False}, None
+    if not stat.S_ISREG(before.st_mode):
+        _fail('legacy backend binary is not a regular file')
+    source_fd = os.open(
+        'PluginLoader',
+        os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NOATIME', 0),
+        dir_fd=services_fd,
+    )
+    try:
+        opened = os.fstat(source_fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            _fail('legacy backend binary changed while opening its rollback snapshot')
+        metadata = _metadata_from_fd(source_fd, opened)
+        _copy_descriptor(source_fd, destination)
+        _fsync_directory(destination.parent)
+        after = os.fstat(source_fd)
+        current = os.stat('PluginLoader', dir_fd=services_fd, follow_symlinks=False)
+        if (
+            (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            _fail('legacy backend binary changed while its rollback snapshot was captured')
+        return {
+            'exists': True,
+            'metadata': metadata,
+            'sha256': _digest(destination),
+        }, [opened.st_dev, opened.st_ino]
+    finally:
+        os.close(source_fd)
+def _metadata_for_symlink_at(parent_fd: int, name: str, info: os.stat_result) -> dict[str, object]:
+    attributes: dict[str, str] = {}
+    if hasattr(os, 'listxattr') and hasattr(os, 'getxattr'):
+        path = f'/proc/self/fd/{parent_fd}/{name}'
+        try:
+            for attribute in os.listxattr(path, follow_symlinks=False):
+                attributes[attribute] = base64.b64encode(
+                    os.getxattr(path, attribute, follow_symlinks=False)
+                ).decode('ascii')
+        except OSError as error:
+            if error.errno not in (getattr(os, 'ENOTSUP', 95), getattr(os, 'EOPNOTSUPP', 95)):
+                raise InstallerError(f'cannot capture symlink metadata for {name}: {error}') from error
+    return {
+        'mode': stat.S_IMODE(info.st_mode),
+        'uid': info.st_uid,
+        'gid': info.st_gid,
+        'atime_ns': info.st_atime_ns,
+        'mtime_ns': info.st_mtime_ns,
+        'xattrs': attributes,
+    }
+
+
+def _snapshot_legacy_file(source: Path, destination: Path) -> dict[str, Any]:
+    parent_fd = os.open(
+        source.parent,
+        os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+    )
+    try:
+        parent_info = os.fstat(parent_fd)
+        if not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != 0 or parent_info.st_mode & 0o022:
+            _fail(f'legacy system unit parent is not root-protected: {source.parent}')
+        info = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)) or info.st_uid != 0:
+            _fail(f'legacy system unit path is not a root-owned regular file or symlink: {source}')
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        identity = [info.st_dev, info.st_ino]
+        if stat.S_ISREG(info.st_mode):
+            source_fd = os.open(
+                source.name,
+                os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NOATIME', 0),
+                dir_fd=parent_fd,
+            )
+            try:
+                opened = os.fstat(source_fd)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    _fail(f'legacy system unit changed while opening its snapshot: {source}')
+                metadata = _metadata_from_fd(source_fd, opened)
+                _copy_descriptor(source_fd, destination)
+                _fsync_directory(destination.parent)
+                after = os.fstat(source_fd)
+                current = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                    != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                    or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+                ):
+                    _fail(f'legacy system unit changed while its snapshot was captured: {source}')
+            finally:
+                os.close(source_fd)
+            return {
+                'kind': 'file',
+                'metadata': metadata,
+                'sha256': _digest(destination),
+                'identity': identity,
+            }
+        target = os.readlink(source.name, dir_fd=parent_fd)
+        metadata = _metadata_for_symlink_at(parent_fd, source.name, info)
+        current = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino) or os.readlink(
+            source.name, dir_fd=parent_fd
+        ) != target:
+            _fail(f'legacy system symlink changed while its snapshot was captured: {source}')
+        os.symlink(target, destination)
+        os.chown(destination, info.st_uid, info.st_gid, follow_symlinks=False)
+        os.utime(destination, ns=(info.st_atime_ns, info.st_mtime_ns), follow_symlinks=False)
+        _fsync_directory(destination.parent)
+        return {'kind': 'symlink', 'metadata': metadata, 'target': target, 'identity': identity}
+    finally:
+        os.close(parent_fd)
+def _legacy_system_sources(properties: dict[str, str]) -> list[Path]:
+    fragment = properties.get('FragmentPath', '')
+    if not fragment:
+        _fail('legacy system service has no persistent unit file to preserve')
+    values = [fragment]
+    values.extend(shlex.split(properties.get('DropInPaths', '')))
+    sources: list[Path] = []
+    seen: set[Path] = set()
+    for value in values:
+        source = Path(value)
+        if not source.is_absolute() or '..' in source.parts or source.name in ('', '.', '..'):
+            _fail(f'legacy system unit reported an unsafe file path: {value!r}')
+        parent_fd = _open_root_directory(source.parent)
+        try:
+            parent_info = os.fstat(parent_fd)
+            info = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as error:
+            raise InstallerError(f'legacy system unit file is unavailable: {error}') from error
+        finally:
+            os.close(parent_fd)
+        if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_mode & 0o022
+            or info.st_uid != 0
+            or not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode))
+        ):
+            _fail(f'legacy system unit path is not a root-owned protected file: {source}')
+        if source not in seen:
+            seen.add(source)
+            sources.append(source)
+    return sources
+
+
+
+
+def _renameat2(
+    source_directory: int,
+    source_name: str,
+    destination_directory: int,
+    destination_name: str,
+    flags: int,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = getattr(libc, 'renameat2', None)
+    if function is None:
+        _fail('atomic no-replace publication requires Linux renameat2')
+    function.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    function.restype = ctypes.c_int
+    if function(
+        source_directory,
+        os.fsencode(source_name),
+        destination_directory,
+        os.fsencode(destination_name),
+        flags,
+    ) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination_name)
+
+
+def _open_root_directory(path: Path) -> int:
+    if not path.is_absolute() or '..' in path.parts:
+        _fail(f'legacy restore parent is not an absolute safe path: {path}')
+    descriptor = os.open('/', os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        for component in path.relative_to('/').parts:
+            child = _open_directory_at(descriptor, component, create=False, mode=0o755)
+            if descriptor != 0:
+                os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _apply_metadata_fd(descriptor: int, metadata: dict[str, Any]) -> None:
+    try:
+        os.fchown(descriptor, int(metadata['uid']), int(metadata['gid']))
+        xattrs = metadata.get('xattrs', {})
+        if not isinstance(xattrs, dict):
+            _fail('invalid xattr snapshot')
+        if xattrs and not hasattr(os, 'setxattr'):
+            _fail('this platform cannot restore captured extended attributes')
+        for name, encoded in xattrs.items():
+            os.setxattr(descriptor, str(name), base64.b64decode(str(encoded), validate=True))
+        os.fchmod(descriptor, int(metadata['mode']))
+        os.utime(
+            descriptor,
+            ns=(int(metadata['atime_ns']), int(metadata['mtime_ns'])),
+        )
+        os.fsync(descriptor)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise InstallerError(f'cannot restore descriptor metadata: {error}') from error
+
+
+def _metadata_matches(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return all(left.get(key) == right.get(key) for key in ('uid', 'gid', 'mode', 'mtime_ns', 'xattrs'))
+
+
+def _digest_descriptor(descriptor: int) -> str:
+    result = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 1024 * 1024, offset)
+        if not chunk:
+            return result.hexdigest()
+        result.update(chunk)
+        offset += len(chunk)
+
+
+def _object_matches_snapshot(parent_fd: int, name: str, item: dict[str, Any]) -> bool:
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    metadata = item.get('metadata')
+    if not isinstance(metadata, dict):
+        _fail(f'legacy migration has invalid metadata for {name}')
+    if item.get('kind') == 'file':
+        if not stat.S_ISREG(info.st_mode):
+            return False
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NOATIME', 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                return False
+            return (
+                _digest_descriptor(descriptor) == item.get('sha256')
+                and _metadata_matches(_metadata_from_fd(descriptor, opened), metadata)
+            )
+        finally:
+            os.close(descriptor)
+    if item.get('kind') == 'symlink':
+        if not stat.S_ISLNK(info.st_mode):
+            return False
+        target = os.readlink(name, dir_fd=parent_fd)
+        current_metadata = _metadata_for_symlink_at(parent_fd, name, info)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        return (
+            target == item.get('target')
+            and (current.st_dev, current.st_ino) == (info.st_dev, info.st_ino)
+            and _metadata_matches(current_metadata, metadata)
+        )
+    _fail(f'legacy migration has an unsupported saved file type for {name}')
+
+
+def _create_restore_stage(parent_fd: int) -> tuple[str, int]:
+    for _ in range(8):
+        name = f'.decky-legacy-restore-{uuid.uuid4().hex}'
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+            dir_fd=parent_fd,
+        )
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o700)
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+            os.close(descriptor)
+            _fail('legacy restore staging directory is not root-private')
+        return name, descriptor
+    _fail('cannot allocate a unique legacy restore staging directory')
+
+def _remove_empty_restore_stage(parent_fd: int, name: str) -> None:
+    if not name.startswith('.decky-legacy-restore-') or '/' in name:
+        _fail('legacy restore journal contains an unsafe staging directory')
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+            dir_fd=parent_fd,
+        )
+    except FileNotFoundError:
+        return
+    try:
+        info = os.fstat(descriptor)
+        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700 or os.listdir(descriptor):
+            _fail('legacy restore staging directory is not empty and root-private')
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if [current.st_dev, current.st_ino] != [info.st_dev, info.st_ino]:
+            _fail('legacy restore staging directory changed during cleanup')
+        os.rmdir(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(descriptor)
+
+
+def _stage_legacy_object(
+    snapshot: Path,
+    item: dict[str, Any],
+    directory_fd: int,
+    name: str,
+) -> list[int]:
+    metadata = item.get('metadata')
+    if not isinstance(metadata, dict):
+        _fail('legacy migration has invalid staged file metadata')
+    if item.get('kind') == 'file':
+        if _digest(snapshot) != item.get('sha256'):
+            _fail(f'legacy migration snapshot checksum changed: {snapshot}')
+        source_fd = os.open(snapshot, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        try:
+            source_info = os.fstat(source_fd)
+            if not stat.S_ISREG(source_info.st_mode):
+                _fail(f'legacy migration snapshot is not a regular file: {snapshot}')
+            destination_fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            try:
+                while True:
+                    chunk = os.read(source_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        count = os.write(destination_fd, view)
+                        view = view[count:]
+                _apply_metadata_fd(destination_fd, metadata)
+                staged = os.fstat(destination_fd)
+            finally:
+                os.close(destination_fd)
+        finally:
+            os.close(source_fd)
+        os.fsync(directory_fd)
+        return [staged.st_dev, staged.st_ino]
+    if item.get('kind') == 'symlink':
+        target = item.get('target')
+        if not isinstance(target, str):
+            _fail('legacy migration symlink target is invalid')
+        os.symlink(target, name, dir_fd=directory_fd)
+        try:
+            os.chown(name, int(metadata['uid']), int(metadata['gid']), dir_fd=directory_fd, follow_symlinks=False)
+            xattrs = metadata.get('xattrs', {})
+            if not isinstance(xattrs, dict):
+                _fail('legacy symlink metadata is invalid')
+            path = f'/proc/self/fd/{directory_fd}/{name}'
+            for attribute, encoded in xattrs.items():
+                os.setxattr(
+                    path,
+                    str(attribute),
+                    base64.b64decode(str(encoded), validate=True),
+                    follow_symlinks=False,
+                )
+            os.utime(
+                name,
+                ns=(int(metadata['atime_ns']), int(metadata['mtime_ns'])),
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            staged = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            os.fsync(directory_fd)
+            return [staged.st_dev, staged.st_ino]
+        except BaseException:
+            os.unlink(name, dir_fd=directory_fd)
+            raise
+    _fail('legacy migration has an unsupported saved file type')
+
+
+def _restore_legacy_file(
+    source: Path,
+    snapshot: Path,
+    item: dict[str, Any],
+    record: dict[str, Any],
+    record_path: Path,
+    item_index: int,
+) -> None:
+    identity = item.get('identity')
+    if (
+        not isinstance(identity, list)
+        or len(identity) != 2
+        or any(type(value) is not int for value in identity)
+    ):
+        _fail(f'legacy migration has invalid inode identity for {source}')
+    parent_fd = _open_root_directory(source.parent)
+    try:
+        journal = item.get('restore_journal')
+        if journal is not None and not isinstance(journal, dict):
+            _fail(f'legacy migration restore journal is invalid for {source}')
+        try:
+            current = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None:
+            current_identity = [current.st_dev, current.st_ino]
+            if current_identity == identity:
+                if not _object_matches_snapshot(parent_fd, source.name, item):
+                    _fail(f'legacy unit file changed in place after migration: {source}')
+                item['restore_journal'] = {
+                    'state': 'restored-original',
+                    'restored_identity': identity,
+                }
+                _write_legacy_record(record_path, record)
+                return
+            if isinstance(journal, dict) and current_identity == journal.get('staged_identity'):
+                if not _object_matches_snapshot(parent_fd, source.name, item):
+                    _fail(f'legacy restore publication changed after interruption: {source}')
+                if journal.get('state') not in {'staged', 'published'}:
+                    _fail(f'legacy restore journal state is invalid: {source}')
+                journal['state'] = 'published'
+                journal['restored_identity'] = current_identity
+                _write_legacy_record(record_path, record)
+                stage_name = journal.get('stage_directory')
+                if isinstance(stage_name, str):
+                    _remove_empty_restore_stage(parent_fd, stage_name)
+                return
+            _fail(f'legacy unit path changed after migration; refusing to replace an outside inode: {source}')
+
+        parked_path = item.get('parked_path')
+        if isinstance(parked_path, str):
+            parked = Path(parked_path)
+            if parked.parent != source.parent or parked.name == source.name:
+                _fail(f'legacy migration contains an unsafe parked path for {source}')
+            try:
+                parked_info = os.stat(parked.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                parked_info = None
+            if parked_info is not None:
+                if [parked_info.st_dev, parked_info.st_ino] != identity:
+                    _fail(f'parked legacy unit file changed; refusing to restore {source}')
+                _renameat2(parent_fd, parked.name, parent_fd, source.name, 1)
+                os.fsync(parent_fd)
+                if not _object_matches_snapshot(parent_fd, source.name, item):
+                    _fail(f'parked legacy unit file does not match its snapshot: {source}')
+                item['restore_journal'] = {
+                    'state': 'restored-parked',
+                    'restored_identity': identity,
+                }
+                _write_legacy_record(record_path, record)
+                return
+
+        stage_name: str
+        stage_fd: int
+        staged_name: str
+        staged_identity: list[int]
+        if isinstance(journal, dict) and isinstance(journal.get('stage_directory'), str):
+            stage_name = journal['stage_directory']
+            staged_name = str(journal.get('stage_name', ''))
+            try:
+                stage_fd = os.open(
+                    stage_name,
+                    os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+                    dir_fd=parent_fd,
+                )
+                info = os.fstat(stage_fd)
+                if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+                    os.close(stage_fd)
+                    _fail(f'legacy restore stage is not root-private: {source.parent / stage_name}')
+                staged_info = os.stat(staged_name, dir_fd=stage_fd, follow_symlinks=False)
+                staged_identity = [staged_info.st_dev, staged_info.st_ino]
+                if staged_identity != journal.get('staged_identity'):
+                    os.close(stage_fd)
+                    _fail(f'legacy restore stage changed after journaling: {source}')
+            except FileNotFoundError:
+                stage_name, stage_fd = _create_restore_stage(parent_fd)
+                staged_name = f'restored-{uuid.uuid4().hex}'
+                staged_identity = _stage_legacy_object(snapshot, item, stage_fd, staged_name)
+                journal = {
+                    'state': 'staged',
+                    'stage_directory': stage_name,
+                    'stage_name': staged_name,
+                    'staged_identity': staged_identity,
+                }
+                item['restore_journal'] = journal
+                _write_legacy_record(record_path, record)
+        else:
+            stage_name, stage_fd = _create_restore_stage(parent_fd)
+            staged_name = f'restored-{uuid.uuid4().hex}'
+            staged_identity = _stage_legacy_object(snapshot, item, stage_fd, staged_name)
+            journal = {
+                'state': 'staged',
+                'stage_directory': stage_name,
+                'stage_name': staged_name,
+                'staged_identity': staged_identity,
+            }
+            item['restore_journal'] = journal
+            _write_legacy_record(record_path, record)
+        try:
+            try:
+                current = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                current = None
+            if current is not None:
+                if [current.st_dev, current.st_ino] == staged_identity and _object_matches_snapshot(parent_fd, source.name, item):
+                    journal['state'] = 'published'
+                    journal['restored_identity'] = staged_identity
+                    _write_legacy_record(record_path, record)
+                    return
+                _fail(f'legacy unit path changed before restoration publication: {source}')
+            _renameat2(stage_fd, staged_name, parent_fd, source.name, 1)
+            os.fsync(parent_fd)
+            if not _object_matches_snapshot(parent_fd, source.name, item):
+                _fail(f'legacy unit restore did not publish the snapshotted object: {source}')
+            journal['state'] = 'published'
+            journal['restored_identity'] = staged_identity
+            _write_legacy_record(record_path, record)
+        finally:
+            os.close(stage_fd)
+        _remove_empty_restore_stage(parent_fd, stage_name)
+    finally:
+        os.close(parent_fd)
+def _safe_legacy_destination(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or '..' in path.parts:
+        _fail(f'legacy migration contains an unsafe restore path: {value!r}')
+    try:
+        parent = path.parent.resolve(strict=True)
+    except OSError as error:
+        raise InstallerError(f'legacy restore parent is unavailable: {error}') from error
+    if parent != path.parent:
+        _fail(f'legacy restore parent changed during migration: {path.parent}')
+    return path
+
+
+
+
+def _check_legacy_migration(
+    homebrew: Path,
+    service_name: str,
+    user: pwd.struct_passwd,
+    *,
+    user_unit_directory: str | None = None,
+) -> dict[str, object]:
+    service_file = _normalize_service_name(service_name)[1]
+    if user.pw_uid == 0 or pwd.getpwuid(user.pw_uid).pw_name != user.pw_name:
+        _fail('legacy migration requires a resolved non-root service account')
+    unit_directory = _user_unit_directory(
+        user,
+        create=False,
+        value=user_unit_directory,
+    )
+    user_unit = unit_directory / service_file
+    user_paths = {'unit': user_unit, 'scope': 'user', 'user': user}
+    try:
+        user_unit_info = user_unit.lstat()
+    except FileNotFoundError:
+        user_unit_info = None
+    if user_unit_info is not None or _unit_properties(user_paths).get('LoadState', 'not-found') != 'not-found':
+        _fail(f'user service {service_file} already exists; refusing cross-scope duplicate migration')
+
+    system_paths = _system_unit_paths(service_name)
+    activation = _capture_activation(system_paths)
+    if activation.get('load_state') != 'loaded':
+        _fail(f'legacy system service {service_file} is not loaded')
+    properties = _unit_properties(system_paths)
+    working = _systemctl(
+        system_paths,
+        'show',
+        system_paths['unit'].name,
+        '--property=WorkingDirectory',
+        check=False,
+        timeout=15,
+    )
+    working_directory = next(
+        (line.split('=', 1)[1] for line in working.stdout.splitlines() if line.startswith('WorkingDirectory=')),
+        '',
+    )
+    services = homebrew / 'services'
+    if working_directory != str(services):
+        _fail(
+            f'legacy system service WorkingDirectory must be the selected services directory '
+            f'({services}), got {working_directory!r}'
+        )
+    services_path, homebrew_fd, services_fd, _ = _open_services_directory(homebrew, user)
+    try:
+        _lstat_regular_or_absent(services_path / 'PluginLoader')
+        try:
+            runtime_info = os.stat('.decky-installer', dir_fd=services_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            runtime_info = None
+        if runtime_info is not None and (
+            not stat.S_ISDIR(runtime_info.st_mode)
+            or runtime_info.st_uid != 0
+            or runtime_info.st_mode & 0o022
+        ):
+            _fail('legacy root runtime directory is not protected from the service account')
+    finally:
+        os.close(services_fd)
+        os.close(homebrew_fd)
+    sources = _legacy_system_sources(properties)
+    mask_parent = Path('/etc/systemd/system')
+    mask_fd = _open_root_directory(mask_parent)
+    try:
+        mask_name = service_file
+        try:
+            mask_info = os.stat(mask_name, dir_fd=mask_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            mask_info = None
+        if mask_info is not None and not any(source == mask_parent / mask_name for source in sources):
+            _fail(f'legacy migration would overwrite an unrelated system unit path: {mask_parent / mask_name}')
+        park_name = f'{service_file}.decky-legacy-{user.pw_uid}.parked'
+        try:
+            os.stat(park_name, dir_fd=mask_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            _fail(f'legacy migration park path already exists: {mask_parent / park_name}')
+    finally:
+        os.close(mask_fd)
+    _legacy_store_preflight(user.pw_uid, service_file)
+    status = _read_legacy_status(homebrew, service_name, user.pw_uid)
+    if status is not None and status.get('phase') != 'restored':
+        _fail(f'legacy migration already exists; use restore-legacy-system: {service_file}')
+    for source in (Path(__file__), Path(__file__).with_name('process_observer.py')):
+        try:
+            info = source.lstat()
+        except OSError as error:
+            raise InstallerError(f'legacy migration helper source is unavailable: {error}') from error
+        if not stat.S_ISREG(info.st_mode):
+            _fail(f'legacy migration helper source is not a regular file: {source}')
+    return {
+        'ok': True,
+        'command': 'check-legacy-migration',
+        'service': service_file,
+        'user': user.pw_name,
+        'homebrew': str(homebrew),
+        'user_unit_directory': str(unit_directory),
+        'previously_running': bool(activation.get('running')),
+        'enabled': bool(activation.get('enabled')),
+    }
+
+
+def _snapshot_legacy_system(args: argparse.Namespace, user: pwd.struct_passwd) -> dict[str, Any]:
+    service_file = _normalize_service_name(args.service_name)[1]
+    homebrew = _homebrew_path(args.homebrew)
+    readiness = _check_legacy_migration(
+        homebrew,
+        args.service_name,
+        user,
+        user_unit_directory=args.user_unit_directory,
+    )
+    directory = _legacy_migration_directory(
+        homebrew,
+        args.service_name,
+        create=True,
+        user_uid=user.pw_uid,
+    )
+    record_path = directory / 'private' / 'record.json'
+    _, archive_fds = _open_legacy_store(user.pw_uid, service_file, create=False)
+    try:
+        try:
+            os.stat('record.json', dir_fd=archive_fds['private'], follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            previous = _read_json_at(archive_fds['private'], 'record.json', mode=0o600, private=True)
+            if previous.get('phase') != 'restored':
+                _fail(f'legacy system service has already been migrated; use restore-legacy-system: {service_file}')
+            # A completed restore is history only; start a fresh archive for this migration.
+            os.unlink('record.json', dir_fd=archive_fds['private'])
+            os.fsync(archive_fds['private'])
+        _discard_incomplete_legacy_snapshots(archive_fds['private'])
+        os.mkdir('snapshots', 0o700, dir_fd=archive_fds['private'])
+        os.fsync(archive_fds['private'])
+    finally:
+        _close_legacy_descriptors(archive_fds)
+    # Replace helpers only after confirming no unrestored migration depends on them.
+    _install_legacy_helpers(directory, user.pw_uid, service_file)
+
+    unit_directory = Path(str(readiness['user_unit_directory']))
+    system_paths = _system_unit_paths(args.service_name)
+    activation = _capture_activation(system_paths)
+    properties = _unit_properties(system_paths)
+    services, homebrew_fd, services_fd, services_info = _open_services_directory(homebrew, user)
+    try:
+        services_metadata = _metadata_from_fd(services_fd, services_info)
+        services_metadata['identity'] = [services_info.st_dev, services_info.st_ino]
+        state_directory = directory / 'private' / 'snapshots'
+        state_directory.mkdir(mode=0o700, exist_ok=True)
+        _fsync_directory(directory / 'private')
+        binary_state, binary_identity = _snapshot_binary_at(
+            services_fd,
+            state_directory / 'binary',
+        )
+        legacy_runtime = _inventory_legacy_runtime(services_fd, service_file)
+        system_directory = state_directory / 'system'
+        system_directory.mkdir(mode=0o700)
+        _fsync_directory(state_directory)
+        files: list[dict[str, Any]] = []
+        mask_path = Path('/etc/systemd/system') / service_file
+        park_path = mask_path.with_name(f'{service_file}.decky-legacy-{user.pw_uid}.parked')
+        for index, source in enumerate(_legacy_system_sources(properties)):
+            snapshot = system_directory / f'{index:04d}'
+            item = {
+                'source': str(source),
+                'snapshot': f'snapshots/system/{index:04d}',
+                **_snapshot_legacy_file(source, snapshot),
+            }
+            if source == mask_path:
+                item['parked_path'] = str(park_path)
+            files.append(item)
+    finally:
+        os.close(services_fd)
+        os.close(homebrew_fd)
+    record: dict[str, Any] = {
+        'schema': 1,
+        'operation': 'legacy-system-migration',
+        'service': service_file,
+        'homebrew': str(homebrew),
+        'user': user.pw_name,
+        'user_uid': user.pw_uid,
+        'user_unit_directory': str(unit_directory),
+        'phase': 'prepared',
+        'activation': activation,
+        'binary': binary_state,
+        'services_directory': services_metadata,
+        'binary_identity': binary_identity,
+        'files': files,
+        'persistent_mask': {
+            'path': str(mask_path),
+            'identity': None,
+            'state': 'planned',
+        },
+        'legacy_runtime': legacy_runtime,
+        'created_at': int(time.time()),
+    }
+    _write_legacy_record(record_path, record)
+    return {
+        'directory': directory,
+        'record_path': record_path,
+        'record': record,
+        'system_paths': system_paths,
+    }
+
+def _inventory_legacy_runtime(services_fd: int, service_name: str) -> dict[str, Any]:
+    try:
+        root_info = os.stat('.decky-installer', dir_fd=services_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return {'exists': False, 'entries': []}
+    if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 0 or root_info.st_mode & 0o022:
+        _fail('legacy root runtime directory is not protected from the service account')
+    root_fd = os.open(
+        '.decky-installer',
+        os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+        dir_fd=services_fd,
+    )
+    try:
+        root_opened = os.fstat(root_fd)
+        if (root_info.st_dev, root_info.st_ino) != (root_opened.st_dev, root_opened.st_ino):
+            _fail('legacy root runtime directory changed while opening')
+        try:
+            unit_info = os.stat(service_name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return {
+                'exists': True,
+                'root_identity': [root_info.st_dev, root_info.st_ino],
+                'unit_exists': False,
+                'entries': [],
+            }
+        if not stat.S_ISDIR(unit_info.st_mode) or unit_info.st_uid != 0 or unit_info.st_mode & 0o022:
+            _fail('legacy root runtime unit directory is not root-protected')
+        unit_fd = os.open(
+            service_name,
+            os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+            dir_fd=root_fd,
+        )
+        try:
+            unit_opened = os.fstat(unit_fd)
+            if (unit_info.st_dev, unit_info.st_ino) != (unit_opened.st_dev, unit_opened.st_ino):
+                _fail('legacy root runtime unit directory changed while opening')
+            entries: list[dict[str, Any]] = []
+
+            def walk(directory_fd: int, prefix: str) -> None:
+                for name in sorted(os.listdir(directory_fd)):
+                    if name in ('', '.', '..') or '/' in name:
+                        _fail('legacy root runtime contains an unsafe path component')
+                    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    relative = f'{prefix}/{name}' if prefix else name
+                    identity = [info.st_dev, info.st_ino]
+                    entry: dict[str, Any] = {
+                        'path': relative,
+                        'identity': identity,
+                        'mode': stat.S_IMODE(info.st_mode),
+                        'uid': info.st_uid,
+                        'gid': info.st_gid,
+                    }
+                    if stat.S_ISDIR(info.st_mode):
+                        child_fd = os.open(
+                            name,
+                            os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+                            dir_fd=directory_fd,
+                        )
+                        try:
+                            child_info = os.fstat(child_fd)
+                            if (child_info.st_dev, child_info.st_ino) != (info.st_dev, info.st_ino):
+                                _fail(f'legacy root runtime changed while opening {relative}')
+                            entry['kind'] = 'directory'
+                            entries.append(entry)
+                            walk(child_fd, relative)
+                        finally:
+                            os.close(child_fd)
+                    elif stat.S_ISREG(info.st_mode):
+                        file_fd = os.open(
+                            name,
+                            os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0),
+                            dir_fd=directory_fd,
+                        )
+                        try:
+                            opened = os.fstat(file_fd)
+                            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                                _fail(f'legacy root runtime changed while opening {relative}')
+                            entry['kind'] = 'file'
+                            entry['sha256'] = _digest_descriptor(file_fd)
+                            after = os.fstat(file_fd)
+                            if (
+                                (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                            ):
+                                _fail(f'legacy root runtime changed while hashing {relative}')
+                            entries.append(entry)
+                        finally:
+                            os.close(file_fd)
+                    elif stat.S_ISLNK(info.st_mode):
+                        entry['kind'] = 'symlink'
+                        entry['target'] = os.readlink(name, dir_fd=directory_fd)
+                        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                            _fail(f'legacy root runtime changed while reading {relative}')
+                        entries.append(entry)
+                    else:
+                        _fail(f'legacy root runtime contains an unsupported object: {relative}')
+
+            walk(unit_fd, '')
+            return {
+                'exists': True,
+                'root_identity': [root_info.st_dev, root_info.st_ino],
+                'unit_exists': True,
+                'unit_identity': [unit_info.st_dev, unit_info.st_ino],
+                'entries': entries,
+            }
+        finally:
+            os.close(unit_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _verify_legacy_runtime(services_fd: int, service_name: str, expected: object) -> None:
+    if not isinstance(expected, dict):
+        _fail('legacy system runtime integrity record is invalid')
+    current = _inventory_legacy_runtime(services_fd, service_name)
+    if current != expected:
+        _fail('legacy Rust runtime/worker/control paths changed; refusing to start the system service')
+
+
+def _park_legacy_system_files(record: dict[str, Any], record_path: Path) -> None:
+    service_name = str(record['service'])
+    mask = record.get('persistent_mask')
+    if not isinstance(mask, dict) or mask.get('state') not in ('planned', 'creating', 'installed'):
+        _fail('legacy persistent mask journal is invalid')
+    mask['state'] = 'creating'
+    _write_legacy_record(record_path, record)
+    for item in record['files']:
+        if not isinstance(item, dict) or not isinstance(item.get('parked_path'), str):
+            continue
+        source = _safe_legacy_destination(str(item['source']))
+        parked = _safe_legacy_destination(str(item['parked_path']))
+        if parked.parent != source.parent or source.parent != Path('/etc/systemd/system'):
+            _fail(f'legacy migration contains an unsafe persistent park path: {parked}')
+        parent_fd = _open_root_directory(source.parent)
+        try:
+            identity = item.get('identity')
+            try:
+                source_info = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                source_info = None
+            try:
+                parked_info = os.stat(parked.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                parked_info = None
+            if source_info is not None and [source_info.st_dev, source_info.st_ino] == identity:
+                if parked_info is not None:
+                    _fail(f'legacy park destination already exists: {parked}')
+                _renameat2(parent_fd, source.name, parent_fd, parked.name, 1)
+                os.fsync(parent_fd)
+            elif (
+                source_info is None
+                and parked_info is not None
+                and [parked_info.st_dev, parked_info.st_ino] == identity
+            ):
+                pass
+            else:
+                _fail(f'legacy system unit changed before persistent parking: {source}')
+        finally:
+            os.close(parent_fd)
+
+    mask_path = Path(str(mask.get('path', '')))
+    if mask_path != Path('/etc/systemd/system') / service_name:
+        _fail('legacy persistent mask path is invalid')
+    parent_fd = _open_root_directory(mask_path.parent)
+    try:
+        try:
+            current = os.stat(mask_path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is None:
+            os.symlink('/dev/null', mask_path.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            current = os.stat(mask_path.name, dir_fd=parent_fd, follow_symlinks=False)
+        else:
+            if not stat.S_ISLNK(current.st_mode) or os.readlink(mask_path.name, dir_fd=parent_fd) != '/dev/null':
+                _fail(f'legacy migration refuses to overwrite an unrelated system unit: {mask_path}')
+            expected_identity = mask.get('identity')
+            if expected_identity is not None and [current.st_dev, current.st_ino] != expected_identity:
+                _fail(f'legacy persistent mask changed during migration: {mask_path}')
+        mask['identity'] = [current.st_dev, current.st_ino]
+        mask['state'] = 'installed'
+        _write_legacy_record(record_path, record)
+    finally:
+        os.close(parent_fd)
+
+
+def _remove_legacy_persistent_mask(record: dict[str, Any], record_path: Path) -> None:
+    mask = record.get('persistent_mask')
+    if not isinstance(mask, dict):
+        _fail('legacy persistent mask journal is invalid')
+    path = Path(str(mask.get('path', '')))
+    if path != Path('/etc/systemd/system') / str(record['service']):
+        _fail('legacy persistent mask path is invalid')
+    if mask.get('state') == 'removed':
+        # A retry after partial restore: the per-file restore validates the destination.
+        return
+    parent_fd = _open_root_directory(path.parent)
+    try:
+        try:
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if mask.get('state') == 'planned':
+            mask['state'] = 'removed'
+            _write_legacy_record(record_path, record)
+            return
+        if current is not None:
+            identity = mask.get('identity')
+            if identity is None and mask.get('state') == 'creating':
+                original = next(
+                    (
+                        item for item in record.get('files', [])
+                        if isinstance(item, dict)
+                        and item.get('source') == str(path)
+                        and item.get('identity') == [current.st_dev, current.st_ino]
+                    ),
+                    None,
+                )
+                if original is not None:
+                    mask['state'] = 'removed'
+                    _write_legacy_record(record_path, record)
+                    return
+                if (
+                    not stat.S_ISLNK(current.st_mode)
+                    or current.st_uid != 0
+                    or os.readlink(path.name, dir_fd=parent_fd) != '/dev/null'
+                ):
+                    _fail(f'legacy persistent mask is not the journaled root mask: {path}')
+                mask['identity'] = [current.st_dev, current.st_ino]
+            elif identity != [current.st_dev, current.st_ino]:
+                _fail(f'legacy persistent unit path changed; refusing to remove it: {path}')
+            if not stat.S_ISLNK(current.st_mode) or os.readlink(path.name, dir_fd=parent_fd) != '/dev/null':
+                _fail(f'legacy persistent unit mask was replaced: {path}')
+            os.unlink(path.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        mask['state'] = 'removed'
+        _write_legacy_record(record_path, record)
+    finally:
+        os.close(parent_fd)
+
+
+def _open_recorded_services(
+    homebrew: Path,
+    record: dict[str, Any],
+) -> tuple[int, int, os.stat_result]:
+    services_state = record.get('services_directory')
+    if not isinstance(services_state, dict):
+        _fail('legacy services-directory journal is invalid')
+    identity = services_state.get('identity')
+    if not isinstance(identity, list) or len(identity) != 2 or any(type(value) is not int for value in identity):
+        _fail('legacy services-directory inode identity is invalid')
+    try:
+        homebrew_fd = os.open(
+            homebrew,
+            os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+        )
+        services_fd = os.open(
+            'services',
+            os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+            dir_fd=homebrew_fd,
+        )
+    except OSError as error:
+        try:
+            os.close(homebrew_fd)
+        except (UnboundLocalError, OSError):
+            pass
+        raise InstallerError(f'legacy services directory is unavailable: {error}') from error
+    info = os.fstat(services_fd)
+    try:
+        path_info = os.stat('services', dir_fd=homebrew_fd, follow_symlinks=False)
+    except OSError as error:
+        os.close(services_fd)
+        os.close(homebrew_fd)
+        raise InstallerError(f'legacy services directory changed during restore: {error}') from error
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or [info.st_dev, info.st_ino] != identity
+        or [path_info.st_dev, path_info.st_ino] != identity
+    ):
+        os.close(services_fd)
+        os.close(homebrew_fd)
+        _fail('legacy services directory changed after its migration snapshot')
+    if info.st_uid not in (0, record.get('user_uid')) or info.st_mode & 0o6000:
+        os.close(services_fd)
+        os.close(homebrew_fd)
+        _fail('legacy services directory ownership changed unexpectedly')
+    return homebrew_fd, services_fd, info
+
+
+def _restore_services_directory_metadata(
+    homebrew: Path,
+    record: dict[str, Any],
+) -> None:
+    services_state = record.get('services_directory')
+    if not isinstance(services_state, dict):
+        _fail('legacy services-directory metadata is invalid')
+    metadata = {key: value for key, value in services_state.items() if key != 'identity'}
+    homebrew_fd, services_fd, _ = _open_recorded_services(homebrew, record)
+    try:
+        os.fchown(services_fd, int(metadata['uid']), int(metadata['gid']))
+        xattrs = metadata.get('xattrs', {})
+        if not isinstance(xattrs, dict):
+            _fail('legacy services-directory xattr snapshot is invalid')
+        for name, encoded in xattrs.items():
+            os.setxattr(services_fd, str(name), base64.b64decode(str(encoded), validate=True))
+        os.fchmod(services_fd, int(metadata['mode']))
+        os.utime(services_fd, ns=(int(metadata['atime_ns']), int(metadata['mtime_ns'])))
+        os.fsync(services_fd)
+        path_info = os.stat('services', dir_fd=homebrew_fd, follow_symlinks=False)
+        info = os.fstat(services_fd)
+        if (path_info.st_dev, path_info.st_ino) != (info.st_dev, info.st_ino):
+            _fail('legacy services path changed while restoring its directory metadata')
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        raise InstallerError(f'cannot safely restore legacy services-directory metadata: {error}') from error
+    finally:
+        os.close(services_fd)
+        os.close(homebrew_fd)
+
+
+def _handoff_services_directory(
+    homebrew: Path,
+    user: pwd.struct_passwd,
+    record: dict[str, Any],
+    record_path: Path,
+) -> None:
+    metadata = record.get('services_directory')
+    if not isinstance(metadata, dict):
+        _fail('legacy services-directory snapshot is invalid')
+    mode = int(metadata['mode'])
+    record['phase'] = 'services-handoff-pending'
+    _write_legacy_record(record_path, record)
+    homebrew_fd, services_fd, _ = _open_recorded_services(homebrew, record)
+    try:
+        os.fchmod(services_fd, mode & ~0o222)
+        os.fchown(services_fd, user.pw_uid, user.pw_gid)
+        os.fchmod(services_fd, mode)
+        os.fsync(services_fd)
+        path_info = os.stat('services', dir_fd=homebrew_fd, follow_symlinks=False)
+        info = os.fstat(services_fd)
+        if (path_info.st_dev, path_info.st_ino) != (info.st_dev, info.st_ino):
+            _fail('legacy services path changed during ownership handoff')
+    finally:
+        os.close(services_fd)
+        os.close(homebrew_fd)
+    record['phase'] = 'services-user-owned'
+    _write_legacy_record(record_path, record)
+
+
+def _legacy_user_manager_environment(user: pwd.struct_passwd) -> dict[str, str]:
+    runtime = _user_runtime_directory(user)
+    return {
+        'HOME': user.pw_dir,
+        'USER': user.pw_name,
+        'LOGNAME': user.pw_name,
+        'PATH': '/usr/sbin:/usr/bin:/sbin:/bin',
+        'XDG_RUNTIME_DIR': str(runtime),
+        'DBUS_SESSION_BUS_ADDRESS': f'unix:path={runtime / "bus"}',
+        'PYTHONDONTWRITEBYTECODE': '1',
+        'LC_ALL': 'C',
+    }
+
+
+def _run_legacy_user_stop(args: argparse.Namespace) -> dict[str, object]:
+    user = _current_user()
+    if os.geteuid() == 0 or args.user != user.pw_name:
+        _fail('legacy user-service cleanup must run as the selected non-root account')
+    if pwd.getpwuid(user.pw_uid).pw_name != args.user:
+        _fail('legacy user-service cleanup requires the resolved account name')
+    _, unit_name = _normalize_service_name(args.service_name)
+    unit_directory = _user_unit_directory(
+        user,
+        create=False,
+        value=args.user_unit_directory,
+    )
+    unit_path = unit_directory / unit_name
+    paths: dict[str, Any] = {
+        'unit': unit_path,
+        'unit_dir': unit_directory,
+        'scope': 'user',
+        'user': user,
+    }
+    _assert_user_unit_source(paths)
+    stop_service(unit_name, scope='user', user=user)
+    properties = _unit_properties(paths)
+    if (
+        properties.get('ActiveState') not in ('inactive', 'failed', 'dead', '')
+        or properties.get('MainPID', '0') != '0'
+    ):
+        _fail('user service remains active after drainage; refusing to remove its unit')
+    try:
+        unit_directory_fd = os.open(
+            unit_directory,
+            os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+        )
+    except FileNotFoundError:
+        # The user install never created the directory, so it holds no unit.
+        unit_directory_fd = None
+    except OSError as error:
+        raise InstallerError(f'user service unit directory is unavailable: {error}') from error
+    try:
+        info = None
+        if unit_directory_fd is not None:
+            try:
+                info = os.stat(unit_name, dir_fd=unit_directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                info = None
+        if info is not None:
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != user.pw_uid:
+                _fail(f'refusing to remove an uncontrolled user service unit: {unit_path}')
+            _systemctl(paths, 'disable', unit_name, check=False)
+            _systemctl(paths, 'disable', '--runtime', unit_name, check=False)
+            os.unlink(unit_name, dir_fd=unit_directory_fd)
+            os.fsync(unit_directory_fd)
+        _systemctl(paths, 'daemon-reload', timeout=30)
+    finally:
+        if unit_directory_fd is not None:
+            os.close(unit_directory_fd)
+    after = _unit_properties(paths)
+    if after.get('LoadState') != 'not-found' or after.get('MainPID', '0') != '0':
+        _fail('user service unit remains loaded after removal; refusing system activation')
+    return {
+        'ok': True,
+        'command': 'legacy-user-stop',
+        'service': unit_name,
+        'load_state': after.get('LoadState'),
+        'active_state': after.get('ActiveState'),
+    }
+
+
+def _stop_legacy_user_service_as_user(
+    directory: Path,
+    user: pwd.struct_passwd,
+    unit_name: str,
+    unit_directory: Path,
+) -> None:
+    helper = directory / 'helper' / 'install.py'
+    info = helper.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) != 0o755
+        or info.st_mode & 0o022
+    ):
+        _fail(f'protected legacy user cleanup helper is unavailable: {helper}')
+    try:
+        groups = os.getgrouplist(user.pw_name, user.pw_gid)
+    except AttributeError:
+        groups = [user.pw_gid]
+
+    def drop_privileges() -> None:
+        os.setgroups(groups)
+        os.setgid(user.pw_gid)
+        os.setuid(user.pw_uid)
+
+    command = [
+        os.path.realpath(sys.executable),
+        str(helper),
+        'legacy-user-stop',
+        '--user',
+        user.pw_name,
+        '--service-name',
+        unit_name,
+        '--user-unit-directory',
+        str(unit_directory),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            check=False,
+            cwd=user.pw_dir if Path(user.pw_dir).is_dir() else '/',
+            env=_legacy_user_manager_environment(user),
+            preexec_fn=drop_privileges,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise InstallerError(f'cannot run protected user-service cleanup for {unit_name}: {error}') from error
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or f'exit status {result.returncode}'
+        _fail(f'protected user-service cleanup failed for {unit_name}: {detail}')
+
+
+def _run_legacy_migration(args: argparse.Namespace) -> dict[str, object]:
+    _require_root()
+    user = pwd.getpwnam(args.user)
+    if user.pw_uid == 0 or user.pw_name != args.user:
+        _fail('legacy migration requires the resolved non-root account named by --user')
+    homebrew = _homebrew_path(args.homebrew)
+    snapshot = _snapshot_legacy_system(args, user)
+    record = snapshot['record']
+    paths = snapshot['system_paths']
+    record_path = snapshot['record_path']
+    directory = snapshot['directory']
+    stop_service(args.service_name, scope='system')
+    record['phase'] = 'system-stopped'
+    _write_legacy_record(record_path, record)
+
+    services, homebrew_fd, services_fd, _ = _open_services_directory(homebrew, user)
+    try:
+        record['legacy_runtime'] = _inventory_legacy_runtime(services_fd, str(record['service']))
+        _write_legacy_record(record_path, record)
+    finally:
+        os.close(services_fd)
+        os.close(homebrew_fd)
+
+    _systemctl(paths, 'disable', paths['unit'].name, check=False)
+    _systemctl(paths, 'disable', '--runtime', paths['unit'].name, check=False)
+    _park_legacy_system_files(record, record_path)
+    _systemctl(paths, 'daemon-reload', timeout=30)
+    properties = _unit_properties(paths)
+    if (
+        properties.get('LoadState') != 'masked'
+        or properties.get('ActiveState') not in ('inactive', 'failed')
+        or properties.get('MainPID', '0') != '0'
+    ):
+        _fail('legacy system unit was not safely parked after process drainage')
+    record['phase'] = 'parked'
+    _write_legacy_record(record_path, record)
+
+    binary_identity = record.get('binary_identity')
+    record['phase'] = 'binary-removal-pending'
+    _write_legacy_record(record_path, record)
+    services_state = record.get('services_directory')
+    if not isinstance(services_state, dict):
+        _fail('legacy services-directory snapshot is invalid')
+    homebrew_fd, services_fd, _ = _open_recorded_services(homebrew, record)
+    try:
+        os.fchmod(services_fd, int(services_state['mode']) & ~0o222)
+        if isinstance(binary_identity, list) and len(binary_identity) == 2:
+            current = os.stat('PluginLoader', dir_fd=services_fd, follow_symlinks=False)
+            if not stat.S_ISREG(current.st_mode) or [current.st_dev, current.st_ino] != binary_identity:
+                _fail('legacy backend binary changed after its rollback snapshot; refusing to remove it')
+            binary_state = record.get('binary')
+            if (
+                not isinstance(binary_state, dict)
+                or binary_state.get('exists') is not True
+                or not _object_matches_snapshot(
+                    services_fd,
+                    'PluginLoader',
+                    {'kind': 'file', **binary_state},
+                )
+            ):
+                _fail('legacy backend binary contents or metadata changed after its rollback snapshot')
+            binary_fd = os.open(
+                'PluginLoader',
+                os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NOATIME', 0),
+                dir_fd=services_fd,
+            )
+            try:
+                opened = os.fstat(binary_fd)
+                if [opened.st_dev, opened.st_ino] != binary_identity:
+                    _fail('legacy backend binary changed before removal')
+            finally:
+                os.close(binary_fd)
+            os.unlink('PluginLoader', dir_fd=services_fd)
+            os.fsync(services_fd)
+        else:
+            try:
+                os.stat('PluginLoader', dir_fd=services_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                _fail('legacy backend binary appeared after its rollback snapshot')
+        record['phase'] = 'binary-removed'
+        _write_legacy_record(record_path, record)
+    finally:
+        os.close(services_fd)
+        os.close(homebrew_fd)
+    _handoff_services_directory(homebrew, user, record, record_path)
+    return {
+        'ok': True,
+        'command': 'migrate-legacy-system',
+        'service': paths['unit'].name,
+        'user': user.pw_name,
+        'state': str(record_path),
+        'status': str(directory / 'status.json'),
+        'helper': str(directory / 'helper' / 'install.py'),
+        'previously_running': bool(record['activation'].get('running')),
+        'restore_command': 'restore-legacy-system',
+    }
+
+
+def _lock_services_directory_for_restore(
+    homebrew: Path,
+    record: dict[str, Any],
+    record_path: Path,
+) -> None:
+    state = record.get('services_directory')
+    if not isinstance(state, dict):
+        _fail('legacy services-directory snapshot is invalid')
+    record['phase'] = 'services-lock-pending'
+    _write_legacy_record(record_path, record)
+    homebrew_fd, services_fd, _ = _open_recorded_services(homebrew, record)
+    try:
+        # Take ownership first: clearing write bits alone can be undone by the owner.
+        os.fchown(services_fd, 0, -1)
+        os.fchmod(services_fd, int(state['mode']) & ~0o222)
+        os.fsync(services_fd)
+        current = os.stat('services', dir_fd=homebrew_fd, follow_symlinks=False)
+        opened = os.fstat(services_fd)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            _fail('legacy services path changed while securing restore publication')
+    finally:
+        os.close(services_fd)
+        os.close(homebrew_fd)
+
+
+def _cleanup_legacy_binary_stage(
+    services_fd: int,
+    journal: dict[str, Any],
+    user: pwd.struct_passwd,
+) -> None:
+    stage_name, staged_name = journal.get('stage_directory'), journal.get('stage_name')
+    if not isinstance(stage_name, str) or not isinstance(staged_name, str):
+        return
+    try:
+        stage_fd = os.open(
+            stage_name,
+            os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+            dir_fd=services_fd,
+        )
+    except FileNotFoundError:
+        return
+    try:
+        try:
+            displaced = os.stat(staged_name, dir_fd=stage_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            displaced = None
+        if displaced is not None:
+            expected = journal.get('expected_destination_identity')
+            if (
+                not isinstance(expected, list)
+                or [displaced.st_dev, displaced.st_ino] != expected
+                or not stat.S_ISREG(displaced.st_mode)
+                or displaced.st_uid != user.pw_uid
+            ):
+                _fail('legacy binary restore stage contains an unexpected displaced file')
+            os.unlink(staged_name, dir_fd=stage_fd)
+        os.fsync(stage_fd)
+    finally:
+        os.close(stage_fd)
+    try:
+        os.rmdir(stage_name, dir_fd=services_fd)
+        os.fsync(services_fd)
+    except OSError:
+        pass
+
+
+def _discard_unpublished_legacy_binary_stage(
+    services_fd: int,
+    journal: dict[str, Any],
+) -> None:
+    stage_name, staged_name = journal.get('stage_directory'), journal.get('stage_name')
+    staged_identity = journal.get('staged_identity')
+    if not isinstance(stage_name, str) or not isinstance(staged_name, str):
+        return
+    try:
+        stage_fd = os.open(
+            stage_name,
+            os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+            dir_fd=services_fd,
+        )
+    except FileNotFoundError:
+        return
+    try:
+        stage_info = os.fstat(stage_fd)
+        if stage_info.st_uid != 0 or stat.S_IMODE(stage_info.st_mode) != 0o700:
+            _fail('legacy binary stage is not root-private')
+        try:
+            staged = os.stat(staged_name, dir_fd=stage_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            staged = None
+        if staged is not None:
+            if (
+                [staged.st_dev, staged.st_ino] != staged_identity
+                or not stat.S_ISREG(staged.st_mode)
+                or staged.st_uid != 0
+            ):
+                _fail('legacy binary stage no longer contains its unpublished root file')
+            os.unlink(staged_name, dir_fd=stage_fd)
+        os.fsync(stage_fd)
+    finally:
+        os.close(stage_fd)
+    try:
+        os.rmdir(stage_name, dir_fd=services_fd)
+        os.fsync(services_fd)
+    except OSError:
+        pass
+
+
+def _finish_legacy_binary_removal(
+    services_fd: int,
+    journal: dict[str, Any],
+    user: pwd.struct_passwd,
+    *,
+    sentinel_at_destination: bool,
+) -> None:
+    stage_name, staged_name = journal.get('stage_directory'), journal.get('stage_name')
+    if not isinstance(stage_name, str) or not isinstance(staged_name, str):
+        _fail('legacy binary removal journal is invalid')
+    stage_fd = os.open(
+        stage_name,
+        os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+        dir_fd=services_fd,
+    )
+    try:
+        stage_info = os.fstat(stage_fd)
+        if stage_info.st_uid != 0 or stat.S_IMODE(stage_info.st_mode) != 0o700:
+            _fail('legacy binary removal stage is not root-private')
+        try:
+            staged = os.stat(staged_name, dir_fd=stage_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            staged = None
+        if staged is not None:
+            staged_identity = [staged.st_dev, staged.st_ino]
+            if staged_identity == journal.get('expected_destination_identity'):
+                if not stat.S_ISREG(staged.st_mode) or staged.st_uid != user.pw_uid:
+                    _fail('legacy binary removal displaced an uncontrolled file')
+            elif staged_identity == journal.get('staged_identity'):
+                if not stat.S_ISREG(staged.st_mode) or staged.st_uid != 0:
+                    _fail('legacy binary removal sentinel changed')
+            else:
+                _fail('legacy binary removal stage contains an outside inode')
+            os.unlink(staged_name, dir_fd=stage_fd)
+        if sentinel_at_destination:
+            try:
+                current = os.stat('PluginLoader', dir_fd=services_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                current = None
+            if current is not None:
+                if (
+                    [current.st_dev, current.st_ino] != journal.get('staged_identity')
+                    or not stat.S_ISREG(current.st_mode)
+                    or current.st_uid != 0
+                ):
+                    _fail('legacy binary removal sentinel was replaced')
+                os.unlink('PluginLoader', dir_fd=services_fd)
+        os.fsync(stage_fd)
+        os.fsync(services_fd)
+    finally:
+        os.close(stage_fd)
+    try:
+        os.rmdir(stage_name, dir_fd=services_fd)
+        os.fsync(services_fd)
+    except OSError:
+        pass
+
+
+def _restore_legacy_binary(
+    homebrew: Path,
+    record: dict[str, Any],
+    record_path: Path,
+    snapshot: Path,
+    user: pwd.struct_passwd,
+) -> None:
+    state = record.get('binary')
+    if not isinstance(state, dict) or not isinstance(state.get('exists'), bool):
+        _fail('legacy migration binary snapshot is invalid')
+    homebrew_fd, services_fd, _ = _open_recorded_services(homebrew, record)
+    try:
+        journal = state.get('restore_journal')
+        if journal is not None and not isinstance(journal, dict):
+            _fail('legacy binary restore journal is invalid')
+        try:
+            current = os.stat('PluginLoader', dir_fd=services_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        original_identity = record.get('binary_identity')
+        if not state['exists']:
+            if current is None:
+                if isinstance(journal, dict) and journal.get('state') == 'removing':
+                    try:
+                        _finish_legacy_binary_removal(
+                            services_fd,
+                            journal,
+                            user,
+                            sentinel_at_destination=False,
+                        )
+                    except FileNotFoundError:
+                        pass
+                state['restore_journal'] = {'state': 'removed'}
+                _write_legacy_record(record_path, record)
+                return
+            current_identity = [current.st_dev, current.st_ino]
+            if (
+                isinstance(journal, dict)
+                and journal.get('state') == 'removing'
+                and current_identity == journal.get('staged_identity')
+            ):
+                _finish_legacy_binary_removal(
+                    services_fd,
+                    journal,
+                    user,
+                    sentinel_at_destination=True,
+                )
+                state['restore_journal'] = {'state': 'removed'}
+                _write_legacy_record(record_path, record)
+                return
+            if isinstance(journal, dict) and journal.get('state') == 'removing':
+                if current_identity != journal.get('expected_destination_identity'):
+                    _fail('legacy backend destination changed during interrupted removal')
+                _discard_unpublished_legacy_binary_stage(services_fd, journal)
+            if not stat.S_ISREG(current.st_mode) or current.st_uid != user.pw_uid or current.st_mode & 0o6000:
+                _fail('legacy backend destination is not the selected user runtime binary')
+            stage_name, stage_fd = _create_restore_stage(services_fd)
+            staged_name = f'sentinel-{uuid.uuid4().hex}'
+            sentinel_fd = os.open(
+                staged_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0),
+                0o600,
+                dir_fd=stage_fd,
+            )
+            try:
+                os.fchown(sentinel_fd, 0, 0)
+                os.fchmod(sentinel_fd, 0o600)
+                os.fsync(sentinel_fd)
+                sentinel = os.fstat(sentinel_fd)
+            finally:
+                os.close(sentinel_fd)
+            journal = {
+                'state': 'removing',
+                'stage_directory': stage_name,
+                'stage_name': staged_name,
+                'staged_identity': [sentinel.st_dev, sentinel.st_ino],
+                'expected_destination_identity': current_identity,
+            }
+            state['restore_journal'] = journal
+            _write_legacy_record(record_path, record)
+            try:
+                _renameat2(stage_fd, staged_name, services_fd, 'PluginLoader', 2)
+                displaced = os.stat(staged_name, dir_fd=stage_fd, follow_symlinks=False)
+                if (
+                    [displaced.st_dev, displaced.st_ino] != current_identity
+                    or not stat.S_ISREG(displaced.st_mode)
+                    or displaced.st_uid != user.pw_uid
+                ):
+                    _renameat2(stage_fd, staged_name, services_fd, 'PluginLoader', 2)
+                    _fail('legacy backend destination changed while removing the user runtime binary')
+                _finish_legacy_binary_removal(
+                    services_fd,
+                    journal,
+                    user,
+                    sentinel_at_destination=True,
+                )
+                state['restore_journal'] = {'state': 'removed'}
+                _write_legacy_record(record_path, record)
+            finally:
+                os.close(stage_fd)
+            return
+
+        metadata = state.get('metadata')
+        digest = state.get('sha256')
+        if not isinstance(metadata, dict) or not isinstance(digest, str):
+            _fail('legacy migration binary snapshot metadata or checksum is invalid')
+        item = {'kind': 'file', 'metadata': metadata, 'sha256': digest}
+        # Inode numbers can be reused after migration removed the original, so the
+        # identity shortcut also requires matching contents and metadata.
+        if (
+            current is not None
+            and isinstance(original_identity, list)
+            and [current.st_dev, current.st_ino] == original_identity
+            and _object_matches_snapshot(services_fd, 'PluginLoader', item)
+        ):
+            state['restore_journal'] = {'state': 'restored-original', 'restored_identity': original_identity}
+            _write_legacy_record(record_path, record)
+            return
+        if current is not None and isinstance(journal, dict) and [
+            current.st_dev, current.st_ino
+        ] == journal.get('staged_identity'):
+            if not _object_matches_snapshot(services_fd, 'PluginLoader', item):
+                _fail('legacy backend restore publication changed after interruption')
+            journal['state'] = 'published'
+            journal['restored_identity'] = [current.st_dev, current.st_ino]
+            _write_legacy_record(record_path, record)
+            _cleanup_legacy_binary_stage(services_fd, journal, user)
+            return
+        expected: list[int] | None = None
+        if current is not None:
+            if not stat.S_ISREG(current.st_mode) or current.st_uid != user.pw_uid or current.st_mode & 0o6000:
+                _fail('legacy backend destination is not the selected user runtime binary')
+            expected = [current.st_dev, current.st_ino]
+        if isinstance(journal, dict):
+            if (
+                journal.get('state') != 'staged'
+                or journal.get('expected_destination_identity') != expected
+            ):
+                _fail('legacy backend restore destination changed after journaling')
+            _discard_unpublished_legacy_binary_stage(services_fd, journal)
+        stage_name, stage_fd = _create_restore_stage(services_fd)
+        staged_name = f'binary-{uuid.uuid4().hex}'
+        staged_identity = _stage_legacy_object(snapshot, item, stage_fd, staged_name)
+        journal = {
+            'state': 'staged',
+            'stage_directory': stage_name,
+            'stage_name': staged_name,
+            'staged_identity': staged_identity,
+            'expected_destination_identity': expected,
+        }
+        state['restore_journal'] = journal
+        _write_legacy_record(record_path, record)
+        try:
+            if expected is None:
+                _renameat2(stage_fd, staged_name, services_fd, 'PluginLoader', 1)
+            else:
+                _renameat2(stage_fd, staged_name, services_fd, 'PluginLoader', 2)
+                displaced = os.stat(staged_name, dir_fd=stage_fd, follow_symlinks=False)
+                if (
+                    [displaced.st_dev, displaced.st_ino] != expected
+                    or not stat.S_ISREG(displaced.st_mode)
+                    or displaced.st_uid != user.pw_uid
+                ):
+                    _renameat2(stage_fd, staged_name, services_fd, 'PluginLoader', 2)
+                    _fail('legacy backend destination changed during atomic publication')
+                os.unlink(staged_name, dir_fd=stage_fd)
+            os.fsync(stage_fd)
+            os.fsync(services_fd)
+            journal['state'] = 'published'
+            journal['restored_identity'] = staged_identity
+            _write_legacy_record(record_path, record)
+        finally:
+            os.close(stage_fd)
+        _cleanup_legacy_binary_stage(services_fd, journal, user)
+    finally:
+        os.close(services_fd)
+        os.close(homebrew_fd)
+
+
+def _run_legacy_restore(args: argparse.Namespace) -> dict[str, object]:
+    _require_root()
+    user = pwd.getpwnam(args.user)
+    homebrew = _homebrew_path(args.homebrew)
+    directory, record = _read_legacy_record(homebrew, args.service_name, user.pw_uid)
+    if user.pw_uid == 0 or user.pw_uid != record['user_uid'] or user.pw_name != record['user']:
+        _fail('legacy migration snapshot belongs to a different service account')
+    if record.get('phase') == 'restored':
+        _fail('legacy system service has already been restored')
+    protected_helper = directory / 'helper' / 'install.py'
+    helper_info = protected_helper.lstat()
+    if (
+        not stat.S_ISREG(helper_info.st_mode)
+        or helper_info.st_uid != 0
+        or stat.S_IMODE(helper_info.st_mode) != 0o755
+        or helper_info.st_mode & 0o022
+        or Path(__file__).resolve(strict=True) != protected_helper
+    ):
+        _fail(f'legacy restore must run from its protected offline helper: {protected_helper}')
+    if args.user_unit_directory and str(Path(args.user_unit_directory)) != record['user_unit_directory']:
+        _fail('restore user unit directory differs from the legacy migration snapshot')
+    record_path = directory / 'private' / 'record.json'
+    if record.get('phase') not in ('restoring', 'services-lock-pending'):
+        # Never move a retried restore's journal phase backwards.
+        record['phase'] = 'restoring'
+        _write_legacy_record(record_path, record)
+
+    unit_name = str(record['service'])
+    unit_directory = _user_unit_directory(
+        user,
+        create=False,
+        value=record['user_unit_directory'],
+    )
+    _stop_legacy_user_service_as_user(directory, user, unit_name, unit_directory)
+    user_paths: dict[str, Any] = {
+        'unit': unit_directory / unit_name,
+        'unit_dir': unit_directory,
+        'scope': 'user',
+        'user': user,
+    }
+    user_properties = _unit_properties(user_paths)
+    if user_properties.get('LoadState') != 'not-found' or user_properties.get('MainPID', '0') != '0':
+        _fail('user service unit remains loaded after unprivileged removal; refusing system activation')
+
+    system_paths = _system_unit_paths(unit_name)
+    # Retained root stop identities remain authoritative across retries and boots.
+    # Do not unmask or activate while any recorded root helper remains undrained.
+    stop_service(unit_name, scope='system')
+    _remove_legacy_persistent_mask(record, record_path)
+    _systemctl(system_paths, 'daemon-reload', timeout=30)
+
+    for index, item in enumerate(record['files']):
+        if not isinstance(item, dict):
+            _fail('legacy migration file manifest is invalid')
+        source = _safe_legacy_destination(str(item.get('source', '')))
+        relative = Path(str(item.get('snapshot', '')))
+        if relative.is_absolute() or '..' in relative.parts or not relative.parts:
+            _fail('legacy migration snapshot contains an unsafe relative path')
+        _restore_legacy_file(
+            source,
+            directory / 'private' / relative,
+            item,
+            record,
+            record_path,
+            index,
+        )
+
+    _lock_services_directory_for_restore(homebrew, record, record_path)
+    homebrew_fd, services_fd, _ = _open_recorded_services(homebrew, record)
+    try:
+        _verify_legacy_runtime(
+            services_fd,
+            unit_name,
+            record.get('legacy_runtime'),
+        )
+    finally:
+        os.close(services_fd)
+        os.close(homebrew_fd)
+    binary_state = record.get('binary')
+    if not isinstance(binary_state, dict):
+        _fail('legacy migration binary snapshot is invalid')
+    _restore_legacy_binary(
+        homebrew,
+        record,
+        record_path,
+        directory / 'private' / 'snapshots' / 'binary',
+        user,
+    )
+    _restore_services_directory_metadata(homebrew, record)
+
+    homebrew_fd, services_fd, _ = _open_recorded_services(homebrew, record)
+    try:
+        _verify_legacy_runtime(
+            services_fd,
+            unit_name,
+            record.get('legacy_runtime'),
+        )
+        # services/ is root-owned again; confirm the binary root will start is the snapshot.
+        if binary_state.get('exists') is True:
+            if not _object_matches_snapshot(services_fd, 'PluginLoader', {'kind': 'file', **binary_state}):
+                _fail('restored legacy backend binary differs from its migration snapshot')
+        else:
+            try:
+                os.stat('PluginLoader', dir_fd=services_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                _fail('a backend binary appeared where the legacy service had none')
+    finally:
+        os.close(services_fd)
+        os.close(homebrew_fd)
+    _systemctl(system_paths, 'daemon-reload', timeout=30)
+    activation = record.get('activation')
+    if not isinstance(activation, dict):
+        _fail('legacy migration activation snapshot is invalid')
+    _set_enabled(system_paths, activation)
+    if activation.get('running'):
+        _systemctl(system_paths, 'start', unit_name, timeout=45)
+        _wait_running(system_paths)
+        legacy_active = homebrew / 'services' / '.decky-installer' / unit_name / 'active.json'
+        health_paths = {
+            **system_paths,
+            'binary': homebrew / 'services' / 'PluginLoader',
+            'active': legacy_active,
+            'homebrew': homebrew,
+        }
+        if legacy_active.exists():
+            _health(health_paths)
+    else:
+        _wait_stopped(system_paths)
+    record['phase'] = 'restored'
+    _write_legacy_record(record_path, record)
+    return {
+        'ok': True,
+        'command': 'restore-legacy-system',
+        'service': unit_name,
+        'user': user.pw_name,
+        'status': str(directory / 'status.json'),
+        'restored_running': bool(activation.get('running')),
+        'restored_enabled': bool(activation.get('enabled')),
+    }
+
+
+def _verify_bundle(args: argparse.Namespace) -> tuple[pwd.struct_passwd, Path, str, Path, dict[str, Any]]:
+    user = pwd.getpwnam(args.user)
+    _require_user(user)
+    if args.user != user.pw_name:
+        _fail('pass the resolved Unix account name with --user')
+    _, service_filename = _normalize_service_name(args.service_name)
+    homebrew = _homebrew_path(args.homebrew, allow_missing=True)
+    bundle, manifest = _validate_bundle(args.bundle, user)
+    if args.version != manifest['release_version']:
+        _fail('--version must match the bundle release identity')
+    _verify_runtime(bundle, manifest, user, bundle / RUST_EXECUTABLE)
+    return user, homebrew, service_filename, bundle, manifest
+
+
+def _verify_bundle_command(args: argparse.Namespace) -> dict[str, object]:
+    user, homebrew, service_filename, bundle, manifest = _verify_bundle(args)
+    return {
+        'ok': True,
+        'command': 'verify-bundle',
+        'service': service_filename,
+        'user': user.pw_name,
+        'homebrew': str(homebrew),
+        'version': manifest['release_version'],
+        'bundle': str(bundle),
+    }
+
+
+def _check_bundle(args: argparse.Namespace) -> dict[str, object]:
+    user, homebrew, service_filename, bundle, manifest = _verify_bundle(args)
+    unit_directory = _user_unit_directory(user, create=False)
+    paths: dict[str, Any] = {
+        'homebrew': homebrew,
+        'unit': unit_directory / service_filename,
+        'unit_dir': unit_directory,
+        'scope': 'user',
+        'user': user,
+    }
+    migration_preflight: dict[str, object] | None = None
+    if getattr(args, 'migrate_legacy', False):
+        migration_preflight = _check_legacy_migration(
+            homebrew,
+            service_filename,
+            user,
+            user_unit_directory=str(unit_directory),
+        )
+    else:
+        _assert_no_system_instance(paths)
+    _assert_user_unit_source(paths)
+    response: dict[str, object] = {
+        'ok': True,
+        'command': 'check-bundle',
+        'service': service_filename,
+        'version': manifest['release_version'],
+        'bundle': str(bundle),
+        'unit_directory': str(unit_directory),
+    }
+    if migration_preflight is not None:
+        response['legacy_migration'] = migration_preflight
+    return response
+
+
+def _activate_binary(args: argparse.Namespace, paths: dict[str, Any]) -> dict[str, object]:
+    _assert_no_system_instance(paths)
+    _assert_user_unit_source(paths)
+    activation = _capture_activation(paths)
+    if activation.get('load_state') != 'loaded':
+        _fail(f'user service {paths["unit"].name} is not installed')
+    stop_service(paths['unit'].name)
+    if activation.get('running'):
+        _systemctl(paths, 'start', paths['unit'].name, timeout=45)
+        _wait_running(paths)
+        _health(paths)
+    else:
+        _wait_stopped(paths)
+    return {
+        'ok': True,
+        'command': 'activate-binary',
+        'service': paths['unit'].name,
+        'active': bool(activation.get('running')),
+    }
+
 def _locked(paths: dict[str, Path]):
     lock_path = paths['lock']
     flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)
     descriptor = os.open(lock_path, flags, 0o600)
     info = os.fstat(descriptor)
-    if not stat.S_ISREG(info.st_mode):
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
         os.close(descriptor)
-        _fail('installer lock is not a regular file')
+        _fail('installer lock is not a protected file owned by the effective account')
     os.fchmod(descriptor, 0o600)
     fcntl.flock(descriptor, fcntl.LOCK_EX)
     return descriptor
@@ -2267,6 +5050,21 @@ def main() -> int:
     _add_common(rollback)
     status = subparsers.add_parser('status', help='report selected service and recoverable installer state')
     _add_common(status)
+    check_bundle = subparsers.add_parser('check-bundle', help='verify a bundle and user-service target without installing')
+    check_bundle.add_argument('--bundle', required=True, metavar='DIR')
+    check_bundle.add_argument('--version', required=True, metavar='STRING')
+    check_bundle.add_argument('--homebrew', required=True, metavar='DIR')
+    check_bundle.add_argument('--user', required=True, metavar='USER')
+    check_bundle.add_argument('--service-name', required=True, metavar='NAME')
+    check_bundle.add_argument('--migrate-legacy', action='store_true', help='check migration from the old system service without changing it')
+    verify_bundle = subparsers.add_parser('verify-bundle', help='verify a runtime bundle without touching service state')
+    verify_bundle.add_argument('--bundle', required=True, metavar='DIR')
+    verify_bundle.add_argument('--version', required=True, metavar='STRING')
+    verify_bundle.add_argument('--homebrew', required=True, metavar='DIR')
+    verify_bundle.add_argument('--user', required=True, metavar='USER')
+    verify_bundle.add_argument('--service-name', required=True, metavar='NAME')
+    activate = subparsers.add_parser('activate-binary', help='restart the selected user service after binary replacement')
+    _add_common(activate)
     install_bundle = subparsers.add_parser('queue-install-bundle', help='durably hand off a verified Rust bundle installation')
     install_bundle.add_argument('--bundle', required=True, metavar='DIR')
     install_bundle.add_argument('--version', required=True, metavar='STRING')
@@ -2286,48 +5084,118 @@ def main() -> int:
     release = subparsers.add_parser('release-queued', help=argparse.SUPPRESS)
     _add_common(release)
     release.add_argument('--request-id', required=True)
+    migration = subparsers.add_parser('migrate-legacy-system', help='park a legacy system service before user-service installation')
+    _add_common(migration)
+    migration.add_argument('--user', required=True, metavar='USER')
+    migration.add_argument('--user-unit-directory', metavar='DIR')
+    restoration = subparsers.add_parser('restore-legacy-system', help='restore the saved legacy system service and activation state')
+    _add_common(restoration)
+    restoration.add_argument('--user', required=True, metavar='USER')
+    restoration.add_argument('--user-unit-directory', metavar='DIR')
+    legacy_user_stop = subparsers.add_parser('legacy-user-stop', help=argparse.SUPPRESS)
+    legacy_user_stop.add_argument('--user', required=True, metavar='USER')
+    legacy_user_stop.add_argument('--service-name', required=True, metavar='NAME')
+    legacy_user_stop.add_argument('--user-unit-directory', required=True, metavar='DIR')
     args = parser.parse_args()
     try:
-        _require_root()
-        if args.command == 'install':
-            _normalize_service_name(args.service_name)
+        if args.command == 'legacy-user-stop':
+            output = _run_legacy_user_stop(args)
+        elif args.command in ('migrate-legacy-system', 'restore-legacy-system'):
+            _require_root()
             user = pwd.getpwnam(args.user)
-            if user.pw_uid == 0:
-                _fail('--user must resolve to a non-root service account')
-            _validate_bundle(args.bundle, user)
-        paths = _paths(_homebrew_path(args.homebrew, create=args.command == 'install'), args.service_name)
-        if args.command == 'queue-install-bundle':
-            descriptor = _locked(paths)
-            try:
-                handoff = _prepare_install_handoff(args, paths)
-            finally:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-                os.close(descriptor)
-            output = _wait_for_handoff(
-                paths,
-                str(handoff['request_id']),
-                str(handoff['unit']),
-                args.command,
+            homebrew = _homebrew_path(args.homebrew)
+            directory = _legacy_migration_directory(
+                homebrew,
+                args.service_name,
+                create=args.command == 'migrate-legacy-system',
+                user_uid=user.pw_uid,
             )
-        elif args.command == 'release-queued':
-            output = _release_activation_handoff(args, paths)
-        elif args.command == 'activate-queued':
-            output = _run_queued_activation(args, paths)
-        else:
-            descriptor = _locked(paths)
+            _, descriptors = _open_legacy_store(
+                user.pw_uid,
+                args.service_name,
+                create=args.command == 'migrate-legacy-system',
+            )
             try:
-                _recover(paths)
-                if args.command == 'install':
-                    output = _run_install(args)
-                elif args.command == 'rollback':
-                    output = _run_rollback(args)
-                elif args.command == 'status':
-                    output = _run_status(args)
-                else:
-                    _fail('unsupported installer command')
+                lock_fd = os.open(
+                    'lock',
+                    os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0),
+                    0o600,
+                    dir_fd=descriptors['private'],
+                )
+                try:
+                    lock_info = os.fstat(lock_fd)
+                    if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != 0 or lock_info.st_mode & 0o077:
+                        _fail('legacy migration lock is not a protected root file')
+                    os.fchown(lock_fd, 0, 0)
+                    os.fchmod(lock_fd, 0o600)
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                    if args.command == 'migrate-legacy-system':
+                        output = _run_legacy_migration(args)
+                    else:
+                        output = _run_legacy_restore(args)
+                finally:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    finally:
+                        os.close(lock_fd)
             finally:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-                os.close(descriptor)
+                _close_legacy_descriptors(descriptors)
+        elif args.command in ('check-bundle', 'verify-bundle'):
+            output = _check_bundle(args) if args.command == 'check-bundle' else _verify_bundle_command(args)
+        else:
+            user = _current_user()
+            _require_user(user)
+            if hasattr(args, 'user'):
+                target = pwd.getpwnam(args.user)
+                _require_user(target)
+                if target.pw_name != args.user:
+                    _fail('pass the resolved Unix account name with --user')
+                user = target
+            if args.command == 'install':
+                _normalize_service_name(args.service_name)
+                _validate_bundle(args.bundle, user)
+            paths = _paths(
+                _homebrew_path(args.homebrew, create=args.command == 'install'),
+                args.service_name,
+                user,
+            )
+            _assert_no_system_instance(paths)
+            _assert_user_unit_source(paths)
+            if args.command == 'queue-install-bundle':
+                descriptor = _locked(paths)
+                try:
+                    _recover(paths)
+                    handoff = _prepare_install_handoff(args, paths)
+                finally:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    os.close(descriptor)
+                output = _wait_for_handoff(
+                    paths,
+                    str(handoff['request_id']),
+                    str(handoff['unit']),
+                    args.command,
+                )
+            elif args.command == 'release-queued':
+                output = _release_activation_handoff(args, paths)
+            elif args.command == 'activate-queued':
+                output = _run_queued_activation(args, paths)
+            else:
+                descriptor = _locked(paths)
+                try:
+                    _recover(paths)
+                    if args.command == 'install':
+                        output = _run_install(args)
+                    elif args.command == 'rollback':
+                        output = _run_rollback(args)
+                    elif args.command == 'status':
+                        output = _run_status(args)
+                    elif args.command == 'activate-binary':
+                        output = _activate_binary(args, paths)
+                    else:
+                        _fail('unsupported installer command')
+                finally:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    os.close(descriptor)
         print(json.dumps(output, sort_keys=True))
         return 0
     except (InstallerError, OSError, KeyError, ValueError) as error:

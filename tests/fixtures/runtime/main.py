@@ -33,7 +33,13 @@ class Plugin:
         return {'total': result, 'calls': state['calls'], 'alias': decky is decky_plugin, 'python': __import__('platform').python_version(), 'native_modules': [aiohttp._http_parser.__name__, multidict._multidict.__name__], 'user': os.geteuid(), 'name': decky.DECKY_PLUGIN_NAME}
 
     async def process_identity(self):
-        return {'pid': os.getpid(), 'cmdline': Path('/proc/self/cmdline').read_bytes().hex()}
+        return {'pid': os.getpid(), 'ppid': os.getppid(), 'cmdline': Path('/proc/self/cmdline').read_bytes().hex()}
+
+    async def native_encode(self, ensure_ascii=True):
+        return decky.native.dumps(
+            {'text': '日本語', 'values': [None, True, 42, 1.5]},
+            ensure_ascii=ensure_ascii,
+        )
 
     async def backend_ping(self):
         import aiohttp

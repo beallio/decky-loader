@@ -367,16 +367,20 @@ impl PluginRegistry {
                 return Err(anyhow::anyhow!("Plugin startup interrupted by shutdown"));
             }
 
+            let root_error = root_plugin_refusal(&plugin, platform::effective_user_ids().0);
             let entry = Arc::new(PluginEntry {
                 disabled: AtomicBool::new(plugin.disabled),
                 metadata: plugin,
                 runtime: Mutex::new(PluginRuntime {
                     worker: None,
-                    start_error: None,
+                    start_error: root_error.clone(),
                 }),
             });
 
-            if !entry.metadata.passive && !entry.disabled.load(Ordering::Relaxed) {
+            if root_error.is_none()
+                && !entry.metadata.passive
+                && !entry.disabled.load(Ordering::Relaxed)
+            {
                 let mut runtime = entry.runtime.lock().await;
                 match registry.set_approved_plugin_permissions(&entry.metadata) {
                     Err(error) => runtime.start_error = Some(error.to_string()),
@@ -634,6 +638,7 @@ impl PluginRegistry {
         let directory_path = resolve_plugin_directory(&self.plugin_root, directory)?;
         let disabled_plugins = read_disabled_plugins(&self.loader_settings_path);
         let mut metadata = read_plugin_metadata(&directory_path, &disabled_plugins)?;
+        let root_error = root_plugin_refusal(&metadata, platform::effective_user_ids().0);
         let previous = self.plugins.read().await.get(&metadata.name).cloned();
         if refresh && previous.is_some() && !metadata.debug {
             return Ok(());
@@ -641,7 +646,7 @@ impl PluginRegistry {
         metadata.disabled = disabled_plugins
             .iter()
             .any(|disabled| disabled == &metadata.name);
-        if !metadata.passive && !metadata.disabled {
+        if root_error.is_none() && !metadata.passive && !metadata.disabled {
             self.set_approved_plugin_permissions(&metadata)?;
         }
 
@@ -660,21 +665,25 @@ impl PluginRegistry {
         };
 
         let mut shutdown = self.shutdown.clone();
-        let worker = match self.launch_plugin_worker(&metadata, &mut shutdown).await {
-            Ok(worker) => worker,
-            Err(WorkerError::Error(error)) => {
-                if let Some(previous) = &previous
-                    && let Some(restore_error) = self
-                        .restore_previous_entry(previous, previous_was_running, previous_error)
-                        .await
-                {
-                    return Err(WorkerError::Error(format!(
-                        "{error}; previous plugin restart failed: {restore_error}"
-                    )));
+        let worker = if root_error.is_some() {
+            None
+        } else {
+            match self.launch_plugin_worker(&metadata, &mut shutdown).await {
+                Ok(worker) => worker,
+                Err(WorkerError::Error(error)) => {
+                    if let Some(previous) = &previous
+                        && let Some(restore_error) = self
+                            .restore_previous_entry(previous, previous_was_running, previous_error)
+                            .await
+                    {
+                        return Err(WorkerError::Error(format!(
+                            "{error}; previous plugin restart failed: {restore_error}"
+                        )));
+                    }
+                    return Err(WorkerError::Error(error));
                 }
-                return Err(WorkerError::Error(error));
+                Err(WorkerError::Stopped) => return Err(WorkerError::Stopped),
             }
-            Err(WorkerError::Stopped) => return Err(WorkerError::Stopped),
         };
         if self.shutting_down.load(Ordering::Acquire) || shutdown_requested(&shutdown) {
             if let Some(mut worker) = worker {
@@ -688,7 +697,7 @@ impl PluginRegistry {
             metadata: metadata.clone(),
             runtime: Mutex::new(PluginRuntime {
                 worker,
-                start_error: None,
+                start_error: root_error.clone(),
             }),
         });
         self.plugins
@@ -709,6 +718,7 @@ impl PluginRegistry {
                     Value::from(metadata.load_type),
                     Value::Bool(true),
                     Value::from(15_000),
+                    root_error.map(Value::String).unwrap_or(Value::Null),
                 ],
             );
         }
@@ -1051,6 +1061,9 @@ impl PluginRegistry {
         }
         let directory_path = resolve_plugin_directory(&self.plugin_root, directory)?;
         let metadata = read_plugin_metadata(&directory_path, &[])?;
+        if let Some(error) = root_plugin_refusal(&metadata, platform::effective_user_ids().0) {
+            return Err(WorkerError::Error(error));
+        }
         self.set_approved_plugin_permissions(&metadata)?;
         Ok(())
     }
@@ -1167,6 +1180,15 @@ fn display_name(plugin: &PluginMetadata) -> String {
         Some(version) if !version.is_empty() => format!("{} (v{version})", plugin.name),
         _ => plugin.name.clone(),
     }
+}
+
+fn root_plugin_refusal(plugin: &PluginMetadata, effective_uid: u32) -> Option<String> {
+    (plugin.requires_root && effective_uid != 0).then(|| {
+        format!(
+            "Plugin {} requires root privileges and cannot run in the user service (effective UID {effective_uid})",
+            display_name(plugin)
+        )
+    })
 }
 fn approved_launch_json(plugin: &PluginMetadata) -> Value {
     json!({
@@ -1811,6 +1833,80 @@ mod plugin_permission_tests {
         set_mode(&directory.join("plugin.json"), 0o600);
         set_mode(&directory.join("package.json"), 0o600);
         set_mode(&directory.join("main.py"), 0o600);
+    }
+
+    #[test]
+    fn root_plugin_policy_matches_process_credentials() {
+        let temporary = TestDirectory::new();
+        let plugin_root = temporary.0.join("plugins");
+        let plugin = plugin_root.join("Example");
+        write_approved_plugin(&plugin, &["root"]);
+        let mut discovered = discover_plugins(&plugin_root, &[]).unwrap();
+        let metadata = discovered.get_mut("Example").unwrap();
+        for (requires_root, uid, denied) in [
+            (true, 1000, true),
+            (true, 0, false),
+            (false, 1000, false),
+            (false, 0, false),
+        ] {
+            metadata.requires_root = requires_root;
+            assert_eq!(root_plugin_refusal(metadata, uid).is_some(), denied);
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_root_plugin_can_be_registered_again_during_recovery() {
+        let temporary = TestDirectory::new();
+        let plugin_root = temporary.0.join("plugins");
+        let plugin = plugin_root.join("Example");
+        write_approved_plugin(&plugin, &["root"]);
+        fs::create_dir(temporary.0.join("settings")).unwrap();
+        fs::write(
+            temporary.0.join("settings/loader.json"),
+            br#"{"disabled_plugins":["Example"]}"#,
+        )
+        .unwrap();
+        let (events, _events) = broadcast::channel(8);
+        let (_shutdown, shutdown) = watch::channel(false);
+        let ids = platform::effective_user_ids();
+        let user = unistd::User::from_uid(Uid::current())
+            .unwrap()
+            .unwrap()
+            .name;
+        let registry = PluginRegistry::start(
+            WorkerConfiguration {
+                executable: std::env::current_exe().unwrap(),
+                mode: WorkerMode::Exec,
+                bootstrap: WorkerBootstrap::Lean,
+                auth_token: "recovery-test".into(),
+                server_host: "127.0.0.1".into(),
+                server_port: 1339,
+                chown_plugin_path: false,
+            },
+            plugin_root,
+            temporary.0.clone(),
+            user,
+            ids,
+            events,
+            shutdown,
+        )
+        .await
+        .unwrap();
+        let removed = registry.remove("Example", false).await;
+        let restored = registry.import_directory("Example", false, false).await;
+        let directory = registry.directory("Example").await;
+        let listed = registry.list().await;
+        registry.shutdown().await;
+        removed.unwrap();
+        restored.unwrap();
+        assert_eq!(directory, Some(plugin));
+        let entry = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "Example")
+            .unwrap();
+        assert_eq!(entry["disabled"], true);
     }
 
     #[test]
@@ -2544,14 +2640,8 @@ async fn launch_worker(
         return Err(WorkerLaunchError::Interrupted);
     }
     let requires_root = plugin.requires_root;
-    if requires_root {
-        let effective_uid = platform::effective_user_ids().0;
-        if effective_uid != 0 {
-            return Err(WorkerLaunchError::Failed(format!(
-                "Plugin {} requires root privileges, but the worker launcher is running as UID {effective_uid}",
-                display_name(plugin)
-            )));
-        }
+    if let Some(error) = root_plugin_refusal(plugin, platform::effective_user_ids().0) {
+        return Err(WorkerLaunchError::Failed(error));
     }
 
     let socket_path = socket_directory

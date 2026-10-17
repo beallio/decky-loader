@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Assemble a complete private Decky runtime candidate from built components.
+"""Assemble a Decky runtime bundle from built components.
 
-Use build.py for the pinned, end-to-end build. This lower-level command accepts
-prebuilt components and verifies their Python SDK/frontend source baseline,
-packaged helper code, runtime description and complete payload checksums.
-Both one-file and shared-directory workers are supported; the automated build
-uses the shared-directory worker with separate forked Python plugin processes.
-Distribution approval remains disabled until the deferred hardware/UI checks.
+Use build.py for a complete build with pinned inputs. This lower-level command
+checks the SDK baseline, fork overlays, worker, and payload checksums.
 """
 from __future__ import annotations
 
@@ -28,6 +24,21 @@ SDK_OVERLAYS = (
     'backend/decky_loader/plugin/worker.py',
     'backend/decky_loader/plugin/launcher.py',
     'backend/decky_loader/plugin/sandboxed_plugin.py',
+    'backend/decky_loader/plugin/imports/decky.py',
+    'backend/decky_loader/plugin/imports/decky.pyi',
+    'backend/decky_loader/plugin/imports/native.py',
+    'backend/decky_loader/plugin/imports/native.pyi',
+    'frontend/src/components/DeckyErrorBoundary.tsx',
+    'frontend/src/plugin-loader.tsx',
+    'frontend/tsconfig.json',
+    'frontend/src/components/settings/pages/general/RemoteDebugging.tsx',
+    'backend/decky_loader/locales/en-US.json',
+)
+SDK_REMOVALS = (
+    'frontend/src/steamfixes/README.md',
+    'frontend/src/steamfixes/index.ts',
+    'frontend/src/steamfixes/restart.ts',
+    'frontend/src/steamfixes/socket.ts',
 )
 
 
@@ -50,9 +61,11 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
         raise ValueError('build the existing frontend and supply its assets and locales')
     if output.exists():
         raise ValueError(f'output already exists; use a new isolated path: {output}')
+    if any((REPO / path).exists() or (REPO / path).is_symlink() for path in SDK_REMOVALS):
+        raise ValueError('obsolete privileged Steam workaround code is still present')
     subprocess.run(
         ['git', 'diff', '--quiet', BASELINE_TAG, '--', 'backend/decky_loader', 'frontend',
-         *(f':(exclude){path}' for path in SDK_OVERLAYS)],
+         *(f':(exclude){path}' for path in (*SDK_OVERLAYS, *SDK_REMOVALS))],
         cwd=REPO, check=True,
     )
     commit, backend_tree, frontend_tree = subprocess.check_output(
@@ -117,13 +130,12 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
         manifest = {
             'kind': 'decky-loader-runtime',
             'release_version': release_version,
-            'private_only': True,
-            'distribution_approved': False,
             'worker_packaging': worker_packaging,
             'rust_executable': 'decky-loader-runtime',
             'runtime': runtime,
             'source_baseline': source_baseline,
             'sdk_overlays': {path: digest(REPO / path) for path in SDK_OVERLAYS},
+            'sdk_removals': list(SDK_REMOVALS),
             'cargo_lock_sha256': digest(BACKEND_RUST / 'Cargo.lock'),
             'build': build_provenance,
             'sha256': {path.relative_to(bundle).as_posix(): digest(path) for path in sorted(bundle.rglob('*')) if path.is_file()},
@@ -138,16 +150,16 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
             (plugin / 'dist').mkdir(parents=True)
             shutil.copy2(REPO / 'tests/fixtures/runtime/main.py', plugin / 'main.py')
             shutil.copy2(REPO / 'tests/fixtures/runtime' / frontend, plugin / 'dist/index.js')
-            (plugin / 'plugin.json').write_text(json.dumps({'name': name, 'author': 'Private compatibility proof', 'api_version': api_version, 'flags': []}))
+            (plugin / 'plugin.json').write_text(json.dumps({'name': name, 'author': 'Runtime compatibility fixture', 'api_version': api_version, 'flags': []}))
             package = {'name': directory.lower(), 'version': '0.0.0'}
             if api_version:
                 package['type'] = 'module'
             (plugin / 'package.json').write_text(json.dumps(package))
-        for script in ('verify.py', 'validate_root.py'):
+        for script in ('verify.py', 'validate_user.py'):
             shutil.copy2(HERE / 'validation' / script, staging / script)
         shutil.copy2(BACKEND_RUST / 'process_observer.py', staging / 'process_observer.py')
         staging.rename(output)
-    return {'output': str(output), 'files': len(manifest['sha256']), 'runtime': runtime, 'source_baseline': source_baseline, 'private_only': True}
+    return {'output': str(output), 'files': len(manifest['sha256']), 'runtime': runtime, 'source_baseline': source_baseline}
 
 
 def main() -> None:

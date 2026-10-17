@@ -14,6 +14,7 @@ A logging facility `logger` is available which writes to the recommended locatio
 
 __version__ = '1.0.0'
 
+import importlib
 import os
 import subprocess
 import logging
@@ -223,3 +224,9 @@ async def emit(event: str, *args: Any) -> None:
     (Event listeners are set up in the frontend via the `addEventListener` function from `@decky/api`)
     """
     pass
+
+
+def __getattr__(name: str) -> Any:
+    if name == "native":
+        return importlib.import_module(".native", __package__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
