@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import gc
 from io import TextIOWrapper
 import json
@@ -108,6 +109,11 @@ def _worker_child(
         if not released:
             os._exit(1)
 
+        mount = arguments.pop("private_plugin_mount", None)
+        if mount is not None:
+            _mount_private_plugin_directory(
+                cast(int, mount["source_fd"]), cast(str, mount["source_path"]), cast(str, mount["target"])
+            )
         try:
             worker.launch(argparse.Namespace(**arguments))
         except BaseException as error:
@@ -126,6 +132,90 @@ def _worker_child(
             print(f"DeckyPluginLauncher child setup failed: {error}", file=sys.stderr, flush=True)
         finally:
             os._exit(1)
+
+
+# Linux mount(2) and unshare(2) values.
+_CLONE_NEWNS = 0x00020000
+_MS_RDONLY = 1
+_MS_NOSUID = 2
+_MS_NODEV = 4
+_MS_REMOUNT = 32
+_MS_BIND = 4096
+_MS_REC = 16384
+_MS_SLAVE = 1 << 19
+
+
+def _mount_private_plugin_directory(source_fd: int, source_path: str, target: str) -> None:
+    """Show the checked plugin folder read-only at `target`, in this process only.
+
+    Used for root plugins. Linux binds only from mounts in the caller's mount
+    namespace, so after unshare the folder is opened again by path and must be
+    the same folder (device and inode) as `source_fd`, which the root host
+    checked. A later change to the public path then does not change what the
+    plugin, or a program it starts, sees at `target`.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mount.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_void_p)
+
+    def check(result: int, action: str) -> None:
+        if result != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, f"{action}: {os.strerror(error)}")
+
+    check(libc.unshare(_CLONE_NEWNS), "could not create a private mount namespace")
+    check(libc.mount(None, b"/", None, _MS_REC | _MS_SLAVE, None), "could not make mounts private")
+    destination = os.fsencode(target)
+    checked = os.fstat(source_fd)
+    local_fd = os.open(source_path, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        opened = os.fstat(local_fd)
+        if (opened.st_dev, opened.st_ino) != (checked.st_dev, checked.st_ino):
+            raise OSError(errno.ESTALE, f"plugin folder changed before it was mounted: {source_path}")
+        check(
+            libc.mount(os.fsencode(f"/proc/self/fd/{local_fd}"), destination, None, _MS_BIND, None),
+            f"could not mount the plugin folder at {target}",
+        )
+    finally:
+        os.close(local_fd)
+    check(
+        libc.mount(None, destination, None, _MS_BIND | _MS_REMOUNT | _MS_RDONLY | _MS_NOSUID | _MS_NODEV, None),
+        f"could not make the plugin folder read-only at {target}",
+    )
+
+
+def fork_worker(arguments: dict[str, Any], inherited_fds: tuple[int, ...]) -> tuple[int, int]:
+    """Fork one plugin worker held behind a gate; return its PID and the gate.
+
+    The worker runs `worker.launch(arguments)` after one byte is written to the
+    gate. `inherited_fds` are closed in the child. The child gets its own process
+    group. Only trusted callers may set the `private_plugin_mount` and
+    `socket_owner` arguments.
+    """
+    _assert_fork_safe()
+    gc.freeze()
+    gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
+    parent_pid = os.getpid()
+    try:
+        pid = os.fork()
+    except BaseException:
+        os.close(gate_read)
+        os.close(gate_write)
+        raise
+    if pid == 0:
+        _worker_child(gate_read, gate_write, arguments, parent_pid, inherited_fds)
+        os._exit(1)
+
+    os.close(gate_read)
+    try:
+        os.setpgid(pid, pid)
+    except OSError:
+        os.close(gate_write)
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        raise
+    return pid, gate_write
 
 
 def _signal_group(pid: int, sig: int) -> None:
@@ -177,6 +267,8 @@ def _start_child(
     requested_bootstrap = request.get("bootstrap", bootstrap)
     if requested_bootstrap != bootstrap:
         raise ValueError("worker bootstrap does not match launcher bootstrap")
+    # Only these keys reach the worker; the user launcher never forwards
+    # private_plugin_mount or socket_owner.
     arguments: dict[str, Any] = {}
     for key in ("plugin_root", "plugin_directory", "socket", "homebrew", "user"):
         arguments[key] = _request(request, key, str)
@@ -184,33 +276,10 @@ def _start_child(
     arguments["bootstrap"] = bootstrap
     arguments["system_pythonpaths"] = _shared_system_pythonpaths(arguments["user"])
 
-    _assert_fork_safe()
-    gc.freeze()
-    gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
-    parent_pid = os.getpid()
-    try:
-        pid = os.fork()
-    except BaseException:
-        os.close(gate_read)
-        os.close(gate_write)
-        raise
-    if pid == 0:
-        inherited_fds = (_wake_read, _wake_write) + tuple(
-            child.gate_fd for child in children.values() if child.gate_fd is not None
-        )
-        _worker_child(gate_read, gate_write, arguments, parent_pid, inherited_fds)
-        os._exit(1)
-
-    os.close(gate_read)
-    try:
-        os.setpgid(pid, pid)
-    except OSError:
-        os.close(gate_write)
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
-        raise
+    inherited_fds = (_wake_read, _wake_write) + tuple(
+        child.gate_fd for child in children.values() if child.gate_fd is not None
+    )
+    pid, gate_write = fork_worker(arguments, inherited_fds)
     children[identifier] = _Child(identifier, pid, gate_write)
     return {"ok": True, "op": "forked", "id": identifier, "pid": pid}
 

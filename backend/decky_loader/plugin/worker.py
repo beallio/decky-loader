@@ -751,6 +751,10 @@ def launch(args: argparse.Namespace) -> None:
         from decky_loader.localplatform.localsocket import LocalSocket
         from decky_loader.plugin.sandboxed_plugin import SandboxedPlugin
 
+        # A root plugin's socket is given to the loader's user, so that only the
+        # user's backend can connect. Only the root host sets this.
+        socket_owner = cast("list[int] | None", getattr(args, "socket_owner", None))
+
         class TrackedLocalSocket(LocalSocket):
             server_ready = False
             startup_error: Exception | None = None
@@ -760,6 +764,9 @@ def launch(args: argparse.Namespace) -> None:
             ) -> None:
                 try:
                     await super().setup_server(on_new_message)
+                    if socket_owner is not None:
+                        os.chown(self.socket_addr, socket_owner[0], socket_owner[1], follow_symlinks=False)
+                        os.chmod(self.socket_addr, 0o600)
                 except Exception as error:
                     self.startup_error = error
                     asyncio.get_running_loop().stop()

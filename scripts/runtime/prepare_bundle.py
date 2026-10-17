@@ -23,6 +23,7 @@ BASELINE_TAG = BUILD_CONFIG['sdk']['tag']
 SDK_OVERLAYS = (
     'backend/decky_loader/plugin/worker.py',
     'backend/decky_loader/plugin/launcher.py',
+    'backend/decky_loader/plugin/root_host.py',
     'backend/decky_loader/plugin/sandboxed_plugin.py',
     'backend/decky_loader/plugin/imports/decky.py',
     'backend/decky_loader/plugin/imports/decky.pyi',
