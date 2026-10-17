@@ -34,6 +34,9 @@ SDK_OVERLAYS = (
     'frontend/src/components/settings/pages/general/RemoteDebugging.tsx',
     'backend/decky_loader/locales/en-US.json',
     'backend/decky_loader/injector.py',
+    'frontend/src/index.ts',
+    'frontend/src/components/TitleView.tsx',
+    'frontend/src/utils/quickAccessClasses.ts',
 )
 SDK_REMOVALS = (
     'frontend/src/steamfixes/README.md',

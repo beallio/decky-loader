@@ -7,7 +7,6 @@ import {
   PanelSectionRow,
   QuickAccessTab,
   findSP,
-  quickAccessMenuClasses,
   showModal,
   sleep,
 } from '@decky/ui';
@@ -38,6 +37,7 @@ import TabsHook from './tabs-hook';
 import Toaster from './toaster';
 import { getVersionInfo } from './updater';
 import { getPluginDisplayName } from './utils/pluginHelpers';
+import { quickAccessClasses } from './utils/quickAccessClasses';
 import { getSetting, setSetting } from './utils/settings';
 import TranslationHelper, { TranslationClass } from './utils/TranslationHelper';
 
@@ -536,7 +536,7 @@ class PluginLoader extends Logger {
       const TheError: FC<{}> = () => (
         <PanelSection>
           <PanelSectionRow>
-            <div className={quickAccessMenuClasses.FriendsTitle} style={{ display: 'flex', justifyContent: 'center' }}>
+            <div className={quickAccessClasses.FriendsTitle} style={{ display: 'flex', justifyContent: 'center' }}>
               <TranslationHelper transClass={TranslationClass.PLUGIN_LOADER} transText="error" />
             </div>
           </PanelSectionRow>
@@ -546,7 +546,7 @@ class PluginLoader extends Logger {
             </pre>
           </PanelSectionRow>
           <PanelSectionRow>
-            <div className={quickAccessMenuClasses.Text}>
+            <div className={quickAccessClasses.Text}>
               <TranslationHelper
                 transClass={TranslationClass.PLUGIN_LOADER}
                 transText={backendError ? 'plugin_backend_error' : 'plugin_error_uninstall'}
