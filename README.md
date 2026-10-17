@@ -1,159 +1,94 @@
-<h1 align="center">
-  <a name="logo" href="https://deckbrew.xyz/"><img src="https://deckbrew.xyz/static/icon-45ca1f5aea376a9ad37e92db906f283e.png" alt="Deckbrew logo" width="200"></a>
-  <br>
-  Decky Loader
-  <br>
-  <a name="download button" href="https://github.com/SteamDeckHomebrew/decky-installer/releases/latest/download/decky_installer.desktop"><img src="./docs/images/download_button.svg"  alt="Download decky" width="150px" style="padding-top: 15px;"></a>
-</h1>
+# Decky Loader (Rust fork)
 
-<p align="center">
-  <a href="https://github.com/SteamDeckHomebrew/decky-loader/releases"><img src="https://img.shields.io/github/downloads/SteamDeckHomebrew/decky-loader/total" /></a>
-  <a href="https://github.com/SteamDeckHomebrew/decky-loader/stargazers"><img src="https://img.shields.io/github/stars/SteamDeckHomebrew/decky-loader" /></a>
-  <a href="https://github.com/SteamDeckHomebrew/decky-loader/commits/main"><img src="https://img.shields.io/github/last-commit/SteamDeckHomebrew/decky-loader.svg" /></a>
-  <a href="https://weblate.werwolv.net/engage/decky/"><img src="https://weblate.werwolv.net/widgets/decky/-/decky/svg-badge.svg" alt="Translation status" /></a>
-  <a href="https://github.com/SteamDeckHomebrew/decky-loader/blob/main/LICENSE"><img src="https://img.shields.io/github/license/SteamDeckHomebrew/decky-loader" /></a>
-  <a href="https://deckbrew.xyz/discord"><img src="https://img.shields.io/discord/960281551428522045?color=%235865F2&label=discord" /></a>
-  <br>
-  <br>
-  🌐 <a href="./README.md">English</a> · <a href="./README_zh-Hans.md">简体中文</a>
-  <br>
-  <br>
-<!--  <img src="https://media.discordapp.net/attachments/966017112244125756/1012466063893610506/main.jpg" alt="Decky screenshot" width="80%">-->
-</p>
+Decky Loader adds plugins to the Steam Deck's Gaming Mode. Plugins can [restyle menus](https://github.com/suchmememanyskill/SDH-CssLoader), [change system sounds](https://github.com/EMERALD0874/SDH-AudioLoader), [adjust colors](https://github.com/libvibrant/vibrantDeck), and [more](https://plugins.deckbrew.xyz/).
 
-## 🩵 Backers and Sponsors
+This fork keeps the normal Decky menus and Python plugins, but replaces the background service with a Rust version. It runs as your normal `deck` account instead of the administrator (root) account. Plugins that need administrator access do not run in this version; Decky shows an error for them instead.
 
-[Become a backer or sponsor](https://opencollective.com/steamdeckhomebrew) to support our work! Contributing to our collective effort will help Decky Loader developers cover the costs of web servers, acquire new development hardware, and more.
+This is not the official Decky Loader. For the official version, see [SteamDeckHomebrew/decky-loader](https://github.com/SteamDeckHomebrew/decky-loader).
 
-<!-- SPONSORS COMMENTED OUT UNTIL WE GET SOME SPONSORS TO AVOID BLANK SVG SPACE -->
-<a href="https://opencollective.com/steamdeckhomebrew"><img alt="Steam Deck Homebrew sponsors on Open Collective" src="https://opencollective.com/steamdeckhomebrew/sponsors.svg?button=true&avatarHeight=46&width=750"></a>
+## Install
 
-<a href="https://opencollective.com/steamdeckhomebrew"><img alt="Steam Deck Homebrew backers on Open Collective" src="https://opencollective.com/steamdeckhomebrew/backers.svg?button=false&avatarHeight=46&width=750"></a>
+1. Press the Steam button, open **Power**, and select **Switch to Desktop**.
+2. Download [install-to-deck.sh](scripts/install-to-deck.sh) and save it in your **Downloads** folder.
+3. Open **Konsole** and run:
 
-## 📖 About
+   ```sh
+   cd ~/Downloads
+   bash install-to-deck.sh --check
+   bash install-to-deck.sh
+   ```
 
-Decky Loader is a homebrew plugin launcher for the Steam Deck. It can be used to [stylize your menus](https://github.com/suchmememanyskill/SDH-CssLoader), [change system sounds](https://github.com/EMERALD0874/SDH-AudioLoader), [adjust your screen saturation](https://github.com/libvibrant/vibrantDeck), [change additional system settings](https://github.com/NGnius/PowerTools), and [more](https://plugins.deckbrew.xyz/).
+   `--check` only tests the download and your Deck. The second command installs the latest stable release.
+4. Return to Gaming Mode.
 
-For more information about Decky Loader as well as documentation and development tools, please visit [our wiki](https://wiki.deckbrew.xyz).
+You do not need a GitHub account or developer tools. Before each change, the script saves a copy of your `homebrew` folder (plugins and settings) in `~/decky-user-backups`. Use `--backup-dir DIR` to save it somewhere else.
 
-### 🎨 Features
+To install a test version, add `--channel preview`. To install one exact version, add `--version TAG`, for example `--version v3.2.10-rust.7`.
 
-🧹 Clean injecting and loading of multiple plugins.  
-🔒 Stays installed between system updates and reboots.  
-🔗 Allows two-way communication between plugins and the loader.  
-🐍 Supports Python functions run from TypeScript React.  
-🌐 Allows plugins to make fetch calls that bypass CORS completely.
+### If you already have Decky installed
 
-### 🤔 Common Issues
-
-- Syncthing may use port 8080 on Steam Deck, which Decky Loader needs to function. If you are using Syncthing as a service, please change its port to something else.
-  - 8384 is the recommended port for Syncthing.
-- If you are using any software that uses port 1337 or 8080, please change its port to something else or uninstall it.
-- Sometimes Decky will disappear on SteamOS updates. This can easily be fixed by just re-running the installer and installing the stable branch again. If this doesn't work, try installing the prerelease instead. If that doesn't work, then [check the existing issues](https://github.com/SteamDeckHomebrew/decky-loader/issues) and if there isn't one then you can [file a new issue](https://github.com/SteamDeckHomebrew/decky-loader/issues/new?assignees=&labels=bug&template=bug_report.yml&title=%5BBUG%5D+%3Ctitle%3E).
-
-## 💾 Installation
-
-- This installation can be done without an admin/sudo password set.
-
-1. Prepare a mouse and keyboard if possible.
-   - Keyboards and mice can be connected to the Steam Deck via USB-C or Bluetooth.
-   - Many Bluetooth keyboard and mouse apps are available for iOS and Android. (KDE connect is preinstalled on the steam deck)
-   - The Steam Link app is available on [Windows](https://media.steampowered.com/steamlink/windows/latest/SteamLink.zip), [macOS](https://apps.apple.com/us/app/steam-link/id1246969117), and [Linux](https://flathub.org/apps/details/com.valvesoftware.SteamLink). It works well as a remote desktop substitute.
-   - If you have no other options, use the right trackpad as a mouse and press <img src="./docs/images/light/steam.svg#gh-dark-mode-only" height=16><img src="./docs/images/dark/steam.svg#gh-light-mode-only" height=16>+<img src="./docs/images/light/x.svg#gh-dark-mode-only" height=16><img src="./docs/images/dark/x.svg#gh-light-mode-only" height=16> to open the on-screen keyboard as needed.
-1. Press the <img src="./docs/images/light/steam.svg#gh-dark-mode-only" height=16><img src="./docs/images/dark/steam.svg#gh-light-mode-only" height=16> button and open the Power menu.
-1. Select "Switch to Desktop".
-1. Navigate to this Github page on a browser of your choice.
-1. Download the [installer file](https://github.com/SteamDeckHomebrew/decky-installer/releases/latest/download/decky_installer.desktop). (If using firefox, it will be named `decky_installer.desktop.download`. Rename it to `decky_installer.desktop` before running it)
-1. Drag the file onto your desktop and double click it to run it.
-1. Either type your admin password or allow Decky to temporarily set your admin password to `Decky!` (this password will be removed after the installer finishes)
-1. Choose the version of Decky Loader you want to install.
-   - **Latest Release**  
-     Intended for most users. This is the latest stable version of Decky Loader.
-   - **Latest Pre-Release**  
-     Intended for plugin developers. Pre-releases are unlikely to be fully stable but contain the latest changes. For more information on plugin development, please consult [the wiki page](https://wiki.deckbrew.xyz/en/loader-dev/development).
-1. Open the Return to Gaming Mode shortcut on your desktop.
-
-- There is also a fast install for those who can use Konsole. Run `curl -L https://github.com/SteamDeckHomebrew/decky-installer/releases/latest/download/install_release.sh | sh` and type your password when prompted.
-
-### 👋 Uninstallation
-
-We are sorry to see you go! If you are considering uninstalling because you are having issues, please consider [opening an issue](https://github.com/SteamDeckHomebrew/decky-loader/issues) or [joining our Discord](https://deckbrew.xyz/discord) so we can help you and other users.
-
-1. Press the <img src="./docs/images/light/steam.svg#gh-dark-mode-only" height=16><img src="./docs/images/dark/steam.svg#gh-light-mode-only" height=16> button and open the Power menu.
-1. Select "Switch to Desktop".
-1. Run the installer file again, and select `uninstall decky loader`.
-
-- There is also a fast uninstall for those who can use Konsole. Run `curl -L https://github.com/SteamDeckHomebrew/decky-installer/releases/latest/download/uninstall.sh | sh` and type your password when prompted.
-
-## 🚀 Getting Started
-
-Now that you have Decky Loader installed, you can start using plugins. Each plugin is maintained by a different developer and has its own uses, but most follow a general structure outlined below.
-
-### 📦 Plugins
-
-1. Press the <img src="./docs/images/light/qam.svg#gh-dark-mode-only" height=16><img src="./docs/images/dark/qam.svg#gh-light-mode-only" height=16> button and navigate to the <img src="./docs/images/light/plug.svg#gh-dark-mode-only" height=16><img src="./docs/images/dark/plug.svg#gh-light-mode-only" height=16> icon. This is the Decky menu used for interacting with plugins and the loader itself.
-1. Select the <img src="./docs/images/light/store.svg#gh-dark-mode-only" height=16><img src="./docs/images/dark/store.svg#gh-light-mode-only" height=16> icon to open the Plugins Browser. This is where you can find and install plugins.
-   - You can also install from URL in the Settings menu. We do not recommend installing plugins from untrusted sources.
-1. To install a plugin, select the "Install" button on the plugin you want. You can also select a version from a dropdown menu, but this is not recommended.
-1. To update, uninstall, and reload plugins, navigate to the Decky menu and select the <img src="./docs/images/light/gear.svg#gh-dark-mode-only" height=16><img src="./docs/images/dark/gear.svg#gh-light-mode-only" height=16> icon.
-   - Keep in mind that uninstalling a plugin will only remove its plugin files, not any other files it may have created.
-
-### 🛠️ Plugin Development
-
-There is no complete plugin development documentation yet. However a good starting point is the [plugin template repository](https://github.com/SteamDeckHomebrew/decky-plugin-template). Consider [joining our Discord](https://deckbrew.xyz/discord) if you have any questions.
-
-### 🤝 Contributing
-
-See the [development guide](docs/development.md) for the repository layout, build commands, tests, dependency checks, and validation tools. The [upstream development wiki](https://wiki.deckbrew.xyz/en/loader-dev/development) has more information about contributing to Decky Loader.
-
-### Experimental Rust runtime
-
-The experimental Rust version keeps the existing Decky interface and Python plugins. It is not the default public release. You do not need to build it yourself to use the pinned trial installer below.
-
-Build instructions and implementation details are in the [development guide](docs/development.md).
-
-#### Install the private candidate on the Deck
-
-Save [install-to-deck.sh](scripts/install-to-deck.sh) on the Deck. Switch to Desktop Mode and open Konsole in the folder where you saved it. Local installation is the default. You do not need an IP address, SSH, or another computer.
-
-The script uses Bash, curl, unzip, and the Deck's system Python. It asks for your user's sudo password when needed. If you have not set a password, run `passwd` in Konsole first. Plugins use the included Python runtime. The Deck does not need Rust, Poetry, pnpm, or pip packages.
-
-The script downloads the pinned `v3.2.10-rust.7-rc.4` bundle through [nightly.link](https://nightly.link). Save the updated script again if you have an older copy. No GitHub account, token, or GitHub CLI is required. It checks the runtime ZIP against the pinned SHA256 before it changes the installation. CI artifacts can expire. To use a saved runtime ZIP instead, add `--bundle /path/to/decky-loader-runtime-linux-x86_64.zip`. Use the inner runtime ZIP, not the outer Actions download.
-
-Run these commands as your normal Deck user. The script requests sudo itself:
+The official Decky runs as the administrator account. Move it to this fork with:
 
 ```sh
-bash install-to-deck.sh --check
-bash install-to-deck.sh
-bash install-to-deck.sh --status
+bash install-to-deck.sh --migrate-legacy
 ```
 
-`--check` verifies the bundle and basic target requirements without stopping the service or changing the installation. Installation briefly stops the selected service to make a full backup of homebrew and its service configuration, then restores its running state before the maintained installer takes over. Backups stay outside homebrew, in the sibling `decky-runtime-backups` directory by default. Use `--backup-dir` to choose another location with enough space.
+This step asks for your password once. If you have not set a password, run `passwd` first. The script saves the old Decky so that you can put it back later.
 
-Before backup or activation, the installer lets the main process stop first. If helper processes remain, it stops only processes tracked as part of the selected service. If they do not exit, installation stops and reports their PIDs. It keeps the process records so later recovery attempts still check them. It does not continue while those processes can still change files.
+## Update
 
-Space checks cover temporary files, the installed runtime, and the full backup. The check adds these requirements together when they share a storage volume. It checks separate volumes independently, including a separate volume mounted at `homebrew/services`. If space is too low, the script stops before it changes the service or creates a backup.
+Open Decky's settings in Gaming Mode and check for updates. Select **Stable** for normal releases or **Pre-Release** for test versions. You can also run the install command again.
 
-To restore the previous backend and service configuration:
+## Undo
+
+To go back to the previous version of this fork:
 
 ```sh
 bash install-to-deck.sh --undo
 ```
 
-Rollback uses small recovery tools retained under `homebrew/services/.decky-deploy`; it does not need GitHub access. It does not restore the separate user-data archive automatically. Keep that recovery directory and your backups.
+To go back to the official Decky that was installed before you moved to this fork:
 
-If an interruption occurs after the backend installer starts, the script runs its recovery before removing temporary files. This includes closing the terminal. If shutdown cannot be confirmed, recovery stays pending and does not start another backend.
+```sh
+bash install-to-deck.sh --restore-legacy
+```
 
-During backup, the previous backend can restart only after the initial shutdown has completed. If that shutdown fails or is interrupted, the script does not restart the backend. Keep the original process details and resolve the reported processes before you try again. For the default service, use `sudo systemctl start plugin_loader` to start the previous backend only after those processes are gone. Then try installation again. If archive creation fails after shutdown has completed, the script restarts the previous backend.
+This asks for your password. Undo does not change your plugin data. If you need your old plugin files, they are in the backup folder.
 
-Use `--status` to check the service after an interruption. If the first backup failed before the recovery tools were installed, use `systemctl status plugin_loader` instead. Installer recovery output is kept in `homebrew/services/.decky-deploy/plugin_loader.service/interrupted-recovery.log` for the default service.
+## Check status
 
-Use `--help` for custom paths, service names, and candidate overrides. `DECK_USER` selects the plugin account and defaults to `deck`. `--non-interactive` disables password prompts. The script stays pinned while other runtime builds are investigated.
+```sh
+bash install-to-deck.sh --status
+```
 
-For optional deployment from another Linux computer, use `--remote HOST`, such as `bash install-to-deck.sh --remote steamdeck --check`. Remote mode requires SSH and SCP on that computer and SSH access to the Deck. `DECK_USER` also selects the SSH account, and `DECK_PORT` overrides its port. Setting `DECK_IP` no longer selects a remote target; use `--remote` explicitly.
+## Problems
 
-After installation, open Decky in Gaming Mode. Open each plugin and use its main function. Check that settings persist after a plugin reload and after a reboot. Check suspend and resume. Keep the pinned candidate and backups until these checks pass on your Deck. If the interface or plugins fail, use `--undo` and check the previous installation again.
+- **Decky does not appear.** Restart the Deck. If it is still missing, run `--status`, then install again.
+- **A plugin shows "Decky could not start".** The plugin needs administrator access or failed to start. Update or remove it in Decky's settings.
+- **Another program uses port 1337 or 8080.** Decky needs these ports. Syncthing often uses 8080; change Syncthing to 8384.
+- **The script stops with a space error.** Free some storage or choose a different `--backup-dir`, then try again. The script stops before it changes anything.
+- **The install fails part way.** The script puts back the previous version automatically. It prints the location of a log file. Attach that file, or the ZIP from [collect-debug-info.sh](scripts/collect-debug-info.sh), when you [report a problem](https://github.com/beallio/decky-loader/issues).
 
-## 📜 Credits
+## Install from another computer
 
-The original idea for the plugin loader concept is based on the work of [marios8543's Steam Deck UI Inject project](https://github.com/marios8543/steamdeck-ui-inject).
+To install over SSH from a Linux computer, add `--remote HOST`, for example `bash install-to-deck.sh --remote steamdeck`. Run `bash install-to-deck.sh --help` for all options.
+
+## For plugin authors
+
+Plugins work as they do in official Decky, except that they cannot request administrator access. Start with the [plugin template](https://github.com/SteamDeckHomebrew/decky-plugin-template).
+
+This fork also offers a fast JSON encoder to Python plugins:
+
+```python
+from decky import native
+
+text = native.dumps({"name": "Deck", "values": [1, 2, 3]})
+```
+
+For normal JSON data, `native.dumps` returns the same text as Python's `json.dumps` with its default settings. It also accepts `ensure_ascii=False`. It has no other `json.dumps` options. It is only available when your plugin runs in this fork. If your plugin also supports official Decky, check for it with `hasattr(decky, "native")`.
+
+To build or change this fork, see the [development guide](docs/development.md).
+
+## Credits
+
+Decky Loader is made by [Steam Deck Homebrew](https://github.com/SteamDeckHomebrew) and its contributors. The original idea is based on [marios8543's Steam Deck UI Inject project](https://github.com/marios8543/steamdeck-ui-inject).

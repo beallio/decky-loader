@@ -101,7 +101,17 @@ The Python plugin support code and frontend remain based on `v3.2.10`. Bundle as
 
 Python plugins still run in separate processes. A shared Python parent loads common support code and forks a child for each active plugin. This shares memory without putting every plugin in one interpreter. The compiled JSON encoder handles loader-managed replies and events; plugins keep their normal Python JSON library.
 
-Plugin startup binds selected plugin information and loader-managed imports to the approved directory. That binding stays available until process exit, including shutdown callbacks and failed startup. It does not cover every file or helper program that a plugin opens. Plugins with administrator access must still be trusted.
+Plugin startup binds selected plugin information and loader-managed imports to the approved directory. That binding stays available until process exit, including shutdown callbacks and failed startup. It does not cover every file or helper program that a plugin opens.
+
+### User service
+
+The installed backend is a `systemd --user` unit for the selected account, `deck` by default. It has no `User=` line and is wanted by `default.target`. `KillMode=mixed` stops the main process first, then any remaining helpers in the unit. The installer keeps its state in `homebrew/services/.decky-user-installer/` and its offline recovery kit in `homebrew/services/.decky-user-deploy/`. It records the user unit directory that the user manager reports and reuses it for later status, update, and rollback commands.
+
+Plugins with the `root` flag are refused with a clear error. Normal install, update, status, and rollback never use sudo. Only the explicit `migrate-legacy-system` and `restore-legacy-system` commands run as root. They keep a protected copy of the old system unit, drop-ins, binary, and restore helper in `/var/lib/decky-loader-runtime/legacy-migrations/<uid>/<unit>/`.
+
+### Native JSON for plugins
+
+`decky.native.dumps(value, *, ensure_ascii=True)` calls the compiled `_decky_native_json` encoder. The module loads the extension only when the function is called, so the SDK still imports in a development environment without it. A missing or incompatible extension raises `ImportError`; there is no Python fallback. This is a fork extension to the pinned `v3.2.10` SDK.
 
 ## Validate an owned VM copy
 
@@ -109,7 +119,7 @@ The maintained entry points are:
 
 ```sh
 python3 scripts/runtime/validation/verify.py --help
-python3 scripts/runtime/validation/validate_root.py --help
+python3 scripts/runtime/validation/validate_user.py --help
 python3 scripts/runtime/validation/benchmark_vm.py --help
 ```
 
@@ -119,9 +129,8 @@ Stage the validation scripts with their documented support inputs and fixtures. 
 
 - `benchmark_vm.py` creates uniquely owned transient services in private network namespaces. It checks that the normal installation is unchanged and does not stop or reconfigure `plugin_loader.service`.
 - `verify.py` is an HTTP/WebSocket client for the supplied `--base` URL. It creates no service or network isolation. It makes plugin calls and reloads a fixture plugin, so point it at an owned test instance rather than treating it as a read-only health check.
-- `validate_root.py --verify-only` checks the staged bundle and packaged worker without running the disruptive lifecycle test.
-
-**Warning: `validate_root.py` without `--verify-only` interrupts the normal installation.** It stops `plugin_loader.service` and its remaining tracked processes, then runs the probe on the host network at `127.0.0.1:1337`, not in a private network namespace. Cleanup attempts to restart the normal service only after the probe's processes have drained. If cleanup cannot confirm drainage, the normal service can remain stopped. Run this mode only on a disposable VM or a dedicated test system during a planned maintenance window. Check the normal service afterward; do not use this mode as a non-disruptive benchmark or routine smoke check.
+- `validate_user.py --verify-only` checks the staged bundle and packaged worker without starting a service.
+- `validate_user.py` without `--verify-only` starts a uniquely named temporary user service on a separate port. It does not stop or change `plugin_loader.service`. Run it as the plugin account, not as root.
 
 The benchmark's Python baseline must be the approved Python executable; never pass an installed Rust binary as the Python variant. Its standard workflow expects an installed Python baseline. If the normal installation has already changed to Rust, use an independently verified historical Python copy and a separate reviewed campaign adapter. Do not replace the normal service merely to fit the benchmark's assumptions.
 
@@ -129,10 +138,17 @@ VM results do not establish compatibility with every third-party plugin or repla
 
 ## Release validation and publication
 
-The `Runtime Builder` workflow performs checks and builds a complete Linux x86-64 artifact. It does not publish a release. The existing public Python release workflow is separate and unchanged.
+The `Runtime Builder` workflow runs checks and builds a complete Linux x86-64 artifact. It does not publish a release.
 
-The `Runtime Prerelease` workflow validates the selected source, version, complete file lists, and every payload checksum. Local validation uses `scripts/runtime/release.py`; run its `--help` for the required artifact directory, candidate tag, and complete source commit. Build with that candidate tag as `--release-version` before validating it. A `dev` bundle is not a tagged release candidate.
+The `Runtime Release` workflow validates the selected source, version, complete file lists, and every payload checksum. Local validation uses `scripts/runtime/release.py`; run its `--help` for the required inputs. Build with the release tag as `--release-version` before validating it. A `dev` bundle is not a release.
 
-Publication is off by default and requires an explicit `--publish` selection. Publish Rust candidates only to a separate experimental repository, never the official Python release feed. An existing tag must resolve to the artifact's exact source commit. The release must remain a prerelease and must not be marked latest or stable.
+The tag selects the channel, and the selected channel must agree with it:
 
-The local-first [Deck installer](../scripts/install-to-deck.sh) stays pinned to its selected trial build. Building or publishing a different candidate does not change that pin. Keep the tested artifact and offline rollback instructions together; do not substitute an untested rebuild under the same release identity.
+| Tag | Channel | GitHub release |
+| --- | --- | --- |
+| `vX.Y.Z-rust.N` | stable | latest release |
+| `vX.Y.Z-rust.N-rc.N` | preview | prerelease, not latest |
+
+Publication is off by default and requires an explicit `--publish` selection from `refs/heads/main`. An existing tag must resolve to the artifact's exact source commit. Never publish to the official Python release feed.
+
+The [Deck installer](../scripts/install-to-deck.sh) downloads the latest stable fork release by default, the newest preview with `--channel preview`, or one exact tag with `--version`. It checks the ZIP against the release's `.sha256` file. Offline installs use `--bundle ZIP --sha256 HASH --version TAG`.
