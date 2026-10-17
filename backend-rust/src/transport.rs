@@ -26,7 +26,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Value, json, value::RawValue};
 use tokio::{
     io::AsyncReadExt,
     net::TcpListener,
@@ -41,12 +41,12 @@ type PendingCalls = HashMap<i64, PendingCall>;
 
 struct PendingCall {
     identity: Arc<()>,
-    reply: Option<Arc<Value>>,
+    reply: Option<Arc<str>>,
 }
 
 enum CallRegistration {
     New(Arc<()>),
-    Existing(Option<Arc<Value>>),
+    Existing(Option<Arc<str>>),
 }
 
 fn register_call(pending: &mut PendingCalls, call_id: i64) -> CallRegistration {
@@ -141,7 +141,11 @@ pub async fn serve(
             tokio::select! {
                 _ = &mut event_stop_receiver => break,
                 event = event_receiver.recv() => match event {
-                    Ok(event) => send_to_active_socket(&event_sockets, &event).await,
+                    Ok(event) => {
+                        if let Ok(text) = serde_json::to_string(&event) {
+                            send_to_active_socket(&event_sockets, &text).await;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -377,7 +381,9 @@ async fn run_websocket(socket: WebSocket, state: AppState) {
         }
         match message {
             Message::Text(text) => {
-                if let Ok(data) = serde_json::from_str::<Value>(text.as_str()) {
+                if let Some((call_id, legacy, args)) = plugin_call_frame(text.as_str()) {
+                    start_call(&state, call_id, Call::Plugin { legacy, args }).await;
+                } else if let Ok(data) = serde_json::from_str::<Value>(text.as_str()) {
                     handle_client_message(&state, data).await;
                 }
             }
@@ -414,10 +420,7 @@ async fn is_active_socket(sockets: &Arc<Mutex<SocketRegistry>>, connection_id: u
         .is_some_and(|active| active.id == connection_id)
 }
 
-async fn send_to_active_socket(sockets: &Arc<Mutex<SocketRegistry>>, data: &Value) {
-    let Ok(text) = serde_json::to_string(data) else {
-        return;
-    };
+async fn send_to_active_socket(sockets: &Arc<Mutex<SocketRegistry>>, text: &str) {
     let mut registry = sockets.lock().await;
     let send_failed = registry
         .active
@@ -449,6 +452,43 @@ async fn handle_client_message(state: &AppState, data: Value) {
     }
 }
 
+/// A call frame for a plugin method, with the plugin arguments left as JSON text.
+/// Returns `None` for any other frame; those take the general path.
+fn plugin_call_frame(text: &str) -> Option<(i64, bool, Vec<Box<RawValue>>)> {
+    let fields: HashMap<String, &RawValue> = serde_json::from_str(text).ok()?;
+    let field = |key: &str| -> Option<Value> {
+        fields
+            .get(key)
+            .and_then(|raw| serde_json::from_str(raw.get()).ok())
+    };
+    if field("type")?.as_i64()? != 0 {
+        return None;
+    }
+    let legacy = match field("route")?.as_str()? {
+        "loader/call_plugin_method" => false,
+        "loader/call_legacy_plugin_method" => true,
+        _ => return None,
+    };
+    let call_id = field("id")?.as_i64()?;
+    let args: Vec<&RawValue> = serde_json::from_str(fields.get("args")?.get()).ok()?;
+    Some((
+        call_id,
+        legacy,
+        args.into_iter().map(ToOwned::to_owned).collect(),
+    ))
+}
+
+enum Call {
+    Dispatch {
+        route: String,
+        args: Vec<Value>,
+    },
+    Plugin {
+        legacy: bool,
+        args: Vec<Box<RawValue>>,
+    },
+}
+
 async fn handle_call(state: &AppState, data: Value) {
     let Value::Object(mut fields) = data else {
         return;
@@ -462,7 +502,10 @@ async fn handle_call(state: &AppState, data: Value) {
     let Some(Value::Array(args)) = fields.remove("args") else {
         return;
     };
+    start_call(state, call_id, Call::Dispatch { route, args }).await;
+}
 
+async fn start_call(state: &AppState, call_id: i64, call: Call) {
     let identity = {
         let mut pending = state.pending.lock().await;
         match register_call(&mut pending, call_id) {
@@ -481,13 +524,19 @@ async fn handle_call(state: &AppState, data: Value) {
     let pending = state.pending.clone();
     let sockets = state.sockets.clone();
     tokio::spawn(async move {
-        let message = Arc::new(match backend.dispatch(&route, args).await {
-            Ok(result) => {
-                let mut reply = json!({ "type": 1, "id": call_id });
-                reply["result"] = result;
-                reply
+        let result = match call {
+            Call::Dispatch { route, args } => backend
+                .dispatch(&route, args)
+                .await
+                .map(|result| result.to_string()),
+            Call::Plugin { legacy, args } => {
+                let args: Vec<&RawValue> = args.iter().map(AsRef::as_ref).collect();
+                backend.call_plugin(legacy, &args).await
             }
-            Err(RpcError::Stopped) => json!({ "type": 2, "id": call_id }),
+        };
+        let message: Arc<str> = match result {
+            Ok(result) => format!(r#"{{"type":1,"id":{call_id},"result":{result}}}"#).into(),
+            Err(RpcError::Stopped) => json!({ "type": 2, "id": call_id }).to_string().into(),
             Err(RpcError::Error {
                 name,
                 message,
@@ -504,9 +553,9 @@ async fn handle_call(state: &AppState, data: Value) {
                 error["traceback"] = traceback.map(Value::String).unwrap_or(Value::Null);
                 let mut reply = json!({ "type": -1, "id": call_id });
                 reply["error"] = error;
-                reply
+                reply.to_string().into()
             }
-        });
+        };
 
         let should_send = {
             let mut pending = pending.lock().await;
@@ -837,6 +886,41 @@ fn decode_percent_once(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_plugin_call_frames_take_the_raw_path() {
+        let (id, legacy, args) = plugin_call_frame(
+            r#"{"type":0,"id":5,"route":"loader/call_plugin_method","args":["P","m",{"n":10000000000000000000001}, "é"]}"#,
+        )
+        .unwrap();
+        assert_eq!((id, legacy), (5, false));
+        let args: Vec<&str> = args.iter().map(|arg| arg.get()).collect();
+        assert_eq!(
+            args,
+            [
+                r#""P""#,
+                r#""m""#,
+                r#"{"n":10000000000000000000001}"#,
+                r#""é""#
+            ]
+        );
+
+        let (_, legacy, _) = plugin_call_frame(
+            r#"{"type":0,"id":6,"route":"loader/call_legacy_plugin_method","args":["P","m",{}]}"#,
+        )
+        .unwrap();
+        assert!(legacy);
+
+        for other in [
+            r#"{"type":0,"id":7,"route":"utilities/ping","args":[]}"#,
+            r#"{"type":3,"id":7,"route":"loader/call_plugin_method","args":[]}"#,
+            r#"{"type":0,"id":"7","route":"loader/call_plugin_method","args":[]}"#,
+            r#"{"type":0,"id":7,"route":"loader/call_plugin_method","args":{}}"#,
+            r#"{"type":4,"messages":[]}"#,
+        ] {
+            assert!(plugin_call_frame(other).is_none(), "{other}");
+        }
+    }
 
     struct TestDirectory(PathBuf);
 

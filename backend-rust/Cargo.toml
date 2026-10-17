@@ -23,7 +23,7 @@ mime_guess = "2"
 nix = { version = "0.31.3", default-features = false, features = ["dir", "fs", "inotify", "process", "signal", "user"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "charset", "gzip", "brotli", "deflate", "cookies"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["arbitrary_precision"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.29"

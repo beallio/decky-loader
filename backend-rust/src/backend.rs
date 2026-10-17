@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value, json, value::RawValue};
 use tokio::sync::Mutex;
 
 use crate::workers::{PluginRegistry, WorkerError};
@@ -267,48 +267,16 @@ impl Backend {
                 exact(&args, 0)?;
                 Ok(self.registry.list().await)
             }
-            "loader/call_plugin_method" => {
-                if args.len() < 2 {
-                    return Err(RpcError::invalid("plugin name and method are required"));
-                }
-                let mut header = args.drain(..2);
-                let name = header.next().expect("validated plugin name");
-                let method = header.next().expect("validated method name");
-                drop(header);
-                let name = name
-                    .as_str()
-                    .ok_or_else(|| RpcError::invalid("argument 0 must be a string"))?;
-                let method = method
-                    .as_str()
-                    .ok_or_else(|| RpcError::invalid("argument 1 must be a string"))?;
-                self.registry
-                    .call(name, method, Value::Array(args), false)
-                    .await
-                    .map_err(Into::into)
-            }
-            "loader/call_legacy_plugin_method" => {
-                exact(&args, 3)?;
-                let kwargs = args.pop().expect("validated legacy arguments");
-                let name = string(&args, 0)?;
-                let method = string(&args, 1)?;
-                if !kwargs.is_object() {
-                    return Err(RpcError::invalid(
-                        "legacy method arguments must be an object",
-                    ));
-                }
-                match self.registry.call(name, method, kwargs, true).await {
-                    Ok(result) => {
-                        let mut response = json!({"success": true});
-                        response["result"] = result;
-                        Ok(response)
-                    }
-                    Err(WorkerError::Error(message)) => {
-                        let mut response = json!({"success": false});
-                        response["result"] = Value::String(message);
-                        Ok(response)
-                    }
-                    Err(WorkerError::Stopped) => Err(RpcError::Stopped),
-                }
+            "loader/call_plugin_method" | "loader/call_legacy_plugin_method" => {
+                let raw = args
+                    .iter()
+                    .map(serde_json::value::to_raw_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| RpcError::failure(error.to_string()))?;
+                let raw: Vec<&RawValue> = raw.iter().map(AsRef::as_ref).collect();
+                let legacy = route == "loader/call_legacy_plugin_method";
+                let result = self.call_plugin(legacy, &raw).await?;
+                serde_json::from_str(&result).map_err(|error| RpcError::failure(error.to_string()))
             }
             "loader/reload_plugin" => {
                 exact(&args, 1)?;
@@ -341,6 +309,58 @@ impl Backend {
                 .await
                 .unwrap_or_else(|| Err(missing_route(route))),
             _ => Err(missing_route(route)),
+        }
+    }
+
+    /// Runs `loader/call_plugin_method` (or the legacy route) on unparsed arguments
+    /// and returns the route result as JSON text. Only the plugin and method names
+    /// are decoded; plugin data passes through as text in both directions.
+    pub async fn call_plugin(&self, legacy: bool, args: &[&RawValue]) -> Result<String, RpcError> {
+        let name_at = |index: usize| {
+            args.get(index)
+                .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())
+                .ok_or_else(|| RpcError::invalid(format!("argument {index} must be a string")))
+        };
+        if !legacy {
+            if args.len() < 2 {
+                return Err(RpcError::invalid("plugin name and method are required"));
+            }
+            let (name, method) = (name_at(0)?, name_at(1)?);
+            let mut call_args = String::from("[");
+            for (index, arg) in args[2..].iter().enumerate() {
+                if index > 0 {
+                    call_args.push(',');
+                }
+                call_args.push_str(arg.get());
+            }
+            call_args.push(']');
+            let result = self
+                .registry
+                .call(&name, &method, &call_args, false)
+                .await?;
+            return Ok(Box::<str>::from(result).into_string());
+        }
+
+        if args.len() != 3 {
+            return Err(RpcError::invalid(format!(
+                "expected 3 arguments, received {}",
+                args.len()
+            )));
+        }
+        let (name, method) = (name_at(0)?, name_at(1)?);
+        let kwargs = args[2].get();
+        if !kwargs.starts_with('{') {
+            return Err(RpcError::invalid(
+                "legacy method arguments must be an object",
+            ));
+        }
+        match self.registry.call(&name, &method, kwargs, true).await {
+            Ok(result) => Ok(format!(r#"{{"success":true,"result":{}}}"#, result.get())),
+            Err(WorkerError::Error(message)) => Ok(format!(
+                r#"{{"success":false,"result":{}}}"#,
+                Value::String(message)
+            )),
+            Err(WorkerError::Stopped) => Err(RpcError::Stopped),
         }
     }
 }

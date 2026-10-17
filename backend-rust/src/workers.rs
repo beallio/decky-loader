@@ -27,7 +27,7 @@ use nix::{
 };
 
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
+use serde_json::{Value, json, value::RawValue};
 use tokio::{
     io::unix::AsyncFd,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -300,11 +300,14 @@ struct WorkerHandle {
     state: Arc<Mutex<PendingState>>,
 }
 
+/// A plugin call result as raw JSON text, or the reason the call failed.
+type CallReply = std::result::Result<Box<RawValue>, WorkerError>;
+
 struct PendingState {
     alive: bool,
     stopping: bool,
     failure: Option<String>,
-    requests: HashMap<String, oneshot::Sender<std::result::Result<Value, WorkerError>>>,
+    requests: HashMap<String, oneshot::Sender<CallReply>>,
 }
 
 impl PluginRegistry {
@@ -530,13 +533,16 @@ impl PluginRegistry {
             .map(|entry| self.plugin_root.join(&entry.metadata.directory))
     }
 
+    /// Calls a plugin method. `args` must be valid JSON text (an array, or an object
+    /// for legacy calls). The worker's result comes back unparsed, so large data is
+    /// not decoded and encoded again on its way to the frontend.
     pub async fn call(
         &self,
         name: &str,
         method: &str,
-        args: Value,
+        args: &str,
         legacy: bool,
-    ) -> std::result::Result<Value, WorkerError> {
+    ) -> std::result::Result<Box<RawValue>, WorkerError> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(WorkerError::Stopped);
         }
@@ -575,18 +581,11 @@ impl PluginRegistry {
         };
 
         let id = Uuid::new_v4().to_string();
-        let mut request = json!({
-            "type": 0,
-            "method": method,
-            "id": id,
-        });
-        request["args"] = args;
-        if legacy {
-            request["legacy"] = Value::Bool(true);
-        }
-        let mut bytes = serde_json::to_vec(&request).map_err(|error| {
-            WorkerError::Error(format!("Failed to serialize plugin request: {error}"))
-        })?;
+        let method = Value::String(method.to_owned()).to_string();
+        let legacy = if legacy { r#","legacy":true"# } else { "" };
+        let mut bytes =
+            format!(r#"{{"type":0,"method":{method},"id":"{id}","args":{args}{legacy}}}"#)
+                .into_bytes();
         bytes.push(b'\n');
 
         let (sender, receiver) = oneshot::channel();
@@ -3288,19 +3287,27 @@ async fn process_worker_message(
     state: &Arc<Mutex<PendingState>>,
     events: &broadcast::Sender<Value>,
 ) -> std::result::Result<(), ()> {
-    let Value::Object(mut message) = serde_json::from_slice(line).map_err(|_| ())? else {
-        return Err(());
+    // Only the small envelope fields are decoded. A call result stays raw JSON text.
+    let message: HashMap<String, &RawValue> = serde_json::from_slice(line).map_err(|_| ())?;
+    let field = |key: &str| -> Option<Value> {
+        message
+            .get(key)
+            .and_then(|raw| serde_json::from_str(raw.get()).ok())
     };
-    match message.get("type").and_then(Value::as_i64) {
+    match field("type").as_ref().and_then(Value::as_i64) {
         Some(1) => {
-            let Some(Value::String(id)) = message.remove("id") else {
+            let Some(Value::String(id)) = field("id") else {
                 return Err(());
             };
-            let success = message.get("success").and_then(Value::as_bool).ok_or(())?;
-            let result = message.remove("res").ok_or(())?;
+            let success = field("success")
+                .as_ref()
+                .and_then(Value::as_bool)
+                .ok_or(())?;
+            let result = *message.get("res").ok_or(())?;
             let response = if success {
-                Ok(result)
+                Ok(result.to_owned())
             } else {
+                let result = serde_json::from_str(result.get()).map_err(|_| ())?;
                 Err(WorkerError::Error(value_error_string(&result)))
             };
             let sender = state.lock().await.requests.remove(&id);
@@ -3309,9 +3316,7 @@ async fn process_worker_message(
             }
         }
         Some(2) => {
-            if let (Some(Value::String(event)), Some(args)) =
-                (message.remove("event"), message.remove("args"))
-            {
+            if let (Some(Value::String(event)), Some(args)) = (field("event"), field("args")) {
                 let mut payload = json!({"plugin": plugin_name});
                 payload["event"] = Value::String(event);
                 payload["args"] = args;
@@ -3342,6 +3347,61 @@ async fn mark_worker_dead(state: &Arc<Mutex<PendingState>>, failure: Option<Stri
     }
     for (_, request) in state.requests.drain() {
         let _ = request.send(Err(WorkerError::Stopped));
+    }
+}
+
+#[cfg(test)]
+mod worker_message_tests {
+    use super::*;
+
+    fn pending(id: &str) -> (Arc<Mutex<PendingState>>, oneshot::Receiver<CallReply>) {
+        let (sender, receiver) = oneshot::channel();
+        let mut requests = HashMap::new();
+        requests.insert(id.to_owned(), sender);
+        let state = PendingState {
+            alive: true,
+            stopping: false,
+            failure: None,
+            requests,
+        };
+        (Arc::new(Mutex::new(state)), receiver)
+    }
+
+    #[tokio::test]
+    async fn plugin_results_keep_their_exact_json() {
+        let (state, receiver) = pending("a");
+        let (events, _) = broadcast::channel(1);
+        let result = r#"{"big":123456789012345678901234567890,"small":1e-7,"text":"caf\u00e9 ☕","list":[1.50,null]}"#;
+        let line = format!(r#"{{"type":1,"id":"a","success":true,"res":{result}}}"#);
+        process_worker_message(line.as_bytes(), "Example", &state, &events)
+            .await
+            .unwrap();
+        assert_eq!(receiver.await.unwrap().unwrap().get(), result);
+    }
+
+    #[tokio::test]
+    async fn plugin_errors_become_messages_and_bad_lines_are_rejected() {
+        let (state, receiver) = pending("b");
+        let (events, _) = broadcast::channel(1);
+        let line = br#"{"type":1,"id":"b","success":false,"res":"it broke"}"#;
+        process_worker_message(line, "Example", &state, &events)
+            .await
+            .unwrap();
+        match receiver.await.unwrap() {
+            Err(WorkerError::Error(message)) => assert_eq!(message, "it broke"),
+            other => panic!("unexpected reply {other:?}"),
+        }
+        for bad in [
+            &b"[1]"[..],
+            b"{\"type\":1,\"id\":\"b\"",
+            br#"{"type":1,"id":"b","success":true}"#,
+        ] {
+            assert!(
+                process_worker_message(bad, "Example", &state, &events)
+                    .await
+                    .is_err()
+            );
+        }
     }
 }
 #[cfg(test)]
