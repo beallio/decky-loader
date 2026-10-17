@@ -1,0 +1,52 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check for a newer upstream release
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Use the runner temporary directory
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Compare the pinned SDK with the newest upstream release
+        id: check
+        run: |
+          python3 scripts/runtime/upstream_check.py \
+            --markdown "$RUNNER_TEMP/upstream-summary.md" > "$RUNNER_TEMP/upstream-report.json"
+          jq -r '"available=\(.update_available)", "latest=\(.latest)"' "$RUNNER_TEMP/upstream-report.json" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update the upstream release issue
+        if: steps.check.outputs.available == 'true'
+        env:
+          LATEST: ${{ steps.check.outputs.latest }}
+        run: |
+          title="Upstream $LATEST is available"
+          gh label create upstream-sync --force \
+            --description "A newer upstream Decky Loader release exists" --color 0E8A16
+          existing="$(gh issue list --label upstream-sync --state open --limit 1 --json number --jq '.[0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            gh issue edit "$existing" --title "$title" --body-file "$RUNNER_TEMP/upstream-summary.md"
+          else
+            gh issue create --label upstream-sync --title "$title" --body-file "$RUNNER_TEMP/upstream-summary.md"
+          fi

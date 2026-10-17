@@ -15,7 +15,7 @@ jobs:
     name: Check frontend formatting
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Use the runner temporary directory
@@ -31,7 +31,7 @@ jobs:
               for name in ('node', 'pnpm'):
                   print(f'{name}={config[name]}', file=output)
           PY
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: ${{ steps.config.outputs.node }}
       - name: Install locked frontend dependencies

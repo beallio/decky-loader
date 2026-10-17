@@ -152,3 +152,23 @@ The tag selects the channel, and the selected channel must agree with it:
 Publication is off by default and requires an explicit `--publish` selection from `refs/heads/main`. An existing tag must resolve to the artifact's exact source commit. Never publish to the official Python release feed.
 
 The [Deck installer](../scripts/install-to-deck.sh) downloads the latest stable fork release by default, the newest preview with `--channel preview`, or one exact tag with `--version`. It checks the ZIP against the release's `.sha256` file. Offline installs use `--bundle ZIP --sha256 HASH --version TAG`.
+
+## Upstream sync
+
+The `Upstream Sync` workflow runs every week and can be started by hand. It runs `scripts/runtime/upstream_check.py`, which compares the pinned SDK tag in [build-config.json](../backend-rust/build-config.json) with the newest stable upstream tag `vX.Y.Z`. Pre-release tags are ignored. When a newer tag exists, the workflow opens one issue, `Upstream vX.Y.Z is available`, with the `upstream-sync` label. It updates that issue on later runs. When the fork is up to date, it does nothing.
+
+The report has three parts:
+
+- Each fork overlay file gets a three-way merge: base is the pinned tag, ours is the fork `HEAD`, theirs is the new tag. The result is `clean`, `conflict`, `unchanged-upstream`, or `deleted-upstream`.
+- Each removed file shows whether upstream changed it.
+- Other changes in `backend/decky_loader` and `frontend` come into the fork as they are.
+
+To run the check yourself, use `python3 scripts/runtime/upstream_check.py`. It prints JSON. Give a Git remote or path as an argument to use another source.
+
+To move to a new upstream tag:
+
+1. Fetch the tag: `git fetch --no-tags https://github.com/SteamDeckHomebrew/decky-loader.git refs/tags/vX.Y.Z:refs/tags/vX.Y.Z`.
+2. Merge the upstream changes into `backend/decky_loader` and `frontend`. For each overlay file, merge by hand, or run `git merge-file` with the old tag as base. Keep the fork changes. For each removed file, check that the change does not matter, then keep it removed.
+3. In `build-config.json`, set `sdk.tag`, `sdk.commit` (`git rev-parse vX.Y.Z^{commit}`), `sdk.backend_tree` (`git rev-parse vX.Y.Z:backend/decky_loader`), and `sdk.frontend_tree` (`git rev-parse vX.Y.Z:frontend`). Update the `v3.2.10` text in this guide.
+4. Run the local checks and a complete build.
+5. Release as `vX.Y.Z-rust.N` (use `-rc.N` for a preview). See [Release validation and publication](#release-validation-and-publication).
