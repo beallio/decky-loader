@@ -1,14 +1,22 @@
-name: Runtime Prerelease
+name: Runtime Release
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Rust candidate tag, for example v3.2.10-rust.7-rc.1
+        description: Rust release tag, for example v3.2.10-rust.7-rc.1
         required: true
         type: string
+      release_channel:
+        description: The release channel must agree with the tag suffix
+        required: true
+        default: preview
+        type: choice
+        options:
+          - stable
+          - preview
       publish:
-        description: Publish an experimental prerelease (never latest or stable)
+        description: Publish this release (requires the main branch)
         default: false
         type: boolean
 
@@ -19,12 +27,19 @@ jobs:
   validate-tag:
     runs-on: ubuntu-22.04
     steps:
-      - name: Require a distinct Rust candidate tag
+      - name: Require the tag and channel to agree
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_CHANNEL: ${{ inputs.release_channel }}
         run: |
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rust\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
-            printf 'Use a Rust candidate tag such as v3.2.10-rust.7-rc.1\n' >&2
+          stable_tag='^v[0-9]+\.[0-9]+\.[0-9]+-rust\.[0-9]+$'
+          preview_tag='^v[0-9]+\.[0-9]+\.[0-9]+-rust\.[0-9]+-rc\.[0-9]+$'
+          if [[ "$RELEASE_CHANNEL" == stable && ! "$RELEASE_TAG" =~ $stable_tag ]]; then
+            printf 'Stable releases require a vX.Y.Z-rust.N tag\n' >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_CHANNEL" == preview && ! "$RELEASE_TAG" =~ $preview_tag ]]; then
+            printf 'Preview releases require a vX.Y.Z-rust.N-rc.N tag\n' >&2
             exit 1
           fi
 
@@ -34,13 +49,23 @@ jobs:
     with:
       release_version: ${{ inputs.release_tag }}
 
-  prerelease:
-    name: Validate payload and optionally publish a prerelease
+  publish:
+    name: Verify payload and optionally publish the release
     needs: build
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
+      - name: Require the main ref for production publication
+        if: inputs.publish
+        env:
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            printf 'Production publication is allowed only from refs/heads/main\n' >&2
+            exit 1
+          fi
+
       - name: Check out the selected source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -56,18 +81,21 @@ jobs:
         env:
           ARTIFACT_DIR: ${{ runner.temp }}/runtime-release
           RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_CHANNEL: ${{ inputs.release_channel }}
           SOURCE_COMMIT: ${{ github.sha }}
           RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_REF: ${{ github.ref }}
           PUBLISH: ${{ inputs.publish }}
           GH_TOKEN: ${{ github.token }}
         run: |
           publish_args=()
           if [[ "$PUBLISH" == true ]]; then
-            publish_args=(--publish)
+            publish_args=(--publish --ref "$RELEASE_REF")
           fi
           python3 scripts/runtime/release.py \
             --artifact-dir "$ARTIFACT_DIR" \
             --tag "$RELEASE_TAG" \
+            --channel "$RELEASE_CHANNEL" \
             --source-commit "$SOURCE_COMMIT" \
             --repository "$RELEASE_REPOSITORY" \
             "${publish_args[@]}"

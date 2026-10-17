@@ -2,25 +2,14 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Run (Remote)",
-            "type": "python",
+            "name": "Runtime Python tests",
+            "type": "debugpy",
             "request": "launch",
+            "module": "unittest",
+            "args": ["discover", "-s", "tests/runtime", "-p", "test_*.py"],
+            "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "preLaunchTask": "remoterun",
-            "cwd": "",
-            "program": "",      
-        },
-        {
-            "name": "Run (Local)",
-            "type": "python",
-            "request": "launch",
-            "program": "${workspaceFolder}/backend/main.py",
-            "cwd": "${workspaceFolder}/backend",
-            "console": "integratedTerminal",
-            "env": {
-                "PLUGIN_PATH": "${workspaceFolder}/plugins"
-            },
-            "preLaunchTask": "localrun"
+            "env": { "PYTHONDONTWRITEBYTECODE": "1" }
         }
     ]
 }

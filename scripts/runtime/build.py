@@ -161,7 +161,9 @@ def build(output: Path, release_version: str, python_archive: Path | None) -> di
             if path.is_file():
                 archive.write(path, path.relative_to(bundle).as_posix())
     checksum = digest(artifact)
-    (output / 'SHA256SUMS').write_text(f'{checksum}  {artifact.name}\n')
+    checksum_line = f'{checksum}  {artifact.name}\n'
+    (output / 'SHA256SUMS').write_text(checksum_line)
+    (output / f'{artifact.name}.sha256').write_text(checksum_line)
     result.update(artifact=str(artifact), artifact_sha256=checksum)
     (output / 'build-result.json').write_text(json.dumps(result, indent=2) + '\n')
     return result

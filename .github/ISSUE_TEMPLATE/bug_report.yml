@@ -1,100 +1,38 @@
 name: Bug report
-description: File a bug/issue
-title: "[BUG] <title>"
-labels: [bug]
+description: Report a problem with this fork.
+title: "[Bug] "
 body:
-  - type: checkboxes
-    id: low-effort-checks
-    attributes:
-      label: Please confirm
-      description: Issues without all checks may be ignored/closed.
-      options:
-        - label: I have searched existing issues
-        - label: This issue is not a duplicate of an existing one
-        - label: I have checked the [common issues section in the readme file](https://github.com/SteamDeckHomebrew/decky-loader#-common-issues)
-        - label: I have attached logs to this bug report (failure to include logs will mean your issue may not be responded to).
-
-  - type: textarea
-    attributes:
-      label: Bug Report Description
-      description: A clear and concise description of what the bug is and if possible, the steps you used to get to the bug. If appropriate, include screenshots or videos.
-      placeholder: |
-        When I try to use ...
-
-        Steps to reproduce the behavior:
-        1. Go to '...'
-        2. Click on '....'
-        3. Scroll down to '....'
-        4. See error
-    validations:
-      required: true
-
-  - type: textarea
-    attributes:
-      label: Expected Behaviour
-      description: A brief description of the expected behavior.
-      placeholder: It should be ...
-    validations:
-      required: true
-
   - type: input
+    id: version
     attributes:
-      label: SteamOS version
-#      description: Can be found with `uname -a`
-#      placeholder: "Linux steamdeck 5.13.0-valve36-1-neptune #1 SMP PREEMPT Mon, 19 Dec 2022 23:39:41 +0000 x86_64 GNU/Linux"
-      placeholder: "SteamOS 3.5.7 Stable"
+      label: Loader version
+      description: Find this in Decky settings.
     validations:
       required: true
-
-  - type: dropdown
-    attributes:
-      label: Selected Update Channel
-      description: Which branch of Decky are you on?
-      multiple: false
-      options:
-         - Stable
-         - Prerelease
-    validations:
-      required: true
-
   - type: input
+    id: system
     attributes:
-      label: Decky Loader Version
-      description: Specify the exact version of Decky.
-      placeholder: v3.0.0-pre12
+      label: SteamOS and Steam versions
     validations:
       required: true
-  
   - type: textarea
+    id: problem
     attributes:
-      label: Plugin Info
-      description: "Include all plugins installed including their version. Helpful script here: https://github.com/SteamDeckHomebrew/decky-loader/blob/main/scripts/plugin-info.sh"
-      placeholder: "If you don't want to collect this info manually you can download a helpful script linked in this item's description and place it into your home directory, chmod +x plugin-info.sh and then run it with ./plugin-info.sh"
+      label: What happened?
+      description: Include the steps that led to the problem.
     validations:
       required: true
- 
-  - type: input
-    attributes:
-      label: Have you modified the read-only filesystem at any point?
-      description: "Describe how here, if you haven't done anything you can leave this blank"
-      placeholder: "Yes, I've installed neofetch via pacman."
-    validations:
-      required: false
-
   - type: textarea
+    id: expected
     attributes:
-      label: Backend Logs
-      description: Please reboot your deck (if possible) when attempting to recreate the issue, then run ``cd ~ && journalctl -b0  -u plugin_loader.service > deckylog.txt``. This will save the log file to ``~`` aka ``/home/deck``. Please upload the file here.
-      placeholder: deckylog.txt
-    validations:
-      required: true
-
+      label: What should have happened?
   - type: textarea
+    id: plugins
     attributes:
-      label: Frontend Logs
-      description: Please copy from your deck ~/.steam/steam/logs/cef_log.txt and ~/.steam/steam/logs/cef_log.previous.txt. Make sure to scrub your Steam username as it may appear in these logs.
-      placeholder: cef_log.txt
-    validations:
-      required: true
-
-      
+      label: Installed plugins
+      description: Include names and versions if the problem involves a plugin.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Attach the ZIP from collect-debug-info.sh. Check it for personal details first.

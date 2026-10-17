@@ -97,6 +97,7 @@ jobs:
           name: decky-loader-runtime-linux-x86_64
           path: |
             ${{ runner.temp }}/decky-runtime/decky-loader-runtime-linux-x86_64.zip
+            ${{ runner.temp }}/decky-runtime/decky-loader-runtime-linux-x86_64.zip.sha256
             ${{ runner.temp }}/decky-runtime/SHA256SUMS
             ${{ runner.temp }}/decky-runtime/build-result.json
           if-no-files-found: error

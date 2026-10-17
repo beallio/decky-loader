@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from unittest.mock import patch
 import zipfile
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -15,16 +18,34 @@ sys.path.insert(0, str(RUNTIME_TOOLS_PATH))
 import release
 
 
-class PrereleaseIntegrityTests(unittest.TestCase):
+class ReleaseIntegrityTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR') or '/var/tmp/omp-1000')
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.tag = 'v3.2.10-rust.7-rc.1'
-        self.commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=release.REPO, text=True).strip()
-        sources = {name: hashlib.sha256(subprocess.check_output(
-            ['git', 'show', f'{self.commit}:{name}'], cwd=release.REPO)).hexdigest()
-            for name in release.source_inventory(self.commit)}
+        source = self.root / 'source'
+        source.mkdir()
+        environment = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1')
+
+        def git(*arguments):
+            return subprocess.check_output(['git', *arguments], cwd=source, env=environment)
+
+        git('-c', 'init.defaultBranch=main', 'init', '--quiet')
+        for name in (*release.SDK_OVERLAYS, 'backend/worker_main.py'):
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f'release source fixture: {name}\n')
+        git('add', '--all')
+        git('-c', 'user.name=Release Fixture', '-c', 'user.email=fixture@example.invalid',
+            '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'release source fixture')
+        repository = patch.object(release, 'REPO', source)
+        repository.start()
+        self.addCleanup(repository.stop)
+        self.commit = git('rev-parse', 'HEAD').decode().strip()
+        self.git = git
+        sources = {name: hashlib.sha256(git('show', f'{self.commit}:{name}')).hexdigest()
+                   for name in release.source_inventory(self.commit)}
         self.payload = {'decky-loader-runtime': b'backend bytes', 'DeckyPluginWorker': b'worker bytes',
                         'install.py': b'installer fixture', 'process_observer.py': b'observer fixture',
                         'assets/index.js': b'frontend fixture', 'locales/en-US.json': b'{}',
@@ -32,7 +53,10 @@ class PrereleaseIntegrityTests(unittest.TestCase):
                         '_internal/base_library.zip': b'standard library fixture'}
         self.runtime = {'python': release.CONFIG['python']['version'], 'decky_version': release.CONFIG['sdk']['tag']}
         self.manifest = {'kind': 'decky-loader-runtime', 'release_version': self.tag, 'worker_packaging': 'onedir',
-                         'source_baseline': release.CONFIG['sdk'], 'runtime': self.runtime,
+                         'source_baseline': release.CONFIG['sdk'], 'sdk_overlays': {
+                             name: sources[name] for name in release.SDK_OVERLAYS},
+                         'sdk_removals': list(release.SDK_REMOVALS),
+                         'runtime': self.runtime,
                          'build': {'base_commit': self.commit, 'source_sha256': sources},
                          'sha256': {name: hashlib.sha256(data).hexdigest() for name, data in self.payload.items()}}
 
@@ -44,11 +68,63 @@ class PrereleaseIntegrityTests(unittest.TestCase):
                 info.external_attr = (stat.S_IFREG | mode) << 16
                 archive.writestr(info, data)
         checksum = hashlib.sha256((self.root / release.ASSET_NAME).read_bytes()).hexdigest()
-        (self.root / 'SHA256SUMS').write_text(f'{checksum}  {release.ASSET_NAME}\n')
+        checksum_line = f'{checksum}  {release.ASSET_NAME}\n'
+        (self.root / 'SHA256SUMS').write_text(checksum_line)
+        (self.root / release.ASSET_CHECKSUM_NAME).write_text(checksum_line)
         (self.root / 'build-result.json').write_text(json.dumps({
             'artifact_sha256': checksum, 'runtime': self.runtime,
             'source_baseline': release.CONFIG['sdk'], 'files': len(self.manifest['sha256']),
         }))
+
+    def test_reports_stable_and_preview_release_identity(self):
+        self.write_bundle()
+        preview = release.validate(self.root, self.tag, self.commit, 'preview')
+        self.assertEqual(preview['channel'], 'preview')
+        stable_tag = 'v3.2.10-rust.7'
+        self.manifest['release_version'] = stable_tag
+        self.write_bundle()
+        stable = release.validate(self.root, stable_tag, self.commit, 'stable')
+        self.assertEqual(stable['channel'], 'stable')
+        with self.assertRaisesRegex(ValueError, 'cannot be published'):
+            release.validate(self.root, stable_tag, self.commit, 'preview')
+        with self.assertRaisesRegex(ValueError, 'cannot be published'):
+            release.validate(self.root, self.tag, self.commit, 'stable')
+
+    def test_cli_reports_release_identity_without_publishing_by_default(self):
+        self.write_bundle()
+        output = io.StringIO()
+        with patch.object(sys, 'argv', [
+            'release.py', '--artifact-dir', str(self.root), '--tag', self.tag, '--channel', 'preview',
+            '--source-commit', self.commit,
+        ]), redirect_stdout(output):
+            self.assertEqual(release.main(), 0)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result['channel'], 'preview')
+        self.assertFalse(result['published'])
+
+    def test_rejects_checksum_sidecar_that_does_not_identify_the_zip(self):
+        self.write_bundle()
+        (self.root / release.ASSET_CHECKSUM_NAME).write_text(f'{"0" * 64}  {release.ASSET_NAME}\n')
+        with self.assertRaisesRegex(ValueError, 'does not identify exactly'):
+            release.validate(self.root, self.tag, self.commit)
+
+    def test_rejects_fork_overlay_hashes_that_differ_from_release_source(self):
+        self.manifest['sdk_overlays'][release.SDK_OVERLAYS[0]] = '0' * 64
+        self.write_bundle()
+        with self.assertRaisesRegex(ValueError, 'fork SDK overlay hashes'):
+            release.validate(self.root, self.tag, self.commit)
+
+    def test_publication_is_limited_to_main_ref(self):
+        release.publication_ref('refs/heads/main', self.commit)
+        with self.assertRaises(ValueError):
+            release.publication_ref('refs/heads/feature', self.commit)
+        self.git('checkout', '--quiet', '-b', 'feature')
+        self.git('-c', 'user.name=Release Fixture', '-c', 'user.email=fixture@example.invalid',
+                 '-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', 'feature only')
+        feature_commit = self.git('rev-parse', 'HEAD').decode().strip()
+        with self.assertRaises(ValueError):
+            release.publication_ref('refs/heads/main', feature_commit)
+
 
     def test_rejects_changed_payload_even_with_matching_outer_checksums(self):
         self.payload['DeckyPluginWorker'] = b'changed after manifest was made'
@@ -93,13 +169,13 @@ class PrereleaseIntegrityTests(unittest.TestCase):
                 self.payload[name] = data
                 self.manifest['sha256'][name] = checksum
 
-    def test_rejects_public_python_update_feed(self):
+    def test_rejects_official_release_feed(self):
         with self.assertRaises(ValueError):
             release.publication_repository('SteamDeckHomebrew/decky-loader')
         with self.assertRaises(ValueError):
             release.publication_repository('STEAMDECKHOMEBREW/DECKY-LOADER')
 
-    def test_rejects_unusable_executables_and_stable_python_tags(self):
+    def test_rejects_unusable_executables_and_non_rust_tags(self):
         self.write_bundle({'DeckyPluginWorker': 0o644})
         with self.assertRaises(ValueError):
             release.validate(self.root, self.tag, self.commit)

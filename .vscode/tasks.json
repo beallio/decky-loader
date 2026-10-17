@@ -1,201 +1,45 @@
 {
     "version": "2.0.0",
     "tasks": [
-        // OTHER
-        {
-            "label": "checkforsettings",
-            "type": "shell",
-            "group": "none",
-            "detail": "Check that settings.json has been created",
-            "command": "bash -c ${workspaceFolder}/.vscode/config.sh",
-            "problemMatcher": []
-        },
-        {
-            "label": "localrun",
-            "type": "shell",
-            "group": "none",
-            "dependsOn": [
-                "buildall"
-            ],
-            "detail": "Check for local runs, create a plugins folder",
-            "command": "mkdir -p plugins",
-            "problemMatcher": []
-        },
-        {
-            "label": "remoterun",
-            "type": "shell",
-            "group": "none",
-            "dependsOn": [
-                "updateremote",
-                "runpydeck"
-            ],
-            "detail": "Task for remote run launches",
-            "command": "exit 0",
-            "problemMatcher": []
-        },
-        {
-            "label": "dependencies",
-            "type": "shell",
-            "group": "none",
-            "dependsOn": [
-                "deploy"
-            ],
-            "detail": "Check for local runs, create a plugins folder",
-            "command": "ssh ${config:deckuser}@${config:deckip} -p ${config:deckport} ${config:deckkey} 'python -m ensurepip --root / && python -m pip install --user --break-system-packages --upgrade poetry && cd ${config:deckdir}/homebrew/dev/pluginloader/backend && python -m poetry install'",
-            "problemMatcher": []
-        },
-        {
-            "label": "extracttext",
-            "type": "shell",
-            "group": "none",
-            "detail": "Check for new strings in the frontend source code and extract it into the corresponding json language files",
-            "command": "cd frontend && ./node_modules/.bin/i18next --config ./i18next-parser.config.mjs",
-            "problemMatcher": []
-        },
-        // BUILD
         {
             "label": "pnpmsetup",
             "type": "shell",
-            "group": "build",
-            "detail": "Setup pnpm",
-            "command": "cd frontend && pnpm i",
+            "command": "pnpm --dir frontend install --frozen-lockfile",
             "problemMatcher": []
-        },
-        {
-            "script": "watch",
-            "type": "npm",
-            "path": "frontend",
-            "group": "build",
-            "problemMatcher": [],
-            "label": "watchfrontend",
-            "detail": "rollup -c -w",
-            "isBackground": true
         },
         {
             "label": "buildfrontend",
-            "type": "npm",
+            "type": "shell",
+            "command": "pnpm --dir frontend run build",
             "group": "build",
-            "detail": "rollup -c",
-            "script": "build",
-            "path": "frontend",
             "problemMatcher": []
         },
         {
-            "label": "buildall",
-            "group": "build",
-            "detail": "Deploy pluginloader to deck",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "pnpmsetup",
-                "buildfrontend"
-            ],
-            "problemMatcher": []
-        },
-        // DEPLOY
-        {
-            "label": "createfolders",
-            "detail": "Create plugins folder in expected directory",
+            "label": "watchfrontend",
             "type": "shell",
-            "group": "none",
-            "dependsOn": [
-                "checkforsettings"
-            ],
-            "command": "ssh ${config:deckuser}@${config:deckip} -p ${config:deckport} ${config:deckkey} 'mkdir -p ${config:deckdir}/homebrew/dev/pluginloader && mkdir -p ${config:deckdir}/homebrew/plugins'",
+            "command": "pnpm --dir frontend run watch",
+            "isBackground": true,
             "problemMatcher": []
         },
         {
-            "label": "deploy",
-            "detail": "Deploy dev PluginLoader to deck",
+            "label": "testpython",
             "type": "shell",
-            "group": "none",
-            "command": "rsync -azp --delete --force --rsh='ssh -p ${config:deckport} ${config:deckkey}' --exclude='.git/' --exclude='.github/' --exclude='.vscode/' --exclude='frontend/' --exclude='dist/' --exclude='contrib/' --exclude='*.log' --exclude='**/__pycache__/' --exclude='.gitignore' . ${config:deckuser}@${config:deckip}:${config:deckdir}/homebrew/dev/pluginloader",
+            "command": "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/runtime -p 'test_*.py'",
+            "group": "test",
             "problemMatcher": []
         },
-        // RUN
         {
-            "label": "runpydeck",
-            "detail": "Run indev PluginLoader on Deck",
+            "label": "testrust",
             "type": "shell",
-            "group": "none",
-            "dependsOn": [
-                "checkforsettings"
-            ],
-            "command": "ssh -t ${config:deckuser}@${config:deckip} -p ${config:deckport} ${config:deckkey} 'export PATH=${config:deckdir}/.local/bin:$PATH; export PLUGIN_PATH=${config:deckdir}/homebrew/plugins; export CHOWN_PLUGIN_PATH=0; export LOG_LEVEL=DEBUG; cd ${config:deckdir}/homebrew/dev/pluginloader/backend; echo '${config:deckpass}' | poetry run sh -c \"cd ${config:deckdir}/homebrew/services; sudo -SE env \"PATH=\\$PATH\" python3 ${config:deckdir}/homebrew/dev/pluginloader/backend/main.py\"'",
+            "command": "base=$TMPDIR; test -n \"$base\" || base=/var/tmp/omp-1000; CARGO_TARGET_DIR=\"$base/decky-cargo-target\" cargo test --manifest-path backend-rust/Cargo.toml --locked --workspace",
+            "group": "test",
             "problemMatcher": []
         },
         {
-            "label": "runpylocal",
-            "detail": "Run PluginLoader from python locally",
+            "label": "buildruntime",
             "type": "shell",
-            "group": "none",
-            "command": "export PLUGIN_PATH=${workspaceFolder}/plugins; export CHOWN_PLUGIN_PATH=0; sudo -E python3 ${workspaceFolder}/backend/main.py",
-            "problemMatcher": []
-        },
-        // ALL-IN-ONES
-        {
-            "label": "deployandrun",
-            "detail": "Deploy and run, skipping JS build. Useful when combined with npm:watch",
-            "dependsOrder": "sequence",
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
-            "dependsOn": [
-                "deploy",
-                "runpydeck"
-            ],
-            "problemMatcher": []
-        },
-        {
-            "label": "updateremote",
-            "detail": "Build and deploy",
-            "dependsOrder": "sequence",
-            "group": "none",
-            "dependsOn": [
-                "buildall",
-                "deploy"
-            ],
-            "problemMatcher": []
-        },
-        {
-            "label": "updateandrun",
-            "detail": "Build, deploy and run",
-            "dependsOrder": "sequence",
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
-            "dependsOn": [
-                "buildfrontend",
-                "deploy",
-                "runpydeck"
-            ],
-            "problemMatcher": []
-        },
-        {
-            "label": "allinone",
-            "detail": "Build, install dependencies, deploy and run",
-            "dependsOrder": "sequence",
-            "group": {
-                "kind": "build",
-                "isDefault": false
-            },
-            "dependsOn": [
-                "buildall",
-                "createfolders",
-                "dependencies",
-                // dependencies runs deploy already
-                // "deploy",
-                "runpydeck"
-            ],
-            "problemMatcher": []
-        },
-        {
-            "label": "act",
-            "type": "shell",
-            "group": "none",
-            "detail": "Build release artifact using local CI",
-            "command": "./act/run-act.sh release",
+            "command": "base=$TMPDIR; test -n \"$base\" || base=/var/tmp/omp-1000; python3 scripts/runtime/build.py --release-version dev --output \"$base/decky-runtime\"",
+            "group": { "kind": "build", "isDefault": true },
             "problemMatcher": []
         }
     ]

@@ -4,46 +4,60 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+env:
+  HUSKY: "0"
+
 jobs:
   typecheck:
-    name: Run type checkers
+    name: Check SDK and frontend types
     runs-on: ubuntu-22.04
-
     steps:
-      - uses: actions/checkout@v4 # Check out the repository first.
-
-      - name: Set up NodeJS 20 💎
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          node-version: 20
-
-      - name: Set up Python 3.11.7 🐍
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11.7"
-
-      - name: Install Poetry
-        uses: snok/install-poetry@v1
-        with:
-          virtualenvs-create: false
-
-      - name: Install Python dependencies ⬇️
-        working-directory: backend
-        run: poetry install --no-interaction
-
-      - name: Install TypeScript dependencies
-        working-directory: frontend
+          persist-credentials: false
+      - name: Use the runner temporary directory
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Read pinned tools
+        id: config
         run: |
-          npm i -g pnpm
-          pnpm i --frozen-lockfile
-
-      - name: Run pyright (Python)
-        uses: jakebailey/pyright-action@v1
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          config = json.loads(Path('backend-rust/build-config.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for name in ('node', 'pnpm', 'poetry', 'poetry_dynamic_versioning'):
+                  print(f'{name}={config[name]}', file=output)
+              print(f'python={config["python"]["version"]}', file=output)
+              print(f'sdk_version={config["sdk"]["tag"].removeprefix("v")}', file=output)
+          PY
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          python-version: "3.10.6"
-          no-comments: true
-          working-directory: backend
-
-      - name: Run tsc (TypeScript)
-        working-directory: frontend
-        run: pnpm run typecheck
+          node-version: ${{ steps.config.outputs.node }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ steps.config.outputs.python }}
+      - name: Install pinned Python tools
+        env:
+          POETRY_VERSION: ${{ steps.config.outputs.poetry }}
+          VERSIONING_VERSION: ${{ steps.config.outputs.poetry_dynamic_versioning }}
+        run: python3 -m pip install "poetry==$POETRY_VERSION" "poetry-dynamic-versioning==$VERSIONING_VERSION"
+      - name: Install locked SDK dependencies
+        working-directory: backend
+        env:
+          POETRY_VIRTUALENVS_IN_PROJECT: "true"
+          POETRY_DYNAMIC_VERSIONING_BYPASS: ${{ steps.config.outputs.sdk_version }}
+        run: poetry sync --no-interaction
+      - name: Check Python SDK types
+        working-directory: backend
+        run: poetry run pyright --pythonversion 3.11
+      - name: Install locked frontend dependencies
+        env:
+          PNPM_VERSION: ${{ steps.config.outputs.pnpm }}
+        run: |
+          npm install --global "pnpm@$PNPM_VERSION"
+          pnpm --dir frontend install --frozen-lockfile
+      - name: Check frontend types
+        run: pnpm --dir frontend run typecheck

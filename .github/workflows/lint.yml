@@ -4,20 +4,40 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+env:
+  HUSKY: "0"
+
 jobs:
   lint:
-    name: Run linters
+    name: Check frontend formatting
     runs-on: ubuntu-22.04
-
     steps:
-      - uses: actions/checkout@v4 # Check out the repository first.
-
-      - name: Install TypeScript dependencies
-        working-directory: frontend
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Use the runner temporary directory
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Read pinned tools
+        id: config
         run: |
-          npm i -g pnpm
-          pnpm i --frozen-lockfile --dangerously-allow-all-builds
-
-      - name: Run prettier (TypeScript)
-        working-directory: frontend
-        run: pnpm run lint
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          config = json.loads(Path('backend-rust/build-config.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for name in ('node', 'pnpm'):
+                  print(f'{name}={config[name]}', file=output)
+          PY
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ steps.config.outputs.node }}
+      - name: Install locked frontend dependencies
+        env:
+          PNPM_VERSION: ${{ steps.config.outputs.pnpm }}
+        run: |
+          npm install --global "pnpm@$PNPM_VERSION"
+          pnpm --dir frontend install --frozen-lockfile
+      - run: pnpm --dir frontend run lint

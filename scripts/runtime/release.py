@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a complete Rust candidate; publish a prerelease only with --publish."""
+"""Validate a complete Rust runtime release; publishing is opt-in."""
 from __future__ import annotations
 
 import argparse
@@ -13,10 +13,36 @@ import sys
 import zipfile
 
 from build import ARTIFACT_NAME, CONFIG, REPO, SOURCE_ROOTS, digest, snapshot_excluded
+from prepare_bundle import SDK_OVERLAYS, SDK_REMOVALS
 
 ASSET_NAME = ARTIFACT_NAME + '.zip'
-TAG_PATTERN = r'v[0-9]+\.[0-9]+\.[0-9]+-rust\.[0-9]+(?:-rc\.[0-9]+)?'
+ASSET_CHECKSUM_NAME = ASSET_NAME + '.sha256'
+STABLE_TAG_PATTERN = r'v[0-9]+\.[0-9]+\.[0-9]+-rust\.[0-9]+'
+PREVIEW_TAG_PATTERN = STABLE_TAG_PATTERN + r'-rc\.[0-9]+'
 PYTHON_RELEASE_REPOSITORY = 'steamdeckhomebrew/decky-loader'
+
+
+def release_channel(tag: str, requested: str | None = None) -> str:
+    if re.fullmatch(STABLE_TAG_PATTERN, tag):
+        inferred = 'stable'
+    elif re.fullmatch(PREVIEW_TAG_PATTERN, tag):
+        inferred = 'preview'
+    else:
+        raise ValueError('use a Rust stable tag vX.Y.Z-rust.N or preview tag vX.Y.Z-rust.N-rc.N')
+    if requested is not None and requested != inferred:
+        raise ValueError(f'{inferred} Rust tags cannot be published to the {requested} channel')
+    return inferred
+
+
+def publication_ref(ref: str, source_commit: str) -> None:
+    if ref != 'refs/heads/main':
+        raise ValueError('production publication requires refs/heads/main')
+    result = subprocess.run(
+        ['git', 'merge-base', '--is-ancestor', source_commit, ref], cwd=REPO,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if result.returncode:
+        raise ValueError('production release source must belong to main')
 
 
 def source_inventory(source_commit: str) -> set[str]:
@@ -33,7 +59,7 @@ def publication_repository(repository: str) -> None:
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
         raise ValueError('publication requires repository owner/repository')
     if repository.lower() == PYTHON_RELEASE_REPOSITORY:
-        raise ValueError('Rust candidates must use a separate experimental repository, not the public Python update feed')
+        raise ValueError('Rust runtime releases must not target the official Python release feed')
 
 
 def existing_tag_commit(repository: str, tag: str) -> str | None:
@@ -66,15 +92,17 @@ def ensure_release_tag(repository: str, tag: str, source_commit: str) -> None:
                     '-f', f'ref=refs/tags/{tag}', '-f', f'sha={source_commit}'], check=True)
 
 
-def validate(directory: Path, tag: str, source_commit: str) -> dict[str, object]:
-    if not re.fullmatch(TAG_PATTERN, tag):
-        raise ValueError('use a Rust candidate tag such as v3.2.10-rust.7-rc.1')
+def validate(directory: Path, tag: str, source_commit: str, channel: str | None = None) -> dict[str, object]:
+    channel = release_channel(tag, channel)
     if not re.fullmatch(r'[0-9a-f]{40}', source_commit):
         raise ValueError('source commit must be a complete lowercase Git commit SHA')
     artifact = directory / ASSET_NAME
     checksum = digest(artifact)
-    if (directory / 'SHA256SUMS').read_text().splitlines() != [f'{checksum}  {ASSET_NAME}']:
+    checksum_line = f'{checksum}  {ASSET_NAME}'
+    if (directory / 'SHA256SUMS').read_text().splitlines() != [checksum_line]:
         raise ValueError('SHA256SUMS does not identify exactly this runtime ZIP')
+    if (directory / ASSET_CHECKSUM_NAME).read_text().splitlines() != [checksum_line]:
+        raise ValueError(f'{ASSET_CHECKSUM_NAME} does not identify exactly this runtime ZIP')
     record = json.loads((directory / 'build-result.json').read_text())
     if not isinstance(record, dict) or record.get('artifact_sha256') != checksum:
         raise ValueError('build record does not match the runtime ZIP')
@@ -93,6 +121,11 @@ def validate(directory: Path, tag: str, source_commit: str) -> dict[str, object]
             raise ValueError('bundle source commit differs from the requested release source')
         if manifest.get('source_baseline') != CONFIG['sdk']:
             raise ValueError('bundle SDK baseline differs from the pinned build configuration')
+        overlays = manifest.get('sdk_overlays')
+        if not isinstance(overlays, dict) or set(overlays) != set(SDK_OVERLAYS):
+            raise ValueError('bundle does not identify the complete explicit fork SDK overlay')
+        if manifest.get('sdk_removals') != list(SDK_REMOVALS):
+            raise ValueError('bundle does not identify the explicit fork SDK removals')
         runtime = manifest.get('runtime')
         if (not isinstance(runtime, dict) or runtime.get('python') != CONFIG['python']['version']
                 or runtime.get('decky_version') != CONFIG['sdk']['tag']):
@@ -133,6 +166,10 @@ def validate(directory: Path, tag: str, source_commit: str) -> dict[str, object]
         raise ValueError('bundle lacks exact build-source hashes')
     if set(source_hashes) != source_inventory(source_commit):
         raise ValueError('build-source inventory does not cover exactly the release commit snapshot')
+    if any(source_hashes.get(name) != expected for name, expected in overlays.items()):
+        raise ValueError('fork SDK overlay hashes differ from the pinned-source release snapshot')
+    if any(name in source_hashes for name in SDK_REMOVALS):
+        raise ValueError('release source reintroduces removed privileged Steam workaround code')
     for name, expected in source_hashes.items():
         if not isinstance(name, str) or any(ord(char) < 32 for char in name):
             raise ValueError('invalid build-source path')
@@ -143,7 +180,7 @@ def validate(directory: Path, tag: str, source_commit: str) -> dict[str, object]
         original = subprocess.check_output(['git', 'show', f'{source_commit}:{name}'], cwd=REPO)
         if hashlib.sha256(original).hexdigest() != expected:
             raise ValueError('build-source hash differs from the release commit: ' + name)
-    return {'validated': True, 'tag': tag, 'source_commit': source_commit,
+    return {'validated': True, 'tag': tag, 'channel': channel, 'source_commit': source_commit,
             'artifact': str(artifact), 'artifact_sha256': checksum, 'files': len(hashes),
             'verified_source_files': len(source_hashes)}
 
@@ -152,26 +189,34 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--artifact-dir', type=Path, required=True)
     parser.add_argument('--tag', required=True)
+    parser.add_argument('--channel', choices=('stable', 'preview'), required=True)
     parser.add_argument('--source-commit', required=True)
     parser.add_argument('--repository', help='GitHub owner/repository; required only for publication')
-    parser.add_argument('--publish', action='store_true', help='explicitly publish an experimental prerelease, never latest/stable')
+    parser.add_argument('--ref', help='Git ref; publication is permitted only from refs/heads/main')
+    parser.add_argument('--publish', action='store_true', help='explicitly publish the validated Rust runtime release')
     args = parser.parse_args()
     if args.publish and (not args.repository or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repository)):
         parser.error('--publish requires --repository owner/repository')
+    if args.publish and not args.ref:
+        parser.error('--publish requires --ref refs/heads/main')
     try:
         if args.publish:
             publication_repository(args.repository)
-        result = validate(args.artifact_dir, args.tag, args.source_commit)
+            publication_ref(args.ref, args.source_commit)
+        result = validate(args.artifact_dir, args.tag, args.source_commit, args.channel)
         if args.publish:
-            assets = [args.artifact_dir / name for name in (ASSET_NAME, 'SHA256SUMS', 'build-result.json')]
+            assets = [args.artifact_dir / name for name in
+                      (ASSET_NAME, ASSET_CHECKSUM_NAME, 'SHA256SUMS', 'build-result.json')]
             ensure_release_tag(args.repository, args.tag, args.source_commit)
-            subprocess.run(['gh', 'release', 'create', args.tag, '--repo', args.repository,
-                            '--verify-tag', '--prerelease', '--latest=false',
-                            '--title', args.tag, '--notes',
-                            'Experimental Rust runtime candidate, not the default Decky release. '
-                            f'SDK baseline {CONFIG["sdk"]["tag"]}; source {args.source_commit}. '
-                            'Physical Deck and plugin checks are required before wider rollout.',
-                            *(str(path) for path in assets)], check=True)
+            notes = (f'{args.channel.title()} Rust runtime release. '
+                     f'SDK baseline {CONFIG["sdk"]["tag"]}; source {args.source_commit}.')
+            release_args = ['gh', 'release', 'create', args.tag, '--repo', args.repository,
+                            '--verify-tag', '--title', args.tag, '--notes', notes]
+            if args.channel == 'preview':
+                release_args.extend(('--prerelease', '--latest=false'))
+            else:
+                release_args.append('--latest')
+            subprocess.run([*release_args, *(str(path) for path in assets)], check=True)
         result['published'] = args.publish
         print(json.dumps(result, sort_keys=True))
         return 0
@@ -182,3 +227,4 @@ def main() -> int:
 
 if __name__ == '__main__':
     raise SystemExit(main())
+
