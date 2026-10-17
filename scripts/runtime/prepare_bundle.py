@@ -37,6 +37,7 @@ SDK_OVERLAYS = (
     'frontend/src/index.ts',
     'frontend/src/components/TitleView.tsx',
     'frontend/src/utils/quickAccessClasses.ts',
+    'frontend/src/components/modals/filepicker/index.tsx',
 )
 SDK_REMOVALS = (
     'frontend/src/steamfixes/README.md',

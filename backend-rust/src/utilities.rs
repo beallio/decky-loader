@@ -1192,15 +1192,23 @@ fn parse_filepicker_options(args: &[Value]) -> Result<FilePickerOptions, RpcErro
 }
 
 fn filepicker_listing(home: &str, options: FilePickerOptions) -> Result<Value, RpcError> {
-    let requested_path = options.path.as_deref().unwrap_or(home);
-    let scan_path = if requested_path.is_empty() {
-        Path::new(".")
-    } else {
-        Path::new(requested_path)
+    // A missing or empty start path opens the home folder (upstream #951).
+    let requested_path = match options.path.as_deref() {
+        None | Some("") => home,
+        Some(path) => path,
     };
-    let resolved = scan_path
+    let resolved = Path::new(requested_path)
         .canonicalize()
         .map_err(|error| filepicker_io_error(error, requested_path))?;
+    // A file as the start path opens the folder that holds it (upstream #952).
+    // `listed_path` tells the frontend which folder it now shows.
+    let (resolved, listed_path) = if resolved.is_file() {
+        let parent = resolved.parent().unwrap_or(&resolved).to_path_buf();
+        let listed = parent.to_string_lossy().into_owned();
+        (parent, listed)
+    } else {
+        (resolved, requested_path.to_owned())
+    };
     let entries =
         std::fs::read_dir(&resolved).map_err(|error| filepicker_io_error(error, requested_path))?;
     let filter = options.filter_for.as_deref().map(compile_filter);
@@ -1270,7 +1278,7 @@ fn filepicker_listing(home: &str, options: FilePickerOptions) -> Result<Value, R
         })
         .collect::<Vec<_>>();
     Ok(json!({
-        "realpath": requested_path,
+        "realpath": listed_path,
         "files": page,
         "total": total,
     }))
@@ -2397,6 +2405,44 @@ mod tests {
         assert_eq!(files[0]["isdir"], true);
         assert_eq!(files[1]["name"], "alpha.TXT");
         assert_eq!(files[2]["name"], "Beta.txt");
+    }
+
+    fn listing_options(path: Option<String>) -> FilePickerOptions {
+        FilePickerOptions {
+            path,
+            include_files: true,
+            include_folders: true,
+            include_ext: None,
+            include_hidden: false,
+            order_by: "name_desc".to_owned(),
+            filter_for: None,
+            page: 1,
+            max: 10,
+        }
+    }
+
+    #[test]
+    fn filepicker_empty_or_missing_start_path_opens_home() {
+        let home = TestDir::new();
+        fs::write(home.0.join("in-home.txt"), b"x").unwrap();
+        let home_path = home.0.to_string_lossy().into_owned();
+        for path in [None, Some(String::new())] {
+            let listing = filepicker_listing(&home_path, listing_options(path)).unwrap();
+            assert_eq!(listing["realpath"], home_path.as_str());
+            assert_eq!(listing["files"][0]["name"], "in-home.txt");
+        }
+    }
+
+    #[test]
+    fn filepicker_file_start_path_opens_its_folder() {
+        let temp = TestDir::new();
+        fs::write(temp.0.join("chosen.txt"), b"x").unwrap();
+        fs::write(temp.0.join("sibling.txt"), b"y").unwrap();
+        let file = temp.0.join("chosen.txt").to_string_lossy().into_owned();
+        let listing = filepicker_listing("/unused-home", listing_options(Some(file))).unwrap();
+        let folder = temp.0.canonicalize().unwrap();
+        assert_eq!(listing["realpath"], folder.to_string_lossy().as_ref());
+        assert_eq!(listing["total"], 2);
     }
 
     #[test]

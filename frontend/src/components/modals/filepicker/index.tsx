@@ -26,7 +26,7 @@ import { styleDefObj } from './iconCustomizations';
 const logger = new Logger('FilePicker');
 
 export interface FilePickerProps {
-  startPath: string;
+  startPath?: string | null;
   includeFiles?: boolean;
   includeFolders?: boolean;
   filter?: RegExp | ((file: File) => boolean);
@@ -137,8 +137,10 @@ const FilePicker: FunctionComponent<FilePickerProps> = ({
 }) => {
   const { t } = useTranslation();
 
-  if (startPath !== '/' && startPath.endsWith('/')) startPath = startPath.substring(0, startPath.length - 1); // remove trailing path
-  const [path, setPath] = useState<string>(startPath);
+  // An empty start path lets the backend choose the home folder.
+  let start = startPath ?? '';
+  if (start !== '/' && start.endsWith('/')) start = start.substring(0, start.length - 1); // remove trailing path
+  const [path, setPath] = useState<string>(start);
   const [listing, setListing] = useState<FileListing>({ files: [], realpath: path, total: 0 });
   const [files, setFiles] = useState<File[]>([]);
   const [error, setError] = useState<FileErrorTypes>(FileErrorTypes.None);
@@ -193,6 +195,8 @@ const FilePicker: FunctionComponent<FilePickerProps> = ({
           page,
           max,
         );
+        // The backend may list another folder: home for an empty path, the parent for a file.
+        if (listing.realpath !== path) setPath(listing.realpath);
         setRawError(null);
         setError(FileErrorTypes.None);
         setFiles(listing.files);
