@@ -5368,6 +5368,7 @@ def _run_legacy_forget(args: argparse.Namespace) -> dict[str, object]:
                 os.fsync(parent_fd)
             finally:
                 os.close(parent_fd)
+        _remove_legacy_dropins(record, unit_name)
         _remove_legacy_runtime_state(homebrew, unit_name)
         _, descriptors = _open_legacy_store(user.pw_uid, unit_name, create=False)
         try:
@@ -5389,6 +5390,41 @@ def _run_legacy_forget(args: argparse.Namespace) -> dict[str, object]:
         _close_legacy_descriptors(descriptors)
     return {'ok': True, 'command': 'forget-legacy-system', 'service': unit_name, 'phase': 'forgotten'}
 
+
+def _remove_legacy_dropins(record: dict[str, Any], unit_name: str) -> None:
+    """Delete the legacy unit's /etc drop-ins that are unchanged since migration.
+
+    They are inert behind the mask. A drop-in that changed after migration is kept.
+    """
+    directory = Path('/etc/systemd/system') / f'{unit_name}.d'
+    try:
+        parent_fd = _open_root_directory(directory)
+    except FileNotFoundError:
+        return
+    try:
+        for item in record['files']:
+            if not isinstance(item, dict):
+                continue
+            source = _safe_legacy_destination(str(item.get('source', '')))
+            if source.parent != directory:
+                continue
+            try:
+                info = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if [info.st_dev, info.st_ino] == item.get('identity') and _object_matches_snapshot(
+                parent_fd, source.name, item
+            ):
+                os.unlink(source.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        empty = not os.listdir(parent_fd)
+    finally:
+        os.close(parent_fd)
+    if empty:
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
 
 
 def _verify_bundle(args: argparse.Namespace) -> tuple[pwd.struct_passwd, Path, str, Path, dict[str, Any]]:
