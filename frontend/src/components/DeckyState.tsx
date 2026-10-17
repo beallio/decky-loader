@@ -72,6 +72,11 @@ export class DeckyState {
   setPlugins(plugins: Plugin[]) {
     this._plugins = plugins;
     this._installedPlugins = [...plugins, ...this._disabledPlugins];
+    // Show the new plugin object after an update, not the old one (upstream #976).
+    if (this._activePlugin) {
+      const name = this._activePlugin.name;
+      this._activePlugin = plugins.find((plugin) => plugin.name === name) ?? null;
+    }
     this.notifyUpdate();
   }
 
