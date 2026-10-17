@@ -5,6 +5,7 @@ mod cef;
 mod launcher;
 mod platform;
 mod plugin_manager;
+mod root_host;
 mod service_manager;
 mod transport;
 mod updater;

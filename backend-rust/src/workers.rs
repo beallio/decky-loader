@@ -42,6 +42,7 @@ use uuid::Uuid;
 use crate::{
     launcher::{ForkLauncher, LauncherEnvironment, LauncherStartError},
     platform,
+    root_host::{self, HostEnvironment, RootHost},
 };
 
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -106,6 +107,7 @@ pub struct PluginRegistry {
     worker_mode: WorkerMode,
     worker_bootstrap: WorkerBootstrap,
     fork_launcher: Mutex<Option<Arc<ForkLauncher>>>,
+    root_host: Mutex<Option<Arc<RootHost>>>,
     launcher_failure: Option<(watch::Sender<bool>, watch::Receiver<bool>)>,
     plugin_root: PathBuf,
     loader_settings_path: PathBuf,
@@ -190,6 +192,7 @@ struct WorkerLaunchConfig<'a> {
     worker_mode: WorkerMode,
     worker_bootstrap: WorkerBootstrap,
     fork_launcher: Option<&'a Arc<ForkLauncher>>,
+    root_host: Option<&'a Arc<RootHost>>,
     plugin_root: &'a Path,
     homebrew: &'a Path,
     user: &'a str,
@@ -236,6 +239,13 @@ enum WorkerSupervisor {
         exit: AsyncFd<OwnedFd>,
         group: ProcessGroupGuard,
     },
+    /// A plugin marked `root`, run by the root plugin host. This process cannot
+    /// signal it, so every stop goes through the host.
+    Root {
+        host: Arc<RootHost>,
+        id: String,
+        exit: AsyncFd<OwnedFd>,
+    },
 }
 
 impl WorkerSupervisor {
@@ -265,6 +275,19 @@ impl WorkerSupervisor {
                     .map_err(|error| io::Error::other(error.to_string()))?;
                 Ok(Some(ExitStatus::from_raw(status)))
             }
+            Self::Root { host, id, .. } => {
+                let status = host
+                    .child_status(id)
+                    .await
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let Some(status) = status else {
+                    return Ok(None);
+                };
+                host.forget_child(id)
+                    .await
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                Ok(Some(ExitStatus::from_raw(status)))
+            }
         }
     }
 
@@ -274,6 +297,11 @@ impl WorkerSupervisor {
             Self::Fork {
                 launcher, id, pid, ..
             } => terminate_fork_child(launcher, id, *pid).await,
+            Self::Root { host, id, .. } => {
+                if host.stop_child(id).await.is_ok() {
+                    let _ = host.forget_child(id).await;
+                }
+            }
         }
         let _ = fs::remove_file(socket_path);
     }
@@ -288,6 +316,7 @@ impl WorkerSupervisor {
                 exit,
                 group,
             } => tokio::spawn(reap_fork_child(stop, launcher, id, pid, exit, group)),
+            Self::Root { host, id, exit } => tokio::spawn(reap_root_child(stop, host, id, exit)),
         }
     }
 }
@@ -347,6 +376,7 @@ impl PluginRegistry {
             worker_mode,
             worker_bootstrap,
             fork_launcher: Mutex::new(None),
+            root_host: Mutex::new(None),
             launcher_failure,
             plugin_root,
             loader_settings_path,
@@ -377,7 +407,11 @@ impl PluginRegistry {
                 return Err(anyhow::anyhow!("Plugin startup interrupted by shutdown"));
             }
 
-            let root_error = root_plugin_refusal(&plugin, platform::effective_user_ids().0);
+            let root_error = root_plugin_refusal(
+                &plugin,
+                platform::effective_user_ids().0,
+                registry.root_host_enabled(),
+            );
             let entry = Arc::new(PluginEntry {
                 disabled: AtomicBool::new(plugin.disabled),
                 metadata: plugin,
@@ -394,6 +428,25 @@ impl PluginRegistry {
                 let mut runtime = entry.runtime.lock().await;
                 match registry.set_approved_plugin_permissions(&entry.metadata) {
                     Err(error) => runtime.start_error = Some(error.to_string()),
+                    Ok(()) if registry.uses_root_host(&entry.metadata) => {
+                        match registry
+                            .launch_root_worker(&entry.metadata, &mut shutdown)
+                            .await
+                        {
+                            Ok(worker) => {
+                                runtime.worker = Some(worker);
+                                running += 1;
+                            }
+                            Err(WorkerError::Error(error)) => runtime.start_error = Some(error),
+                            Err(WorkerError::Stopped) => {
+                                drop(runtime);
+                                registry.shutdown().await;
+                                return Err(anyhow::anyhow!(
+                                    "Plugin startup interrupted by shutdown"
+                                ));
+                            }
+                        }
+                    }
                     Ok(()) => {
                         let fork_launcher = if registry.worker_mode == WorkerMode::Fork {
                             match registry.ensure_fork_launcher(&mut shutdown).await {
@@ -414,7 +467,7 @@ impl PluginRegistry {
                         } else {
                             None
                         };
-                        let launch_config = registry.launch_config(fork_launcher.as_ref());
+                        let launch_config = registry.launch_config(fork_launcher.as_ref(), None);
                         match launch_worker(
                             &launch_config,
                             &entry.metadata,
@@ -651,7 +704,11 @@ impl PluginRegistry {
         let directory_path = resolve_plugin_directory(&self.plugin_root, directory)?;
         let disabled_plugins = read_disabled_plugins(&self.loader_settings_path);
         let mut metadata = read_plugin_metadata(&directory_path, &disabled_plugins)?;
-        let root_error = root_plugin_refusal(&metadata, platform::effective_user_ids().0);
+        let root_error = root_plugin_refusal(
+            &metadata,
+            platform::effective_user_ids().0,
+            self.root_host_enabled(),
+        );
         let previous = self.plugins.read().await.get(&metadata.name).cloned();
         if refresh && previous.is_some() && !metadata.debug {
             return Ok(());
@@ -746,12 +803,15 @@ impl PluginRegistry {
         if metadata.passive || metadata.disabled {
             return Ok(None);
         }
+        if self.uses_root_host(metadata) {
+            return self.launch_root_worker(metadata, shutdown).await.map(Some);
+        }
         let fork_launcher = if self.worker_mode == WorkerMode::Fork {
             Some(self.ensure_fork_launcher(shutdown).await?)
         } else {
             None
         };
-        let config = self.launch_config(fork_launcher.as_ref());
+        let config = self.launch_config(fork_launcher.as_ref(), None);
         match launch_worker(&config, metadata, self.events.clone(), shutdown).await {
             Ok(worker) => Ok(Some(worker)),
             Err(WorkerLaunchError::Failed(error)) => Err(WorkerError::Error(error)),
@@ -1084,12 +1144,18 @@ impl PluginRegistry {
         let plugins = self.plugins.read().await.clone();
         let fork_launcher = self.fork_launcher.lock().await.clone();
         cleanup_plugins(&plugins, &self.socket_directory, fork_launcher.as_ref()).await;
+        // Closing the connection makes the root host stop anything it still runs for us.
+        self.root_host.lock().await.take();
     }
 
     fn set_approved_plugin_permissions(
         &self,
         metadata: &PluginMetadata,
     ) -> std::result::Result<(), WorkerError> {
+        if self.uses_root_host(metadata) {
+            // The root host checks ownership itself; this account cannot change root files.
+            return Ok(());
+        }
         let directory = self.plugin_root.join(&metadata.directory);
         set_plugin_permissions_on_approved(
             &metadata.approved_directory,
@@ -1110,7 +1176,11 @@ impl PluginRegistry {
         }
         let directory_path = resolve_plugin_directory(&self.plugin_root, directory)?;
         let metadata = read_plugin_metadata(&directory_path, &[])?;
-        if let Some(error) = root_plugin_refusal(&metadata, platform::effective_user_ids().0) {
+        if let Some(error) = root_plugin_refusal(
+            &metadata,
+            platform::effective_user_ids().0,
+            self.root_host_enabled(),
+        ) {
             return Err(WorkerError::Error(error));
         }
         self.set_approved_plugin_permissions(&metadata)?;
@@ -1162,15 +1232,70 @@ impl PluginRegistry {
         Ok(launcher)
     }
 
+    /// The root plugin host is enabled when its socket unit has created the socket.
+    fn root_host_enabled(&self) -> bool {
+        root_host::socket_path(self.user_ids.0).exists()
+    }
+
+    fn uses_root_host(&self, metadata: &PluginMetadata) -> bool {
+        metadata.requires_root && platform::effective_user_ids().0 != 0
+    }
+
+    async fn ensure_root_host(&self) -> std::result::Result<Arc<RootHost>, WorkerError> {
+        let mut current = self.root_host.lock().await;
+        if let Some(host) = current.as_ref()
+            && !host.is_failed()
+        {
+            return Ok(Arc::clone(host));
+        }
+        if !self.root_host_enabled() {
+            return Err(WorkerError::Error(root_host::NOT_ENABLED.to_owned()));
+        }
+        let host = RootHost::connect(
+            &root_host::socket_path(self.user_ids.0),
+            HostEnvironment {
+                auth_token: &self.auth_token,
+                server_host: &self.server_host,
+                server_port: self.server_port,
+            },
+        )
+        .await
+        .map_err(|error| {
+            WorkerError::Error(format!("Could not reach the root plugin host: {error:#}"))
+        })?;
+        let host = Arc::new(host);
+        *current = Some(Arc::clone(&host));
+        Ok(host)
+    }
+
+    async fn launch_root_worker(
+        &self,
+        metadata: &PluginMetadata,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> std::result::Result<WorkerProcess, WorkerError> {
+        if self.shutting_down.load(Ordering::Acquire) || shutdown_requested(shutdown) {
+            return Err(WorkerError::Stopped);
+        }
+        let host = self.ensure_root_host().await?;
+        let config = self.launch_config(None, Some(&host));
+        match launch_worker(&config, metadata, self.events.clone(), shutdown).await {
+            Ok(worker) => Ok(worker),
+            Err(WorkerLaunchError::Failed(error)) => Err(WorkerError::Error(error)),
+            Err(WorkerLaunchError::Interrupted) => Err(WorkerError::Stopped),
+        }
+    }
+
     fn launch_config<'a>(
         &'a self,
         fork_launcher: Option<&'a Arc<ForkLauncher>>,
+        root_host: Option<&'a Arc<RootHost>>,
     ) -> WorkerLaunchConfig<'a> {
         WorkerLaunchConfig {
             worker_executable: &self.worker_executable,
             worker_mode: self.worker_mode,
             worker_bootstrap: self.worker_bootstrap,
             fork_launcher,
+            root_host,
             plugin_root: &self.plugin_root,
             homebrew: &self.homebrew,
             user: &self.user,
@@ -1231,11 +1356,16 @@ fn display_name(plugin: &PluginMetadata) -> String {
     }
 }
 
-fn root_plugin_refusal(plugin: &PluginMetadata, effective_uid: u32) -> Option<String> {
-    (plugin.requires_root && effective_uid != 0).then(|| {
+fn root_plugin_refusal(
+    plugin: &PluginMetadata,
+    effective_uid: u32,
+    root_host_enabled: bool,
+) -> Option<String> {
+    (plugin.requires_root && effective_uid != 0 && !root_host_enabled).then(|| {
         format!(
-            "Plugin {} requires root privileges and cannot run in the user service (effective UID {effective_uid})",
-            display_name(plugin)
+            "Plugin {}: {}",
+            display_name(plugin),
+            root_host::NOT_ENABLED
         )
     })
 }
@@ -1919,14 +2049,18 @@ mod plugin_permission_tests {
         write_approved_plugin(&plugin, &["root"]);
         let mut discovered = discover_plugins(&plugin_root, &[]).unwrap();
         let metadata = discovered.get_mut("Example").unwrap();
-        for (requires_root, uid, denied) in [
-            (true, 1000, true),
-            (true, 0, false),
-            (false, 1000, false),
-            (false, 0, false),
+        for (requires_root, uid, root_host_enabled, denied) in [
+            (true, 1000, false, true),
+            (true, 1000, true, false),
+            (true, 0, false, false),
+            (false, 1000, false, false),
+            (false, 0, false, false),
         ] {
             metadata.requires_root = requires_root;
-            assert_eq!(root_plugin_refusal(metadata, uid).is_some(), denied);
+            assert_eq!(
+                root_plugin_refusal(metadata, uid, root_host_enabled).is_some(),
+                denied
+            );
         }
     }
 
@@ -2797,6 +2931,39 @@ fn create_socket_directory(user_ids: (u32, u32)) -> Result<PathBuf> {
     Ok(directory)
 }
 
+async fn start_root_worker(
+    host: &Arc<RootHost>,
+    plugin: &PluginMetadata,
+) -> std::result::Result<(WorkerSupervisor, PathBuf), WorkerLaunchError> {
+    let id = Uuid::new_v4().to_string();
+    let (pid, socket_path) = host
+        .start_child(&id, &plugin.directory)
+        .await
+        .map_err(|error| {
+            WorkerLaunchError::Failed(format!(
+                "Could not start {} in the root plugin host: {error:#}",
+                display_name(plugin)
+            ))
+        })?;
+    let exit = match process_exit_notification(pid) {
+        Ok(exit) => exit,
+        Err(error) => {
+            if host.stop_child(&id).await.is_ok() {
+                let _ = host.forget_child(&id).await;
+            }
+            return Err(WorkerLaunchError::Failed(format!(
+                "Could not monitor root plugin exit: {error}"
+            )));
+        }
+    };
+    let supervisor = WorkerSupervisor::Root {
+        host: Arc::clone(host),
+        id,
+        exit,
+    };
+    Ok((supervisor, socket_path))
+}
+
 async fn launch_worker(
     config: &WorkerLaunchConfig<'_>,
     plugin: &PluginMetadata,
@@ -2808,6 +2975,7 @@ async fn launch_worker(
         worker_mode,
         worker_bootstrap,
         fork_launcher,
+        root_host,
         plugin_root,
         homebrew,
         user,
@@ -2821,118 +2989,123 @@ async fn launch_worker(
         return Err(WorkerLaunchError::Interrupted);
     }
     let requires_root = plugin.requires_root;
-    if let Some(error) = root_plugin_refusal(plugin, platform::effective_user_ids().0) {
-        return Err(WorkerLaunchError::Failed(error));
-    }
+    let uses_root_host = requires_root && platform::effective_user_ids().0 != 0;
+    let (mut supervisor, socket_path) = if uses_root_host {
+        let Some(host) = root_host else {
+            return Err(WorkerLaunchError::Failed(root_host::NOT_ENABLED.to_owned()));
+        };
+        start_root_worker(host, plugin).await?
+    } else {
+        let socket_path = socket_directory
+            .join(if requires_root { "root" } else { "user" })
+            .join(socket_filename());
+        if socket_path.as_os_str().as_bytes().len() >= 108 {
+            return Err(WorkerLaunchError::Failed(format!(
+                "Worker IPC socket path exceeds the Linux AF_UNIX limit: {}",
+                socket_path.display()
+            )));
+        }
+        let approved_launch = approved_launch_json(plugin);
 
-    let socket_path = socket_directory
-        .join(if requires_root { "root" } else { "user" })
-        .join(socket_filename());
-    if socket_path.as_os_str().as_bytes().len() >= 108 {
-        return Err(WorkerLaunchError::Failed(format!(
-            "Worker IPC socket path exceeds the Linux AF_UNIX limit: {}",
-            socket_path.display()
-        )));
-    }
-    let approved_launch = approved_launch_json(plugin);
-
-    let mut supervisor = match worker_mode {
-        WorkerMode::Exec => {
-            let mut command = Command::new(worker_executable);
-            let approved_launch_argument =
-                serde_json::to_string(&approved_launch).map_err(|error| {
+        let supervisor = match worker_mode {
+            WorkerMode::Exec => {
+                let mut command = Command::new(worker_executable);
+                let approved_launch_argument =
+                    serde_json::to_string(&approved_launch).map_err(|error| {
+                        WorkerLaunchError::Failed(format!(
+                            "Failed to serialize approved plugin launch metadata: {error}"
+                        ))
+                    })?;
+                command
+                    .arg("--plugin-root")
+                    .arg(plugin_root)
+                    .arg("--plugin-directory")
+                    .arg(&plugin.directory)
+                    .arg("--socket")
+                    .arg(&socket_path)
+                    .arg("--homebrew")
+                    .arg(homebrew)
+                    .arg("--user")
+                    .arg(user)
+                    .arg("--bootstrap")
+                    .arg(worker_bootstrap.as_str())
+                    .arg("--approved-launch")
+                    .arg(&approved_launch_argument)
+                    .env("DECKY_AUTH_TOKEN", auth_token)
+                    .env("SERVER_HOST", server_host)
+                    .env("SERVER_PORT", server_port.to_string())
+                    .env(
+                        "CHOWN_PLUGIN_PATH",
+                        if chown_plugin_path { "1" } else { "0" },
+                    )
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit());
+                command.as_std_mut().process_group(0);
+                command.kill_on_drop(true);
+                let child = command.spawn().map_err(|error| {
                     WorkerLaunchError::Failed(format!(
-                        "Failed to serialize approved plugin launch metadata: {error}"
+                        "Failed to start worker for {} using {}: {error}",
+                        display_name(plugin),
+                        worker_executable.display()
                     ))
                 })?;
-            command
-                .arg("--plugin-root")
-                .arg(plugin_root)
-                .arg("--plugin-directory")
-                .arg(&plugin.directory)
-                .arg("--socket")
-                .arg(&socket_path)
-                .arg("--homebrew")
-                .arg(homebrew)
-                .arg("--user")
-                .arg(user)
-                .arg("--bootstrap")
-                .arg(worker_bootstrap.as_str())
-                .arg("--approved-launch")
-                .arg(&approved_launch_argument)
-                .env("DECKY_AUTH_TOKEN", auth_token)
-                .env("SERVER_HOST", server_host)
-                .env("SERVER_PORT", server_port.to_string())
-                .env(
-                    "CHOWN_PLUGIN_PATH",
-                    if chown_plugin_path { "1" } else { "0" },
-                )
-                .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
-            command.as_std_mut().process_group(0);
-            command.kill_on_drop(true);
-            let child = command.spawn().map_err(|error| {
-                WorkerLaunchError::Failed(format!(
-                    "Failed to start worker for {} using {}: {error}",
-                    display_name(plugin),
-                    worker_executable.display()
-                ))
-            })?;
-            let pid = child.id().expect("a spawned worker has a process ID");
-            WorkerSupervisor::Direct {
-                child,
-                pid,
-                group: ProcessGroupGuard { pid },
+                let pid = child.id().expect("a spawned worker has a process ID");
+                WorkerSupervisor::Direct {
+                    child,
+                    pid,
+                    group: ProcessGroupGuard { pid },
+                }
             }
-        }
-        WorkerMode::Fork => {
-            let Some(launcher) = fork_launcher else {
-                return Err(WorkerLaunchError::Failed(
-                    "Fork worker mode has no shared launcher".to_owned(),
-                ));
-            };
-            let id = Uuid::new_v4().to_string();
-            match launcher
-                .start_child(json!({
-                    "op": "start",
-                    "id": id,
-                    "plugin_root": plugin_root,
-                    "plugin_directory": plugin.directory,
-                    "socket": socket_path,
-                    "homebrew": homebrew,
-                    "user": user,
-                    "bootstrap": worker_bootstrap.as_str(),
-                    "approved_launch": &approved_launch,
-                }))
-                .await
-            {
-                Ok(pid) => {
-                    let exit = match process_exit_notification(pid) {
-                        Ok(exit) => exit,
-                        Err(error) => {
-                            terminate_fork_child(launcher, &id, pid).await;
-                            return Err(WorkerLaunchError::Failed(format!(
-                                "Could not monitor forked worker exit: {error}"
-                            )));
+            WorkerMode::Fork => {
+                let Some(launcher) = fork_launcher else {
+                    return Err(WorkerLaunchError::Failed(
+                        "Fork worker mode has no shared launcher".to_owned(),
+                    ));
+                };
+                let id = Uuid::new_v4().to_string();
+                match launcher
+                    .start_child(json!({
+                        "op": "start",
+                        "id": id,
+                        "plugin_root": plugin_root,
+                        "plugin_directory": plugin.directory,
+                        "socket": socket_path,
+                        "homebrew": homebrew,
+                        "user": user,
+                        "bootstrap": worker_bootstrap.as_str(),
+                        "approved_launch": &approved_launch,
+                    }))
+                    .await
+                {
+                    Ok(pid) => {
+                        let exit = match process_exit_notification(pid) {
+                            Ok(exit) => exit,
+                            Err(error) => {
+                                terminate_fork_child(launcher, &id, pid).await;
+                                return Err(WorkerLaunchError::Failed(format!(
+                                    "Could not monitor forked worker exit: {error}"
+                                )));
+                            }
+                        };
+                        WorkerSupervisor::Fork {
+                            launcher: Arc::clone(launcher),
+                            id,
+                            pid,
+                            exit,
+                            group: ProcessGroupGuard { pid },
                         }
-                    };
-                    WorkerSupervisor::Fork {
-                        launcher: Arc::clone(launcher),
-                        id,
-                        pid,
-                        exit,
-                        group: ProcessGroupGuard { pid },
+                    }
+                    Err(error) => {
+                        return Err(WorkerLaunchError::Failed(format!(
+                            "Failed to fork worker for {}: {error:#}",
+                            display_name(plugin)
+                        )));
                     }
                 }
-                Err(error) => {
-                    return Err(WorkerLaunchError::Failed(format!(
-                        "Failed to fork worker for {}: {error:#}",
-                        display_name(plugin)
-                    )));
-                }
             }
-        }
+        };
+        (supervisor, socket_path)
     };
     if shutdown_requested(shutdown) {
         supervisor.abort_startup(&socket_path).await;
@@ -2941,6 +3114,7 @@ async fn launch_worker(
     let release = match &supervisor {
         WorkerSupervisor::Direct { .. } => None,
         WorkerSupervisor::Fork { launcher, id, .. } => Some(launcher.release_child(id).await),
+        WorkerSupervisor::Root { host, id, .. } => Some(host.release_child(id).await),
     };
     if let Some(Err(error)) = release {
         supervisor.abort_startup(&socket_path).await;
@@ -3147,6 +3321,28 @@ async fn reap_fork_child(
         .forget_child(&id, pid)
         .await
         .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(ExitStatus::from_raw(status))
+}
+
+async fn reap_root_child(
+    mut stop: mpsc::UnboundedReceiver<()>,
+    host: Arc<RootHost>,
+    id: String,
+    exit: AsyncFd<OwnedFd>,
+) -> io::Result<ExitStatus> {
+    let to_io = |error: anyhow::Error| io::Error::other(format!("{error:#}"));
+    let status = tokio::select! {
+        result = exit.readable() => {
+            result.map(drop)?;
+            // The host reaps the exited child when asked for its status.
+            host.child_status(&id)
+                .await
+                .map_err(to_io)?
+                .ok_or_else(|| io::Error::other("root plugin exited without a host wait status"))?
+        }
+        _ = stop.recv() => host.stop_child(&id).await.map_err(to_io)?,
+    };
+    host.forget_child(&id).await.map_err(to_io)?;
     Ok(ExitStatus::from_raw(status))
 }
 
