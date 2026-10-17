@@ -1,5 +1,6 @@
 from json import dump, load
-from os import mkdir, path, listdir, rename
+from os import chmod, fsync, mkdir, path, listdir, rename, replace, stat, unlink
+from tempfile import NamedTemporaryFile
 from typing import Any, Dict
 from .localplatform.localplatform import chown, file_owner, get_chown_plugin_path
 from .enums import UserType
@@ -49,8 +50,34 @@ class SettingsManager:
             pass
 
     def commit(self):
-        with open(self.path, "w+", encoding="utf-8") as file:
-            dump(self.settings, file, indent=4, ensure_ascii=False)
+        # Write a complete copy first, then swap it in. A crash or power loss
+        # during the write leaves the previous settings file intact.
+        directory = path.dirname(self.path)
+        try:
+            mode = stat(self.path).st_mode & 0o777
+        except FileNotFoundError:
+            mode = 0o644
+        with NamedTemporaryFile(
+            "w", encoding="utf-8", dir=directory, prefix=f".{path.basename(self.path)}.", suffix=".tmp", delete=False
+        ) as file:
+            temporary = file.name
+            try:
+                dump(self.settings, file, indent=4, ensure_ascii=False)
+                file.flush()
+                fsync(file.fileno())
+            except BaseException:
+                file.close()
+                unlink(temporary)
+                raise
+        try:
+            chmod(temporary, mode)
+            replace(temporary, self.path)
+        except BaseException:
+            try:
+                unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
 
     def getSetting(self, key: str, default: Any = None) -> Any:
         return self.settings.get(key, default)

@@ -39,6 +39,7 @@ SDK_OVERLAYS = (
     'frontend/src/utils/quickAccessClasses.ts',
     'frontend/src/components/modals/filepicker/index.tsx',
     'frontend/src/components/DeckyState.tsx',
+    'backend/decky_loader/settings.py',
 )
 SDK_REMOVALS = (
     'frontend/src/steamfixes/README.md',
