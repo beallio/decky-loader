@@ -40,6 +40,7 @@ const REMOTE_DEBUGGER_BIND: &str = "0.0.0.0";
 const REMOTE_DEBUGGER_PORT: u16 = 8081;
 const CEF_DEBUGGER_HOST: &str = "127.0.0.1";
 const CEF_DEBUGGER_PORT: u16 = 8080;
+const CEF_IDENTITY_TIMEOUT: Duration = Duration::from_secs(2);
 const SSHD_UNIT: &str = "sshd.service";
 const RDT_PORT: u16 = 8097;
 const RDT_BIND: &str = "127.0.0.1";
@@ -871,9 +872,18 @@ impl Utilities {
                 return Err(RpcError::failure("CEF debugger forwarding cancelled during shutdown"));
             }
             listener = TcpListener::bind((REMOTE_DEBUGGER_BIND, REMOTE_DEBUGGER_PORT)) => {
-                listener.map_err(|error| RpcError::failure(format!(
-                    "failed to bind CEF debugger forwarder on {REMOTE_DEBUGGER_BIND}:{REMOTE_DEBUGGER_PORT}: {error}"
-                )))?
+                match listener {
+                    Ok(listener) => listener,
+                    Err(error) if self.external_forwarder_serves_cef(error.kind()).await => {
+                        eprintln!(
+                            "CEF debugger is already forwarded on port {REMOTE_DEBUGGER_PORT} by another service"
+                        );
+                        return Ok(true);
+                    }
+                    Err(error) => return Err(RpcError::failure(format!(
+                        "failed to bind CEF debugger forwarder on {REMOTE_DEBUGGER_BIND}:{REMOTE_DEBUGGER_PORT}: {error}"
+                    ))),
+                }
             }
         };
         if *cancelled.borrow() {
@@ -897,15 +907,36 @@ impl Utilities {
         let _lifecycle = self.remote_debugger_lifecycle.lock().await;
         let owns_proxy = self.remote_debugger_proxy.lock().await.is_some();
         self.stop_remote_debugger_proxy().await?;
-        if !owns_proxy {
-            ensure_listener_available(
-                REMOTE_DEBUGGER_BIND,
-                REMOTE_DEBUGGER_PORT,
-                "CEF debugger forwarding",
-            )
-            .await?;
+        if !owns_proxy
+            && let Err(error) = probe_listener(REMOTE_DEBUGGER_BIND, REMOTE_DEBUGGER_PORT).await
+        {
+            if self.external_forwarder_serves_cef(error.kind()).await {
+                eprintln!(
+                    "CEF debugger forwarding on port {REMOTE_DEBUGGER_PORT} belongs to another service; leaving it running"
+                );
+            } else {
+                return Err(held_listener_error(
+                    "CEF debugger forwarding",
+                    REMOTE_DEBUGGER_BIND,
+                    REMOTE_DEBUGGER_PORT,
+                    &error,
+                ));
+            }
         }
         Ok(true)
+    }
+
+    /// Reports whether a failed bind on the forwarding port is explained by another service
+    /// that already forwards the same CEF debugger (SteamOS `steam-web-debug-portforward`).
+    async fn external_forwarder_serves_cef(&self, bind_error: io::ErrorKind) -> bool {
+        if bind_error != io::ErrorKind::AddrInUse {
+            return false;
+        }
+        let (direct, forwarded) = tokio::join!(
+            fetch_cef_version(&self.legacy_client, CEF_DEBUGGER_PORT),
+            fetch_cef_version(&self.legacy_client, REMOTE_DEBUGGER_PORT)
+        );
+        stands_in_for_cef_forwarder(bind_error, direct.as_ref(), forwarded.as_ref())
     }
 
     async fn stop_remote_debugger_proxy(&self) -> Result<(), RpcError> {
@@ -976,18 +1007,62 @@ impl Default for Utilities {
     }
 }
 
-async fn ensure_listener_available(
-    bind: &str,
-    port: u16,
-    description: &str,
-) -> Result<(), RpcError> {
-    let listener = TcpListener::bind((bind, port)).await.map_err(|error| {
-        RpcError::failure(format!(
-            "{description} at {bind}:{port} is held by an external listener: {error}"
-        ))
-    })?;
-    drop(listener);
+async fn probe_listener(bind: &str, port: u16) -> io::Result<()> {
+    drop(TcpListener::bind((bind, port)).await?);
     Ok(())
+}
+
+fn held_listener_error(description: &str, bind: &str, port: u16, error: &io::Error) -> RpcError {
+    RpcError::failure(format!(
+        "{description} at {bind}:{port} is held by an external listener: {error}"
+    ))
+}
+
+async fn fetch_cef_version(client: &Client, port: u16) -> Option<Value> {
+    let response = client
+        .get(format!("http://{CEF_DEBUGGER_HOST}:{port}/json/version"))
+        .timeout(CEF_IDENTITY_TIMEOUT)
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json().await.ok()
+}
+
+/// Browser name and debugger session path. The host and port differ between the direct and
+/// forwarded answers, so they are not part of the identity.
+fn cef_identity(version: &Value) -> Option<(&str, String)> {
+    const BROWSER_PATH: &str = "/devtools/browser/";
+    let browser = version
+        .get("Browser")?
+        .as_str()
+        .filter(|name| !name.is_empty())?;
+    let websocket = reqwest::Url::parse(version.get("webSocketDebuggerUrl")?.as_str()?).ok()?;
+    let path = websocket.path();
+    if path.len() <= BROWSER_PATH.len() || !path.starts_with(BROWSER_PATH) {
+        return None;
+    }
+    Some((browser, path.to_owned()))
+}
+
+fn same_cef_debugger(direct: &Value, forwarded: &Value) -> bool {
+    match (cef_identity(direct), cef_identity(forwarded)) {
+        (Some(direct), Some(forwarded)) => direct == forwarded,
+        _ => false,
+    }
+}
+
+/// A failed bind is acceptable only when another service already holds the port and that
+/// service reaches the same CEF debugger that the backend would have forwarded to.
+fn stands_in_for_cef_forwarder(
+    bind_error: io::ErrorKind,
+    direct: Option<&Value>,
+    forwarded: Option<&Value>,
+) -> bool {
+    bind_error == io::ErrorKind::AddrInUse
+        && matches!((direct, forwarded), (Some(direct), Some(forwarded)) if same_cef_debugger(direct, forwarded))
 }
 
 fn legacy_args(method: &str, kwargs: &Value) -> Result<Vec<Value>, String> {
@@ -2147,8 +2222,8 @@ async fn forward_tcp_connection(
 #[cfg(test)]
 mod tests {
     use super::{
-        FilePickerOptions, ensure_listener_available, filepicker_listing, require_root_authority,
-        run_tcp_forwarder,
+        FilePickerOptions, filepicker_listing, probe_listener, require_root_authority,
+        run_tcp_forwarder, same_cef_debugger, stands_in_for_cef_forwarder,
     };
     use std::{fs, path::PathBuf};
     use tokio::{
@@ -2178,15 +2253,77 @@ mod tests {
     async fn external_forwarder_port_is_not_reported_as_stopped() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let error = ensure_listener_available("127.0.0.1", port, "test forwarding")
-            .await
-            .unwrap_err();
-        assert!(error.message().contains("held by an external listener"));
+        let error = probe_listener("127.0.0.1", port).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
 
         drop(listener);
-        ensure_listener_available("127.0.0.1", port, "test forwarding")
-            .await
-            .unwrap();
+        probe_listener("127.0.0.1", port).await.unwrap();
+    }
+
+    fn version(browser: &str, websocket: &str) -> serde_json::Value {
+        serde_json::json!({"Browser": browser, "webSocketDebuggerUrl": websocket})
+    }
+
+    #[test]
+    fn same_cef_debugger_ignores_port_but_not_browser_identity() {
+        let direct = version("Chrome/126", "ws://127.0.0.1:8080/devtools/browser/abc");
+        let forwarded = version("Chrome/126", "ws://127.0.0.1:8081/devtools/browser/abc");
+        assert!(same_cef_debugger(&direct, &forwarded));
+
+        let other_session = version("Chrome/126", "ws://127.0.0.1:8081/devtools/browser/xyz");
+        assert!(!same_cef_debugger(&direct, &other_session));
+        let other_browser = version("Chrome/127", "ws://127.0.0.1:8081/devtools/browser/abc");
+        assert!(!same_cef_debugger(&direct, &other_browser));
+    }
+
+    #[test]
+    fn same_cef_debugger_rejects_unrelated_or_incomplete_responses() {
+        let direct = version("Chrome/126", "ws://127.0.0.1:8080/devtools/browser/abc");
+        for other in [
+            serde_json::json!({}),
+            serde_json::json!({"Browser": "Chrome/126"}),
+            version("Chrome/126", "not a url"),
+            version("Chrome/126", "ws://127.0.0.1:8081/"),
+            version("Chrome/126", "ws://127.0.0.1:8081/devtools/browser/"),
+            version("", "ws://127.0.0.1:8081/devtools/browser/abc"),
+        ] {
+            assert!(!same_cef_debugger(&direct, &other));
+            assert!(!same_cef_debugger(&other, &direct));
+        }
+    }
+
+    #[test]
+    fn only_address_in_use_with_matching_identity_counts_as_forwarded() {
+        use std::io::ErrorKind;
+        let direct = version("Chrome/126", "ws://127.0.0.1:8080/devtools/browser/abc");
+        let forwarded = version("Chrome/126", "ws://127.0.0.1:8081/devtools/browser/abc");
+        let other = version("Chrome/126", "ws://127.0.0.1:8081/devtools/browser/xyz");
+
+        assert!(stands_in_for_cef_forwarder(
+            ErrorKind::AddrInUse,
+            Some(&direct),
+            Some(&forwarded)
+        ));
+        assert!(!stands_in_for_cef_forwarder(
+            ErrorKind::PermissionDenied,
+            Some(&direct),
+            Some(&forwarded)
+        ));
+        assert!(!stands_in_for_cef_forwarder(
+            ErrorKind::AddrInUse,
+            Some(&direct),
+            Some(&other)
+        ));
+        assert!(!stands_in_for_cef_forwarder(
+            ErrorKind::AddrInUse,
+            Some(&direct),
+            None
+        ));
+        assert!(!stands_in_for_cef_forwarder(
+            ErrorKind::AddrInUse,
+            None,
+            Some(&forwarded)
+        ));
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ use std::{
 use futures_util::StreamExt;
 use reqwest::{Response, Url};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::AsyncWriteExt,
     process::Command,
@@ -28,6 +29,8 @@ const INITIAL_CHECK_DELAY: Duration = Duration::from_secs(30);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const FALLBACK_DOWNLOAD_SIZE: u64 = 25 * 1024 * 1024;
 const RUST_BUNDLE_ASSET: &str = "decky-loader-runtime-linux-x86_64.zip";
+const RUST_CHECKSUM_ASSET: &str = "decky-loader-runtime-linux-x86_64.zip.sha256";
+const MAX_CHECKSUM_BYTES: usize = 1024;
 const RUST_TESTING_ARTIFACT: &str = "decky-loader-runtime-linux-x86_64";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 
@@ -223,7 +226,17 @@ impl Updater {
             .filter(|url| !url.is_empty())
             .ok_or_else(|| RpcError::failure("Rust bundle asset has no download URL"))?;
         let size = asset.get("size").and_then(Value::as_u64);
-        self.download_bundle_and_handoff(backend, download_url, version, size)
+        let checksum_url = rust_checksum_asset(&remote)
+            .and_then(|asset| asset.get("browser_download_url"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RpcError::failure(format!(
+                    "release has no {RUST_CHECKSUM_ASSET} checksum asset; refusing to install an unverified bundle"
+                ))
+            })?;
+        let expected =
+            parse_checksum_sidecar(&download_checksum_text(backend, checksum_url).await?)?;
+        self.download_bundle_and_handoff(backend, download_url, version, size, Some(&expected))
             .await?;
         Ok(Value::Null)
     }
@@ -334,11 +347,13 @@ impl Updater {
             "{}/{repository}/actions/artifacts/{artifact_id}.zip",
             backend.config.testing_download_url.trim_end_matches('/')
         );
+        // nightly.link artifacts have no checksum sidecar.
         self.download_bundle_and_handoff(
             backend,
             &archive_url,
             &format!("PR-{pr_id}"),
             artifact_size,
+            None,
         )
         .await?;
         Ok(Value::Null)
@@ -350,10 +365,14 @@ impl Updater {
         download_url: &str,
         version: &str,
         size: Option<u64>,
+        expected_sha256: Option<&str>,
     ) -> Result<(), RpcError> {
         let mut temporary = UpdateFiles::new(backend).await?;
         let archive = temporary.reserve("zip").await?;
         download_to_file(backend, download_url, &archive, size).await?;
+        if let Some(expected) = expected_sha256 {
+            verify_bundle_digest(expected, &file_sha256(archive.clone()).await?)?;
+        }
         let bundle = temporary.reserve_directory("bundle").await?;
         extract_bundle_archive(archive.clone(), bundle.clone()).await?;
         tokio::fs::remove_file(&archive)
@@ -394,14 +413,52 @@ async fn wait_or_stop(duration: Duration, stopped: &mut oneshot::Receiver<()>) -
     }
 }
 
-fn rust_bundle_asset(release: &Value) -> Option<&Value> {
+fn release_asset<'a>(release: &'a Value, name: &str) -> Option<&'a Value> {
     release.get("assets")?.as_array()?.iter().find(|asset| {
-        asset.get("name").and_then(Value::as_str) == Some(RUST_BUNDLE_ASSET)
+        asset.get("name").and_then(Value::as_str) == Some(name)
             && asset
                 .get("browser_download_url")
                 .and_then(Value::as_str)
                 .is_some_and(|url| !url.is_empty())
     })
+}
+
+fn rust_bundle_asset(release: &Value) -> Option<&Value> {
+    release_asset(release, RUST_BUNDLE_ASSET)
+}
+
+fn rust_checksum_asset(release: &Value) -> Option<&Value> {
+    release_asset(release, RUST_CHECKSUM_ASSET)
+}
+
+/// Accepts only the `sha256sum` line for the Rust bundle: 64 lowercase hex digits, two spaces,
+/// the exact asset name, and at most one final newline.
+fn parse_checksum_sidecar(text: &str) -> Result<String, RpcError> {
+    let line = text.strip_suffix('\n').unwrap_or(text);
+    let malformed = || {
+        RpcError::failure(format!(
+            "{RUST_CHECKSUM_ASSET} is malformed; expected one line: <64 lowercase hex digits>  {RUST_BUNDLE_ASSET}"
+        ))
+    };
+    let (digest, name) = line.split_once("  ").ok_or_else(malformed)?;
+    let is_digest = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !is_digest || name != RUST_BUNDLE_ASSET {
+        return Err(malformed());
+    }
+    Ok(digest.to_owned())
+}
+
+fn verify_bundle_digest(expected: &str, actual: &str) -> Result<(), RpcError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(RpcError::failure(format!(
+            "downloaded Rust bundle does not match {RUST_CHECKSUM_ASSET}: expected SHA-256 {expected}, received {actual}"
+        )))
+    }
 }
 
 fn rust_testing_artifact(artifacts: &[Value]) -> Option<&Value> {
@@ -626,6 +683,43 @@ async fn download_to_file(
     }
     backend.emit("updater/update_download_percentage", vec![json!(100)]);
     Ok(())
+}
+
+async fn download_checksum_text(backend: &Backend, download_url: &str) -> Result<String, RpcError> {
+    let url = Url::parse(download_url)
+        .map_err(|error| RpcError::failure(format!("invalid checksum download URL: {error}")))?;
+    let response =
+        backend.client.get(url).send().await.map_err(|error| {
+            RpcError::failure(format!("checksum download request failed: {error}"))
+        })?;
+    let response = checked_response(response, "checksum download").await?;
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            RpcError::failure(format!("reading checksum download failed: {error}"))
+        })?;
+        if body.len() + chunk.len() > MAX_CHECKSUM_BYTES {
+            return Err(RpcError::failure(format!(
+                "{RUST_CHECKSUM_ASSET} is larger than {MAX_CHECKSUM_BYTES} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body)
+        .map_err(|_| RpcError::failure(format!("{RUST_CHECKSUM_ASSET} is not valid UTF-8")))
+}
+
+async fn file_sha256(path: PathBuf) -> Result<String, RpcError> {
+    tokio::task::spawn_blocking(move || -> io::Result<String> {
+        let mut file = File::open(path)?;
+        let mut hasher = Sha256::new();
+        io::copy(&mut file, &mut hasher)?;
+        Ok(format!("{:x}", hasher.finalize()))
+    })
+    .await
+    .map_err(|error| RpcError::failure(format!("hashing downloaded bundle failed: {error}")))?
+    .map_err(|error| io_failure("hashing downloaded bundle", error))
 }
 
 async fn extract_bundle_archive(archive: PathBuf, bundle: PathBuf) -> Result<(), RpcError> {
@@ -871,8 +965,9 @@ fn io_failure(operation: &str, error: io::Error) -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::{
-        RUST_BUNDLE_ASSET, RUST_TESTING_ARTIFACT, default_branch, filter_releases, resolve_branch,
-        rust_bundle_asset, rust_testing_artifact, secure_staging_directory,
+        RUST_BUNDLE_ASSET, RUST_CHECKSUM_ASSET, RUST_TESTING_ARTIFACT, default_branch,
+        filter_releases, parse_checksum_sidecar, resolve_branch, rust_bundle_asset,
+        rust_checksum_asset, rust_testing_artifact, secure_staging_directory, verify_bundle_digest,
     };
     use crate::backend::RpcError;
     use serde_json::{Value, json};
@@ -887,6 +982,73 @@ mod tests {
             "size": 512,
             "browser_download_url": "https://github.com/beallio/decky-loader/releases/download/v1.0.0/decky-loader-runtime-linux-x86_64.zip"
         })
+    }
+
+    const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn checksum_asset() -> Value {
+        json!({
+            "name": RUST_CHECKSUM_ASSET,
+            "browser_download_url": "https://github.com/beallio/decky-loader/releases/download/v1.0.0/decky-loader-runtime-linux-x86_64.zip.sha256"
+        })
+    }
+
+    #[test]
+    fn checksum_asset_is_required_and_needs_a_download_url() {
+        let complete = json!({"assets":[rust_asset(), checksum_asset()]});
+        assert!(rust_checksum_asset(&complete).is_some());
+
+        let missing = json!({"assets":[rust_asset()]});
+        assert!(rust_checksum_asset(&missing).is_none());
+
+        let no_url = json!({"assets":[rust_asset(), {"name":RUST_CHECKSUM_ASSET, "browser_download_url":""}]});
+        assert!(rust_checksum_asset(&no_url).is_none());
+    }
+
+    #[test]
+    fn checksum_sidecar_accepts_only_the_exact_sha256sum_line() {
+        let line = format!("{DIGEST}  {RUST_BUNDLE_ASSET}");
+        assert_eq!(parse_checksum_sidecar(&line).unwrap(), DIGEST);
+        assert_eq!(
+            parse_checksum_sidecar(&format!("{line}\n")).unwrap(),
+            DIGEST
+        );
+
+        let upper = format!("{}  {RUST_BUNDLE_ASSET}", DIGEST.to_uppercase());
+        let short = format!("{}  {RUST_BUNDLE_ASSET}", &DIGEST[1..]);
+        let long = format!("0{DIGEST}  {RUST_BUNDLE_ASSET}");
+        let not_hex = format!("{}g  {RUST_BUNDLE_ASSET}", &DIGEST[1..]);
+        for malformed in [
+            String::new(),
+            "\n".to_owned(),
+            DIGEST.to_owned(),
+            format!("{DIGEST} {RUST_BUNDLE_ASSET}"),
+            format!("{DIGEST} *{RUST_BUNDLE_ASSET}"),
+            format!("{DIGEST}  other.zip"),
+            format!("{DIGEST}  {RUST_BUNDLE_ASSET}\n\n"),
+            format!("{line}\n{line}\n"),
+            format!(" {line}"),
+            format!("{line} "),
+            format!("{line}\r\n"),
+            upper,
+            short,
+            long,
+            not_hex,
+        ] {
+            let error = parse_checksum_sidecar(&malformed).unwrap_err();
+            assert!(
+                error.message().contains("malformed"),
+                "accepted {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_digest_must_match_the_sidecar() {
+        verify_bundle_digest(DIGEST, DIGEST).unwrap();
+        let other = DIGEST.replace('0', "f");
+        let error = verify_bundle_digest(DIGEST, &other).unwrap_err();
+        assert!(error.message().contains("does not match"));
     }
 
     #[test]
