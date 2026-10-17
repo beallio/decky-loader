@@ -25,6 +25,7 @@ are needed. --bundle is for a saved ZIP and requires --sha256 and --version.
   --undo                   Roll back one user-service transaction
   --migrate-legacy         Explicitly park a legacy system service first
   --restore-legacy         Restore the saved legacy system service
+  --forget-legacy          Delete the saved legacy service (no way back after this)
   --homebrew DIR           Homebrew directory (default: /home/DECK_USER/homebrew)
   --backup-dir DIR         Homebrew archive directory (default: sibling decky-user-backups)
   --service NAME           Service name (default: plugin_loader)
@@ -1120,6 +1121,11 @@ PY
         exit 0
     fi
 
+    if [[ ( $action == restore-legacy || $action == forget-legacy ) && -r $legacy_record ]] \
+            && grep -q '"phase": "forgotten"' "$legacy_record"; then
+        fail 'The saved copy of the old Decky was already deleted with --forget-legacy'
+    fi
+
     if [[ $action == restore-legacy ]]; then
         need sudo
         legacy_helper=$(protected_legacy_helper) || fail 'No safe protected legacy restore helper is available'
@@ -1141,6 +1147,15 @@ PY
         restore_helper_started=1
         "${sudo_args[@]}" python3 -B "$legacy_helper" restore-legacy-system "${legacy_restore_args[@]}" \
             2>&1 | tee -a "${failure_log:-/dev/null}"
+        exit 0
+    fi
+
+    if [[ $action == forget-legacy ]]; then
+        need sudo
+        legacy_helper=$(protected_legacy_helper) || fail 'No saved legacy service was found'
+        "${sudo_args[@]}" python3 -B "$legacy_helper" forget-legacy-system \
+            --homebrew "$homebrew" --service-name "$unit" --user "$user"
+        printf 'The saved copy of the old Decky was deleted.\n'
         exit 0
     fi
 
@@ -1270,9 +1285,9 @@ while (( $# )); do
         --undo|--status|--check)
             [[ $action == install ]] || fail 'Choose only one of --undo, --status, or --check'
             action=${1#--}; shift ;;
-        --restore-legacy)
+        --restore-legacy|--forget-legacy)
             [[ $action == install && $restore_legacy == false ]] || fail 'Choose only one operation'
-            action=restore-legacy; restore_legacy=true; shift ;;
+            action=${1#--}; restore_legacy=true; shift ;;
         --migrate-legacy) migrate_legacy=true; shift ;;
         --non-interactive) non_interactive=true; shift ;;
         --remote|--bundle|--sha256|--version|--channel|--homebrew|--backup-dir|--service|--listen|--cef-url|--inject-frontend)
@@ -1304,9 +1319,15 @@ if [[ $migrate_legacy == true && $action != install && $action != check ]]; then
     fail '--migrate-legacy is only valid with installation or --check'
 fi
 if [[ $restore_legacy == true && ( -n $bundle_archive || -n $expected || -n $version || $migrate_legacy == true ) ]]; then
-    fail '--restore-legacy does not take bundle, release, or migration options'
+    fail "--$action does not take bundle, release, or migration options"
 fi
-if [[ $action == status || $action == undo || $action == restore-legacy ]]; then
+if [[ $action == forget-legacy && $non_interactive == false ]]; then
+    [[ -t 0 ]] || fail '--forget-legacy needs a terminal to confirm, or --non-interactive'
+    printf 'This deletes the saved copy of the old Decky. After this, --restore-legacy cannot work.\n'
+    read -r -p 'Type yes to continue: ' answer
+    [[ $answer == yes ]] || fail 'Cancelled; nothing was changed'
+fi
+if [[ $action == status || $action == undo || $action == restore-legacy || $action == forget-legacy ]]; then
     [[ -z $bundle_archive && -z $expected && -z $version ]] || fail 'Status, undo, and restore operations do not use bundle or release options'
 fi
 if [[ -n $backup_directory && $action != install && $action != check

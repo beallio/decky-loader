@@ -55,6 +55,14 @@ bash install-to-deck.sh --restore-legacy
 
 This asks for your password. Undo does not change your plugin data. If you need your old plugin files, they are in the backup folder.
 
+When this fork works well for a few days, you can delete the saved copy of the old Decky to free space:
+
+```sh
+bash install-to-deck.sh --forget-legacy
+```
+
+After this, `--restore-legacy` cannot work.
+
 ## Check status
 
 ```sh

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -253,6 +254,51 @@ class UserServiceInstallerTests(unittest.TestCase):
             }):
                 with self.assertRaisesRegex(installer.InstallerError, "migrate-legacy-system"):
                     installer._assert_no_system_instance(paths)
+
+    def test_masked_legacy_service_allows_user_scope_only_after_completed_migration(self):
+        paths = {
+            "homebrew": Path("/nonexistent-homebrew"),
+            "unit": Path("plugin_loader.service"),
+            "scope": "user",
+            "user": pwd.getpwuid(os.geteuid()),
+        }
+        masked = {"LoadState": "masked", "ActiveState": "inactive", "MainPID": "0"}
+        for phase, allowed in (("services-user-owned", True), ("forgotten", True), ("parked", False)):
+            with self.subTest(phase=phase), \
+                    patch.object(installer, "_unit_properties", return_value=masked), \
+                    patch.object(installer, "_read_legacy_status", return_value={"phase": phase}):
+                if allowed:
+                    installer._assert_no_system_instance(paths)
+                else:
+                    with self.assertRaises(installer.InstallerError):
+                        installer._assert_no_system_instance(paths)
+
+    def legacy_args(self):
+        user = pwd.getpwuid(os.geteuid())
+        return SimpleNamespace(homebrew="/", service_name="plugin_loader", user=user.pw_name,
+                               user_unit_directory=None), user
+
+    def test_forget_requires_a_completed_migration(self):
+        args, user = self.legacy_args()
+        record = {"user_uid": user.pw_uid, "user": user.pw_name, "phase": "parked", "service": "plugin_loader.service"}
+        with patch.object(installer, "_require_root"), \
+                patch.object(installer, "_read_legacy_record", return_value=(Path("/nonexistent"), record)), \
+                patch.object(installer, "_write_legacy_record") as write:
+            with self.assertRaisesRegex(installer.InstallerError, "completed migration"):
+                installer._run_legacy_forget(args)
+        write.assert_not_called()
+
+    def test_restore_refuses_after_forget(self):
+        args, user = self.legacy_args()
+        for phase in ("forgetting", "forgotten"):
+            record = {"user_uid": user.pw_uid, "user": user.pw_name, "phase": phase, "service": "plugin_loader.service"}
+            with self.subTest(phase=phase), \
+                    patch.object(installer, "_require_root"), \
+                    patch.object(installer, "_read_legacy_record", return_value=(Path("/nonexistent"), record)), \
+                    patch.object(installer, "_write_legacy_record") as write:
+                with self.assertRaisesRegex(installer.InstallerError, "cannot be restored"):
+                    installer._run_legacy_restore(args)
+                write.assert_not_called()
 
     def test_recorded_services_directory_accepts_only_its_journaled_identity(self):
         with tempfile.TemporaryDirectory() as temporary:

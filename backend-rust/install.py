@@ -777,7 +777,7 @@ def _assert_no_system_instance(paths: dict[str, Any]) -> dict[str, str]:
         _fail('legacy migration state is incomplete; run restore-legacy-system before installing a user service')
     if load_state == 'masked' and (
         status is not None
-        and status.get('phase') in ('services-user-owned', 'installed')
+        and status.get('phase') in ('services-user-owned', 'installed', 'forgetting', 'forgotten')
         and system.get('ActiveState') in ('inactive', 'failed')
         and system.get('MainPID', '0') == '0'
     ):
@@ -2853,6 +2853,8 @@ def _read_legacy_record(
         'restoring',
         'services-lock-pending',
         'restored',
+        'forgetting',
+        'forgotten',
     )
     if (
         record.get('phase') not in phases
@@ -2980,6 +2982,34 @@ def _install_legacy_helpers(directory: Path, user_uid: int, service_name: str) -
     finally:
         _close_legacy_descriptors(descriptors)
 
+
+def _clear_directory_fd(directory_fd: int) -> None:
+    """Remove every entry below an opened directory without following symlinks."""
+    for name in os.listdir(directory_fd):
+        if name in ('', '.', '..') or '/' in name:
+            _fail('legacy archive contains an unsafe name')
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child_fd = os.open(
+                name,
+                os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                child_info = os.fstat(child_fd)
+                if (info.st_dev, info.st_ino) != (child_info.st_dev, child_info.st_ino):
+                    _fail('legacy archive directory changed while opening')
+                _clear_directory_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        elif stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            os.unlink(name, dir_fd=directory_fd)
+        else:
+            _fail(f'legacy archive contains an unsupported object: {name}')
+    os.fsync(directory_fd)
+
+
 def _discard_incomplete_legacy_snapshots(private_fd: int) -> None:
     try:
         root_info = os.stat('snapshots', dir_fd=private_fd, follow_symlinks=False)
@@ -3000,33 +3030,7 @@ def _discard_incomplete_legacy_snapshots(private_fd: int) -> None:
         opened = os.fstat(root_fd)
         if (root_info.st_dev, root_info.st_ino) != (opened.st_dev, opened.st_ino):
             _fail('incomplete legacy snapshot archive changed while opening')
-
-        def clear(directory_fd: int) -> None:
-            for name in os.listdir(directory_fd):
-                if name in ('', '.', '..') or '/' in name:
-                    _fail('incomplete legacy snapshot archive contains an unsafe name')
-                info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                if stat.S_ISDIR(info.st_mode):
-                    child_fd = os.open(
-                        name,
-                        os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0),
-                        dir_fd=directory_fd,
-                    )
-                    try:
-                        child_info = os.fstat(child_fd)
-                        if (info.st_dev, info.st_ino) != (child_info.st_dev, child_info.st_ino):
-                            _fail('incomplete legacy snapshot directory changed while opening')
-                        clear(child_fd)
-                    finally:
-                        os.close(child_fd)
-                    os.rmdir(name, dir_fd=directory_fd)
-                elif stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-                    os.unlink(name, dir_fd=directory_fd)
-                else:
-                    _fail(f'incomplete legacy snapshot contains an unsupported object: {name}')
-            os.fsync(directory_fd)
-
-        clear(root_fd)
+        _clear_directory_fd(root_fd)
         current = os.stat('snapshots', dir_fd=private_fd, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
             _fail('incomplete legacy snapshot archive changed during cleanup')
@@ -4887,6 +4891,8 @@ def _run_legacy_restore(args: argparse.Namespace) -> dict[str, object]:
         _fail('legacy migration snapshot belongs to a different service account')
     if record.get('phase') == 'restored':
         _fail('legacy system service has already been restored')
+    if record.get('phase') in ('forgetting', 'forgotten'):
+        _fail('the saved legacy system service was deleted with forget-legacy-system; it cannot be restored')
     protected_helper = directory / 'helper' / 'install.py'
     helper_info = protected_helper.lstat()
     if (
@@ -5019,6 +5025,120 @@ def _run_legacy_restore(args: argparse.Namespace) -> dict[str, object]:
         'restored_running': bool(activation.get('running')),
         'restored_enabled': bool(activation.get('enabled')),
     }
+
+def _remove_root_tree_at(parent_fd: int, name: str) -> bool:
+    """Remove a root-owned directory tree by descriptor; return False when absent."""
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
+        _fail(f'refusing to remove {name}: it is not a root-owned directory')
+    directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(directory_fd)
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            _fail(f'{name} changed while opening it for removal')
+        _clear_directory_fd(directory_fd)
+    finally:
+        os.close(directory_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+    return True
+
+
+def _remove_legacy_runtime_state(homebrew: Path, unit_name: str) -> None:
+    """Remove the old root loader's per-unit state below homebrew/services."""
+    homebrew_fd = os.open(homebrew, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        services_fd = os.open('services', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=homebrew_fd)
+    finally:
+        os.close(homebrew_fd)
+    try:
+        for control in ('.decky-installer', '.decky-deploy'):
+            try:
+                info = os.stat(control, dir_fd=services_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
+                _fail(f'refusing to clean services/{control}: it is not a root-owned directory')
+            control_fd = os.open(control, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=services_fd)
+            try:
+                opened = os.fstat(control_fd)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    _fail(f'services/{control} changed while opening it')
+                _remove_root_tree_at(control_fd, unit_name)
+                empty = not os.listdir(control_fd)
+            finally:
+                os.close(control_fd)
+            if empty:
+                os.rmdir(control, dir_fd=services_fd)
+                os.fsync(services_fd)
+    finally:
+        os.close(services_fd)
+
+
+def _run_legacy_forget(args: argparse.Namespace) -> dict[str, object]:
+    """Delete the saved legacy service after a completed migration. Restore is then impossible."""
+    _require_root()
+    user = pwd.getpwnam(args.user)
+    homebrew = _homebrew_path(args.homebrew)
+    directory, record = _read_legacy_record(homebrew, args.service_name, user.pw_uid)
+    if user.pw_uid == 0 or user.pw_uid != record['user_uid'] or user.pw_name != record['user']:
+        _fail('legacy migration snapshot belongs to a different service account')
+    phase = record.get('phase')
+    if phase not in ('services-user-owned', 'forgetting', 'forgotten'):
+        _fail(f'forget-legacy-system needs a completed migration; the current phase is {phase}')
+    record_path = directory / 'private' / 'record.json'
+    unit_name = str(record['service'])
+    if phase != 'forgotten':
+        system = _unit_properties(_system_unit_paths(unit_name))
+        if system.get('LoadState') != 'masked' or system.get('MainPID', '0') != '0':
+            _fail('the legacy system service is not masked and stopped; refusing to delete its saved copy')
+        user_unit = Path(str(record['user_unit_directory'])) / unit_name
+        if _lstat_regular_or_absent(user_unit) is None:
+            _fail(f'the user service unit is missing ({user_unit}); install it before deleting the legacy copy')
+        record['phase'] = 'forgetting'
+        _write_legacy_record(record_path, record)
+        # Keep the /dev/null mask so the legacy unit can never start again.
+        for item in record['files']:
+            parked = item.get('parked_path') if isinstance(item, dict) else None
+            if not parked:
+                continue
+            path = _safe_legacy_destination(str(parked))
+            parent_fd = _open_root_directory(path.parent)
+            try:
+                try:
+                    info = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if [info.st_dev, info.st_ino] != item.get('identity'):
+                    _fail(f'parked legacy unit changed; refusing to delete it: {path}')
+                os.unlink(path.name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        _remove_legacy_runtime_state(homebrew, unit_name)
+        _, descriptors = _open_legacy_store(user.pw_uid, unit_name, create=False)
+        try:
+            _discard_incomplete_legacy_snapshots(descriptors['private'])
+        finally:
+            _close_legacy_descriptors(descriptors)
+        record['phase'] = 'forgotten'
+        _write_legacy_record(record_path, record)
+    # The helper goes last, so an interrupted run can still be repeated from it.
+    _, descriptors = _open_legacy_store(user.pw_uid, unit_name, create=False)
+    try:
+        for name in ('install.py', 'process_observer.py'):
+            try:
+                os.unlink(name, dir_fd=descriptors['helper'])
+            except FileNotFoundError:
+                pass
+        os.fsync(descriptors['helper'])
+    finally:
+        _close_legacy_descriptors(descriptors)
+    return {'ok': True, 'command': 'forget-legacy-system', 'service': unit_name, 'phase': 'forgotten'}
+
 
 
 def _verify_bundle(args: argparse.Namespace) -> tuple[pwd.struct_passwd, Path, str, Path, dict[str, Any]]:
@@ -5182,6 +5302,9 @@ def main() -> int:
     _add_common(restoration)
     restoration.add_argument('--user', required=True, metavar='USER')
     restoration.add_argument('--user-unit-directory', metavar='DIR')
+    forgetting = subparsers.add_parser('forget-legacy-system', help='delete the saved legacy system service after a completed migration')
+    _add_common(forgetting)
+    forgetting.add_argument('--user', required=True, metavar='USER')
     legacy_user_stop = subparsers.add_parser('legacy-user-stop', help=argparse.SUPPRESS)
     legacy_user_stop.add_argument('--user', required=True, metavar='USER')
     legacy_user_stop.add_argument('--service-name', required=True, metavar='NAME')
@@ -5190,7 +5313,7 @@ def main() -> int:
     try:
         if args.command == 'legacy-user-stop':
             output = _run_legacy_user_stop(args)
-        elif args.command in ('migrate-legacy-system', 'restore-legacy-system'):
+        elif args.command in ('migrate-legacy-system', 'restore-legacy-system', 'forget-legacy-system'):
             _require_root()
             user = pwd.getpwnam(args.user)
             homebrew = _homebrew_path(args.homebrew)
@@ -5221,6 +5344,8 @@ def main() -> int:
                     fcntl.flock(lock_fd, fcntl.LOCK_EX)
                     if args.command == 'migrate-legacy-system':
                         output = _run_legacy_migration(args)
+                    elif args.command == 'forget-legacy-system':
+                        output = _run_legacy_forget(args)
                     else:
                         output = _run_legacy_restore(args)
                 finally:
