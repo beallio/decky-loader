@@ -1,6 +1,7 @@
 # Root plugin host (design)
 
-Status: design approved on 2026-10-17 (see Decisions). Build in progress.
+Status: phases 1 and 2 built and tested on the SteamOS VM (2026-10-17): the host, opt-in and
+opt-out, folder checks, start and stop, status, and the backend integration. Phases 3 to 5 remain.
 
 ## Goal
 
@@ -47,10 +48,14 @@ Consequences:
      are root-owned and not group or other writable, and that the tree hash matches. A folder that
      `deck` made cannot pass, because `deck` cannot create root-owned files. A swapped root-owned
      folder fails the hash check.
-   - Each root plugin runs in its own mount namespace. The host bind-mounts the checked folder
-     (through its descriptor) read-only over the plugin's normal path in that namespace, with
-     slave propagation so new USB and SD card mounts still appear. A swap after the check does not
-     reach the plugin, including programs that the plugin starts from its `bin/` folder.
+   - Each root plugin runs in its own mount namespace. The checked folder is mounted read-only
+     at a root-owned path, `/var/lib/decky-loader-runtime/root-host/<uid>/mnt/<dir>`, with
+     slave propagation so new USB and SD card mounts still appear. `DECKY_PLUGIN_DIR` and the
+     plugin's `__file__` point there. Linux binds only from mounts in the caller's namespace, so
+     after `unshare` the child opens the public path again and mounts it only if its device and
+     inode match the checked descriptor. A swap after the check does not reach the plugin,
+     including programs that the plugin starts from its `bin/` folder. Python imports go through
+     the checked descriptor as for other plugins.
 3. The root host must not accept plugin code from `deck`. It downloads root plugins itself, only
    from the store hosts on its allow list, and checks the store's SHA-256.
 
@@ -126,9 +131,9 @@ Decky, without following symlinks.
   keeps plugin code and data unless `--purge` is also given.
 - **Start:** the socket unit starts the host when the backend connects. The backend connects only
   if at least one enabled plugin needs root. Without root plugins, no root process runs.
-- **Backend restart or crash:** when the control connection closes, the host stops all root
-  plugins after a 10 s grace period. The backend starts them again when it reconnects. A root
-  plugin never runs without a backend.
+- **Backend restart or crash:** root plugins belong to the control connection that started them.
+  When it closes, the host stops them at once (SIGTERM, then SIGKILL after 5 s). The backend starts
+  them again when it reconnects. A root plugin never runs without a backend.
 - **Host exit:** with no running root plugins and no connection for 60 s, the host exits.
 - **Store install:** the backend sees the `root` flag (store tag and `plugin.json`) and sends
   `install` instead of unpacking the ZIP itself. Uninstall, enable, disable and reload go through
@@ -147,7 +152,7 @@ Decky, without following symlinks.
 
 | | No root plugins enabled | One or more root plugins enabled |
 |---|---|---|
-| Memory | 0 | Root host (Rust, about 2–4 MB) + shared Python host (about 10–11 MB) + the root plugins themselves. About 12–15 MB more than now, estimated, not measured. Correction: an earlier estimate said about 10 MB. |
+| Memory | 0 | The root host process: measured 26.6 MB PSS (6.8 MB private) with one root plugin on the VM, the same as the user service's plugin host. It cannot share pages with the user service, because root runs its own root-owned copy of the runtime. The root plugins themselves cost the same as in any mode. |
 | Idle CPU | 0 | 0; the host waits on sockets and has no timers |
 | Per call | Unchanged | Unchanged: the backend calls the root plugin's socket directly |
 | Disk | 0 | One more runtime copy, about 100 MB |
@@ -166,8 +171,7 @@ Decky, without following symlinks.
    - A swapped root-owned plugin folder (another root plugin's code) fails the hash check.
    - Inside the plugin, its folder is read-only, and a swap of the outside folder after the start
      does not change what the plugin sees.
-4. Backend killed: root plugins stop after the grace period, and start again when the backend
-   returns.
+4. Backend killed: root plugins stop, and start again when the backend returns.
 5. In-app update with a host update, a failed host update, and `--undo`.
 6. Idle: no root process when no root plugins are enabled; 0 CPU while root plugins are idle.
 7. Memory: measure the real cost of the root host for the cost table.

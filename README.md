@@ -2,7 +2,7 @@
 
 Decky Loader adds plugins to the Steam Deck's Gaming Mode. Plugins can [restyle menus](https://github.com/suchmememanyskill/SDH-CssLoader), [change system sounds](https://github.com/EMERALD0874/SDH-AudioLoader), [adjust colors](https://github.com/libvibrant/vibrantDeck), and [more](https://plugins.deckbrew.xyz/).
 
-This fork keeps the normal Decky menus and Python plugins, but replaces the background service with a Rust version. It runs as your normal `deck` account instead of the administrator (root) account. Plugins that need administrator access do not run in this version; Decky shows an error for them instead.
+This fork keeps the normal Decky menus and Python plugins, but replaces the background service with a Rust version. It runs as your normal `deck` account instead of the administrator (root) account. Plugins that need administrator access do not run unless you turn on [root plugin support](#plugins-that-need-administrator-access).
 
 This is not the official Decky Loader. For the official version, see [SteamDeckHomebrew/decky-loader](https://github.com/SteamDeckHomebrew/decky-loader).
 
@@ -63,6 +63,22 @@ bash install-to-deck.sh --forget-legacy
 
 After this, `--restore-legacy` cannot work.
 
+## Plugins that need administrator access
+
+Some plugins, for example PowerTools, need administrator (root) access. By default they do not run, and Decky shows a message for them. To let them run:
+
+```sh
+bash install-to-deck.sh --enable-root-plugins
+```
+
+This installs the current version, asks for your `sudo` password once, and lists the installed plugins that need root. Answer `y` to allow them. Only those plugins run as root, in a separate background service. Decky itself and all other plugins still run as `deck`.
+
+- **Cost:** while at least one root plugin is on, one extra background process uses about 25 MB of memory. With no root plugins, nothing extra runs. It uses no CPU while idle.
+- **Risk:** a plugin that runs as root can change anything on your Deck. Allow only plugins you trust. As in the official Decky, a root plugin keeps its settings in your normal Decky folders.
+- **After you install or update a root plugin,** run the command again to allow the new version.
+
+To turn root plugin support off, run `bash install-to-deck.sh --disable-root-plugins`. Root plugins then stop and become owned by `deck` again.
+
 ## Check status
 
 ```sh
@@ -74,7 +90,8 @@ The output also has a `resources` section. It shows CPU and memory for each plug
 ## Problems
 
 - **Decky does not appear.** Restart the Deck. If it is still missing, run `--status`, then install again.
-- **A plugin shows "Decky could not start".** The plugin needs administrator access or failed to start. Update or remove it in Decky's settings.
+- **A plugin shows "This plugin needs root".** See [Plugins that need administrator access](#plugins-that-need-administrator-access).
+- **A plugin shows "Decky could not start".** The plugin failed to start. Update or remove it in Decky's settings.
 - **Another program uses port 1337 or 8080.** Decky needs these ports. Syncthing often uses 8080; change Syncthing to 8384.
 - **The script stops with a space error.** Free some storage or choose a different `--backup-dir`, then try again. The script stops before it changes anything.
 - **The install fails part way.** The script puts back the previous version automatically. It prints the location of a log file. Attach that file, or the ZIP from [collect-debug-info.sh](scripts/collect-debug-info.sh), when you [report a problem](https://github.com/beallio/decky-loader/issues).
@@ -85,7 +102,7 @@ To install over SSH from a Linux computer, add `--remote HOST`, for example `bas
 
 ## For plugin authors
 
-Plugins work as they do in official Decky, except that they cannot request administrator access. Start with the [plugin template](https://github.com/SteamDeckHomebrew/decky-plugin-template).
+Plugins work as they do in official Decky. Plugins that set the `root` flag run only when the user turns on root plugin support. They see their own folder read-only at the path in `DECKY_PLUGIN_DIR`, and must not write into it. Start with the [plugin template](https://github.com/SteamDeckHomebrew/decky-plugin-template).
 
 This fork also offers a fast JSON encoder to Python plugins:
 

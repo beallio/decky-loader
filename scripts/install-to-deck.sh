@@ -26,6 +26,9 @@ are needed. --bundle is for a saved ZIP and requires --sha256 and --version.
   --migrate-legacy         Explicitly park a legacy system service first
   --restore-legacy         Restore the saved legacy system service
   --forget-legacy          Delete the saved legacy service (no way back after this)
+  --enable-root-plugins    Install, then let plugins that need root run in a
+                           separate root service (asks for sudo once)
+  --disable-root-plugins   Remove that root service; root plugins stop working
   --homebrew DIR           Homebrew directory (default: /home/DECK_USER/homebrew)
   --backup-dir DIR         Homebrew archive directory (default: sibling decky-user-backups)
   --service NAME           Service name (default: plugin_loader)
@@ -1027,6 +1030,7 @@ target_action() {
     migrate_legacy=${10}
     non_interactive=${11}
     backup_directory=${12}
+    root_plugins=${13:-none}
     need realpath
     stage=$(realpath -- "$(dirname -- "${BASH_SOURCE[0]}")")
     need id
@@ -1150,6 +1154,15 @@ PY
         exit 0
     fi
 
+    if [[ $action == disable-root-plugins ]]; then
+        need sudo
+        [[ -f $kit/install.py ]] || fail 'Install the Rust runtime before changing root plugin support'
+        "${sudo_args[@]}" python3 -B "$kit/install.py" disable-root-plugins --homebrew "$homebrew" --user "$user"
+        systemctl --user restart -- "$unit" || fail "Could not restart $unit"
+        printf 'Root plugin support is off. Plugins that need root are owned by %s again and do not run.\n' "$user"
+        exit 0
+    fi
+
     if [[ $action == forget-legacy ]]; then
         need sudo
         legacy_helper=$(protected_legacy_helper) || fail 'No saved legacy service was found'
@@ -1250,12 +1263,50 @@ PY
     installer_transaction_started=0
     legacy_migration_attempted=0
     printf 'Installation complete for %s as %s.\n' "$unit" "$user"
+    if [[ $root_plugins == enable ]]; then
+        enable_root_plugins
+    fi
     exit 0
+}
+
+enable_root_plugins() {
+    need sudo
+    local candidates=() adopt_args=() directory answer
+    mapfile -t candidates < <(python3 - "$homebrew/plugins" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+    try:
+        with open(os.path.join(root, name, 'plugin.json'), 'rb') as handle:
+            flags = json.load(handle).get('flags', [])
+    except (OSError, ValueError, AttributeError):
+        continue
+    if isinstance(flags, list) and 'root' in flags and '\n' not in name:
+        print(name)
+PY
+)
+    if (( ${#candidates[@]} )); then
+        printf 'These installed plugins need root:\n'
+        printf '  %s\n' "${candidates[@]}"
+        printf 'If you allow them, root owns their files and runs them as root. Allow only plugins you trust.\n'
+        answer=y
+        if [[ $non_interactive != true ]]; then
+            [[ -t 0 ]] || fail '--enable-root-plugins needs a terminal to confirm, or --non-interactive'
+            read -r -p 'Allow these plugins to run as root? [y/N] ' answer
+        fi
+        if [[ $answer == [yY]* ]]; then
+            for directory in "${candidates[@]}"; do adopt_args+=(--adopt "$directory"); done
+        fi
+    fi
+    "${sudo_args[@]}" python3 -B "$kit/install.py" enable-root-plugins --bundle "$stage/bundle" \
+        --homebrew "$homebrew" --user "$user" "${adopt_args[@]}"
+    systemctl --user restart -- "$unit" || fail "Could not restart $unit"
+    printf 'Root plugin support is on.\n'
 }
 
 if [[ ${1:-} == --_target ]]; then
     shift
-    [[ $# == 12 ]] || fail 'Invalid internal deployment arguments'
+    [[ $# == 12 || $# == 13 ]] || fail 'Invalid internal deployment arguments'
     stage='' legacy_migration_attempted=0
     legacy_restore_command=()
     target_action "$@"
@@ -1279,6 +1330,7 @@ inject=true
 non_interactive=false
 migrate_legacy=false
 restore_legacy=false
+root_plugins=none
 while (( $# )); do
     case $1 in
         --help|-h) show_help; exit 0 ;;
@@ -1289,6 +1341,10 @@ while (( $# )); do
             [[ $action == install && $restore_legacy == false ]] || fail 'Choose only one operation'
             action=${1#--}; restore_legacy=true; shift ;;
         --migrate-legacy) migrate_legacy=true; shift ;;
+        --enable-root-plugins) root_plugins=enable; shift ;;
+        --disable-root-plugins)
+            [[ $action == install ]] || fail 'Choose only one operation'
+            action=disable-root-plugins; root_plugins=disable; shift ;;
         --non-interactive) non_interactive=true; shift ;;
         --remote|--bundle|--sha256|--version|--channel|--homebrew|--backup-dir|--service|--listen|--cef-url|--inject-frontend)
             (( $# >= 2 )) || fail "Missing value for $1"
@@ -1327,8 +1383,12 @@ if [[ $action == forget-legacy && $non_interactive == false ]]; then
     read -r -p 'Type yes to continue: ' answer
     [[ $answer == yes ]] || fail 'Cancelled; nothing was changed'
 fi
-if [[ $action == status || $action == undo || $action == restore-legacy || $action == forget-legacy ]]; then
-    [[ -z $bundle_archive && -z $expected && -z $version ]] || fail 'Status, undo, and restore operations do not use bundle or release options'
+if [[ $root_plugins == enable && $action != install ]]; then
+    fail '--enable-root-plugins is only valid with installation'
+fi
+if [[ $action == status || $action == undo || $action == restore-legacy || $action == forget-legacy
+        || $action == disable-root-plugins ]]; then
+    [[ -z $bundle_archive && -z $expected && -z $version ]] || fail 'Status, undo, restore, and disable operations do not use bundle or release options'
 fi
 if [[ -n $backup_directory && $action != install && $action != check
         && $action != undo && $action != restore-legacy ]]; then
@@ -1491,7 +1551,7 @@ if [[ -n $remote_host ]]; then
     if [[ $action == install || $action == check ]]; then
         scp "${scp_opts[@]}" -- "$bundle_archive" "$scp_target:$remote_stage/runtime.zip"
     fi
-    target_args=(--_target "$action" "$homebrew" "$user" "$service" "$expected" "$version" "$listen" "$cef" "$inject" "$migrate_legacy" "$non_interactive" "$backup_directory")
+    target_args=(--_target "$action" "$homebrew" "$user" "$service" "$expected" "$version" "$listen" "$cef" "$inject" "$migrate_legacy" "$non_interactive" "$backup_directory" "$root_plugins")
     printf -v command '%q ' bash "$remote_stage/deploy.sh" "${target_args[@]}"
     ssh "${ssh_opts[@]}" "${tty_args[@]}" "$target" "$command"
     exit 0
@@ -1503,5 +1563,5 @@ cp -- "$(realpath -- "${BASH_SOURCE[0]}")" "$local_stage/deploy.sh"
 if [[ $action == install || $action == check ]]; then
     cp -- "$bundle_archive" "$local_stage/runtime.zip"
 fi
-target_args=(--_target "$action" "$homebrew" "$user" "$service" "$expected" "$version" "$listen" "$cef" "$inject" "$migrate_legacy" "$non_interactive" "$backup_directory")
+target_args=(--_target "$action" "$homebrew" "$user" "$service" "$expected" "$version" "$listen" "$cef" "$inject" "$migrate_legacy" "$non_interactive" "$backup_directory" "$root_plugins")
 bash "$local_stage/deploy.sh" "${target_args[@]}"

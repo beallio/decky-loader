@@ -41,6 +41,11 @@ KIND = 'decky-loader-runtime'
 BASELINE_TAG = 'v3.2.10'
 SERVICE_STOP_DIRECTORY = Path('/run/decky-loader-runtime-stops')
 LEGACY_MIGRATION_ROOT = Path('/var/lib/decky-loader-runtime/legacy-migrations')
+ROOT_HOST_STATE = Path('/var/lib/decky-loader-runtime/root-host')
+ROOT_HOST_RUN = Path('/run/decky-loader-runtime')
+ROOT_HOST_UNIT_DIRECTORY = Path('/etc/systemd/system')
+ROOT_HOST_PROTOCOL = 1
+ROOT_HOST_STORE_HOSTS = ('plugins.deckbrew.xyz', 'cdn.tzatzikiweeb.moe')
 SYSTEMCTL_CANDIDATES = (Path('/usr/bin/systemctl'), Path('/bin/systemctl'))
 DEFAULT_LISTEN = '127.0.0.1:1337'
 DEFAULT_CEF_URL = 'http://127.0.0.1:8080'
@@ -5427,6 +5432,289 @@ def _remove_legacy_dropins(record: dict[str, Any], unit_name: str) -> None:
             pass
 
 
+# Root plugin host (docs/root-plugin-host.md). Root plugins run in a separate,
+# socket-activated system service; everything else stays in the user service.
+
+def _root_host_unit_name(user: pwd.struct_passwd) -> str:
+    return f'decky-root-plugins-{user.pw_name}'
+
+
+def _root_host_units(user: pwd.struct_passwd, group: str, runtime: Path, config: Path) -> dict[str, str]:
+    """The socket and service unit files, by file name."""
+    for path in (runtime, config):
+        if not re.fullmatch(r'/[A-Za-z0-9._/-]+', str(path)):
+            _fail(f'root host path has unsupported characters: {path}')
+    name = _root_host_unit_name(user)
+    socket_path = ROOT_HOST_RUN / str(user.pw_uid) / 'root-host.sock'
+    return {
+        f'{name}.socket': (
+            '[Unit]\n'
+            f'Description=Decky Loader root plugin host socket for {user.pw_name}\n\n'
+            '[Socket]\n'
+            f'ListenStream={socket_path}\n'
+            f'SocketUser={user.pw_name}\n'
+            f'SocketGroup={group}\n'
+            'SocketMode=0600\n'
+            'DirectoryMode=0711\n'
+            'RemoveOnStop=yes\n'
+            'Accept=no\n\n'
+            '[Install]\n'
+            'WantedBy=sockets.target\n'
+        ),
+        f'{name}.service': (
+            '[Unit]\n'
+            f'Description=Decky Loader root plugin host for {user.pw_name}\n'
+            f'Requires={name}.socket\n'
+            f'After={name}.socket\n\n'
+            '[Service]\n'
+            'Type=simple\n'
+            f'ExecStart={runtime / WORKER_EXECUTABLE} --root-host --config {config}\n'
+            'KillMode=control-group\n'
+            'Restart=no\n'
+        ),
+    }
+
+
+def _root_directory(path: Path, mode: int) -> None:
+    """Create or check a folder that only root can change."""
+    try:
+        path.mkdir(mode=mode)
+    except FileExistsError:
+        pass
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
+        _fail(f'{path} must be a root-owned folder')
+    os.chmod(path, mode)
+
+
+def _change_tree_owner(directory_fd: int, uid: int, gid: int, *, clear_group_other_write: bool) -> None:
+    """Give a plugin folder tree to uid:gid without following links.
+
+    Each item is changed through its own descriptor, so a renamed or replaced
+    item cannot redirect the change. Regular files with more than one link are
+    refused: they could be another file outside the folder.
+    """
+    def adjust(descriptor: int) -> None:
+        info = os.fstat(descriptor)
+        os.fchown(descriptor, uid, gid)
+        mode = stat.S_IMODE(info.st_mode) & ~0o6000
+        if clear_group_other_write:
+            mode &= ~0o022
+        os.fchmod(descriptor, mode)
+
+    adjust(directory_fd)
+    with os.scandir(directory_fd) as entries:
+        names = [entry.name for entry in entries]
+    for name in names:
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode):
+            os.chown(name, uid, gid, dir_fd=directory_fd, follow_symlinks=False)
+        elif stat.S_ISDIR(info.st_mode):
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
+            try:
+                _change_tree_owner(child, uid, gid, clear_group_other_write=clear_group_other_write)
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(info.st_mode):
+            child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory_fd)
+            try:
+                opened = os.fstat(child)
+                if opened.st_nlink != 1 or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    _fail(f'plugin file has extra links or changed while it was adopted: {name}')
+                adjust(child)
+            finally:
+                os.close(child)
+        else:
+            _fail(f'plugin folder contains an unsupported item: {name}')
+
+
+def _open_plugin_directory(homebrew: Path, directory: str) -> int:
+    if directory in ('', '.', '..') or '/' in directory:
+        _fail(f'plugin folder must be a plain name: {directory!r}')
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    root = os.open(homebrew / 'plugins', flags)
+    try:
+        return os.open(directory, flags, dir_fd=root)
+    finally:
+        os.close(root)
+
+
+def _plugin_requires_root(directory_fd: int) -> bool:
+    descriptor = os.open('plugin.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory_fd)
+    with os.fdopen(descriptor, 'rb') as stream:
+        metadata = json.loads(stream.read(1 << 20))
+    flags = metadata.get('flags') if isinstance(metadata, dict) else None
+    return isinstance(flags, list) and 'root' in flags
+
+
+def _root_host_tree_hash(runtime: Path, homebrew: Path, directory: str) -> dict[str, Any]:
+    result = subprocess.run(
+        [str(runtime / WORKER_EXECUTABLE), '--root-host-admin', 'tree-hash', '--directory', str(homebrew / 'plugins' / directory)],
+        check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+        env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'HOME': '/root'}, cwd='/',
+    )
+    if result.returncode:
+        _fail(f'could not check root plugin {directory}: {result.stderr.strip() or result.stdout.strip()}')
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise InstallerError(f'root plugin check returned invalid JSON for {directory}') from error
+    if not isinstance(value, dict) or not re.fullmatch(r'[0-9a-f]{64}', str(value.get('tree_sha256'))):
+        _fail(f'root plugin check returned no tree hash for {directory}')
+    return {'name': value.get('name'), 'version': value.get('version'), 'tree_sha256': value['tree_sha256']}
+
+
+def _read_root_host_json(path: Path) -> dict[str, Any] | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        _fail(f'{path} must be a root-owned file that only root can change')
+    value = _read_json(path)
+    return value if isinstance(value, dict) else None
+
+
+def _run_enable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
+    _require_root()
+    user = pwd.getpwnam(args.user)
+    if user.pw_uid == 0 or user.pw_name != args.user:
+        _fail('--user must name the non-root account that runs Decky')
+    import grp
+
+    group = grp.getgrgid(user.pw_gid).gr_name
+    homebrew = _homebrew_path(args.homebrew)
+    state = ROOT_HOST_STATE / str(user.pw_uid)
+    paths: dict[str, Any] = {'unit': Path(f'{_root_host_unit_name(user)}.socket'), 'scope': 'system'}
+    created: list[Path] = []
+    adopted: list[str] = []
+    try:
+        for path in (ROOT_HOST_STATE.parent, ROOT_HOST_STATE, state, state / 'runtimes'):
+            if not path.exists():
+                created.append(path)
+            _root_directory(path, 0o755)
+
+        # Copy first, then check the copy: the user can change the source bundle.
+        stage = state / 'runtimes' / f'.stage-{uuid.uuid4().hex}'
+        created.append(stage)
+        shutil.copytree(Path(args.bundle), stage, symlinks=True, copy_function=shutil.copy2)
+        stage_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            _change_tree_owner(stage_fd, 0, 0, clear_group_other_write=True)
+        finally:
+            os.close(stage_fd)
+        _, manifest = _validate_bundle(str(stage), user)
+        runtime_id = _digest(stage / 'bundle.json')[:24]
+        runtime = state / 'runtimes' / runtime_id
+        if runtime.exists():
+            shutil.rmtree(stage)
+        else:
+            stage.rename(runtime)
+            created.append(runtime)
+        created.remove(stage)
+        _validate_bundle(str(runtime), user)
+        _verify_runtime(runtime, manifest, user, runtime / RUST_EXECUTABLE)
+
+        config = state / 'config.json'
+        _write_json(config, {
+            'protocol': ROOT_HOST_PROTOCOL, 'user': user.pw_name, 'uid': user.pw_uid, 'gid': user.pw_gid,
+            'homebrew': str(homebrew), 'runtime': runtime_id, 'release_version': manifest.get('release_version'),
+            'store_hosts': list(ROOT_HOST_STORE_HOSTS),
+        }, 0o644)
+
+        plugins: dict[str, Any] = dict((_read_root_host_json(state / 'state.json') or {}).get('plugins') or {})
+        for directory in args.adopt or ():
+            directory_fd = _open_plugin_directory(homebrew, directory)
+            try:
+                if not _plugin_requires_root(directory_fd):
+                    _fail(f'{directory} is not marked as a plugin that needs root')
+                adopted.append(directory)
+                _change_tree_owner(directory_fd, 0, 0, clear_group_other_write=True)
+            finally:
+                os.close(directory_fd)
+            plugins[directory] = _root_host_tree_hash(runtime, homebrew, directory)
+        _write_json(state / 'state.json', {'plugins': plugins}, 0o644)
+
+        for name, text in _root_host_units(user, group, runtime, config).items():
+            _write_atomic(ROOT_HOST_UNIT_DIRECTORY / name, text.encode(), 0o644)
+        _systemctl(paths, 'daemon-reload')
+        service = f'{_root_host_unit_name(user)}.service'
+        # A running host keeps its old runtime until it stops; it holds no state.
+        _systemctl(paths, 'stop', service, check=False)
+        _systemctl(paths, 'enable', '--now', paths['unit'].name)
+    except BaseException:
+        for directory in adopted:
+            try:
+                directory_fd = _open_plugin_directory(homebrew, directory)
+                try:
+                    _change_tree_owner(directory_fd, user.pw_uid, user.pw_gid, clear_group_other_write=False)
+                finally:
+                    os.close(directory_fd)
+            except (OSError, InstallerError):
+                pass
+        for path in reversed(created):
+            shutil.rmtree(path, ignore_errors=True)
+        raise
+    return {
+        'ok': True, 'root_host': 'enabled', 'runtime': runtime_id, 'adopted': adopted,
+        'plugins': sorted(plugins), 'socket': str(ROOT_HOST_RUN / str(user.pw_uid) / 'root-host.sock'),
+    }
+
+
+def _run_disable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
+    _require_root()
+    user = pwd.getpwnam(args.user)
+    if user.pw_uid == 0 or user.pw_name != args.user:
+        _fail('--user must name the non-root account that runs Decky')
+    homebrew = _homebrew_path(args.homebrew)
+    state = ROOT_HOST_STATE / str(user.pw_uid)
+    name = _root_host_unit_name(user)
+    paths: dict[str, Any] = {'unit': Path(f'{name}.socket'), 'scope': 'system'}
+    _systemctl(paths, 'disable', '--now', f'{name}.socket', check=False)
+    _systemctl(paths, 'stop', f'{name}.service', check=False)
+    for unit in (f'{name}.socket', f'{name}.service'):
+        (ROOT_HOST_UNIT_DIRECTORY / unit).unlink(missing_ok=True)
+    _systemctl(paths, 'daemon-reload')
+    returned: list[str] = []
+    plugins = (_read_root_host_json(state / 'state.json') or {}).get('plugins') or {}
+    for directory in sorted(plugins):
+        try:
+            directory_fd = _open_plugin_directory(homebrew, directory)
+        except FileNotFoundError:
+            continue
+        try:
+            _change_tree_owner(directory_fd, user.pw_uid, user.pw_gid, clear_group_other_write=False)
+        finally:
+            os.close(directory_fd)
+        returned.append(directory)
+    shutil.rmtree(state, ignore_errors=True)
+    shutil.rmtree(ROOT_HOST_RUN / str(user.pw_uid), ignore_errors=True)
+    return {'ok': True, 'root_host': 'disabled', 'returned_to_user': returned}
+
+
+def _root_host_status(user: pwd.struct_passwd) -> dict[str, object]:
+    state = ROOT_HOST_STATE / str(user.pw_uid)
+    config = _read_root_host_json(state / 'config.json')
+    if config is None:
+        return {'enabled': False}
+    plugins = (_read_root_host_json(state / 'state.json') or {}).get('plugins') or {}
+    name = _root_host_unit_name(user)
+    paths: dict[str, Any] = {'unit': Path(f'{name}.socket'), 'scope': 'system'}
+    states = {}
+    for unit in (f'{name}.socket', f'{name}.service'):
+        result = _systemctl(paths, 'show', unit, '-p', 'ActiveState', '-p', 'MainPID', check=False)
+        states[unit] = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+    return {
+        'enabled': True,
+        'runtime': config.get('runtime'),
+        'release_version': config.get('release_version'),
+        'socket': states[f'{name}.socket'].get('ActiveState'),
+        'host': states[f'{name}.service'].get('ActiveState'),
+        'host_pid': int(states[f'{name}.service'].get('MainPID') or 0) or None,
+        'plugins': {directory: entry.get('name') for directory, entry in sorted(plugins.items()) if isinstance(entry, dict)},
+    }
+
+
 def _verify_bundle(args: argparse.Namespace) -> tuple[pwd.struct_passwd, Path, str, Path, dict[str, Any]]:
     user = pwd.getpwnam(args.user)
     _require_user(user)
@@ -5606,10 +5894,22 @@ def main() -> int:
     legacy_user_stop.add_argument('--user', required=True, metavar='USER')
     legacy_user_stop.add_argument('--service-name', required=True, metavar='NAME')
     legacy_user_stop.add_argument('--user-unit-directory', required=True, metavar='DIR')
+    enable_root = subparsers.add_parser('enable-root-plugins', help='run plugins that need root in a separate root service (root only)')
+    enable_root.add_argument('--bundle', required=True, metavar='DIR')
+    enable_root.add_argument('--homebrew', required=True, metavar='DIR')
+    enable_root.add_argument('--user', required=True, metavar='USER')
+    enable_root.add_argument('--adopt', action='append', metavar='FOLDER', help='approve this installed plugin folder; it becomes owned by root')
+    disable_root = subparsers.add_parser('disable-root-plugins', help='remove the root plugin service and give root plugins back to the user (root only)')
+    disable_root.add_argument('--homebrew', required=True, metavar='DIR')
+    disable_root.add_argument('--user', required=True, metavar='USER')
     args = parser.parse_args()
     try:
         if args.command == 'legacy-user-stop':
             output = _run_legacy_user_stop(args)
+        elif args.command == 'enable-root-plugins':
+            output = _run_enable_root_plugins(args)
+        elif args.command == 'disable-root-plugins':
+            output = _run_disable_root_plugins(args)
         elif args.command in ('migrate-legacy-system', 'restore-legacy-system', 'forget-legacy-system'):
             _require_root()
             user = pwd.getpwnam(args.user)
@@ -5710,6 +6010,7 @@ def main() -> int:
                     os.close(descriptor)
                 if args.command == 'status':
                     output['resources'] = _service_resources(paths, args.sample_seconds)
+                    output['root_host'] = _root_host_status(user)
         print(json.dumps(output, sort_keys=True))
         return 0
     except (InstallerError, OSError, KeyError, ValueError) as error:
