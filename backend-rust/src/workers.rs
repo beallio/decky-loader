@@ -47,6 +47,8 @@ use crate::{
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+// Quiet time after the last directory attribute change before a refused plugin is retried.
+const OWNERSHIP_RETRY_DEBOUNCE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerError {
@@ -991,6 +993,8 @@ impl PluginRegistry {
     }
 
     pub async fn start_live_reload(self: &Arc<Self>) -> std::result::Result<(), WorkerError> {
+        // LIVE_RELOAD=0 turns off the whole watcher, including the retry of plugins
+        // refused for their directory owner (benchmarks rely on a quiet backend).
         if std::env::var("LIVE_RELOAD").is_ok_and(|value| value != "1") {
             return Ok(());
         }
@@ -1009,6 +1013,40 @@ impl PluginRegistry {
             live_reload_notify,
         )));
         Ok(())
+    }
+
+    /// Loads again each plugin that was refused because of its directory owner,
+    /// if `changes` names its directory. Other plugins are not touched.
+    async fn retry_ownership_failed(&self, changes: &AttributeChanges) {
+        let entries = self
+            .plugins
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut candidates = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let error = entry.runtime.lock().await.start_error.clone();
+            candidates.push((
+                entry.metadata.name.clone(),
+                entry.metadata.directory.clone(),
+                error,
+            ));
+        }
+        for name in ownership_retry_targets(&candidates, changes) {
+            match self.reload(&name).await {
+                Ok(()) | Err(WorkerError::Stopped) => {}
+                Err(WorkerError::Error(message)) => {
+                    // Keep the new reason. A plugin that now fails for another
+                    // reason is not retried again, which stops a retry loop.
+                    let entry = self.plugins.read().await.get(&name).cloned();
+                    if let Some(entry) = entry {
+                        entry.runtime.lock().await.start_error = Some(message);
+                    }
+                }
+            }
+        }
     }
 
     pub async fn shutdown(&self) {
@@ -1444,6 +1482,17 @@ fn read_plugin_metadata_from_fd(
     })
 }
 
+fn plugin_ownership_error(directory_path: &Path, owner_uid: u32, service_uid: u32) -> String {
+    format!(
+        "Plugin directory {} is owned by uid {owner_uid}, not the service user (uid {service_uid}); change its owner to the service user",
+        directory_path.display()
+    )
+}
+
+fn is_plugin_ownership_error(message: &str) -> bool {
+    message.starts_with("Plugin directory ") && message.contains(" is owned by uid ")
+}
+
 fn set_plugin_permissions_on_approved(
     directory_fd: &OwnedFd,
     directory_path: &Path,
@@ -1481,11 +1530,10 @@ fn set_plugin_permissions_on_approved(
         })?;
         if owner.st_uid != effective_user_ids.0 {
             // A previous root loader leaves plugin directories owned by root.
-            return Err(WorkerError::Error(format!(
-                "Plugin directory {} is owned by uid {}, not the service user (uid {}); change its owner to the service user",
-                directory_path.display(),
+            return Err(WorkerError::Error(plugin_ownership_error(
+                directory_path,
                 owner.st_uid,
-                effective_user_ids.0
+                effective_user_ids.0,
             )));
         }
     }
@@ -2227,7 +2275,7 @@ impl InotifyWatcher {
     }
 
     fn add_watch(&mut self, directory: &Path) -> io::Result<()> {
-        let mask = libc::IN_CREATE
+        let mut mask = libc::IN_CREATE
             | libc::IN_CLOSE_WRITE
             | libc::IN_MOVED_TO
             | libc::IN_DELETE
@@ -2236,6 +2284,11 @@ impl InotifyWatcher {
             | libc::IN_MOVE_SELF
             | libc::IN_ONLYDIR
             | libc::IN_DONT_FOLLOW;
+        // Owner changes matter only on the plugin root, the plugin directories and
+        // their direct entries. Deeper directories do not need the extra events.
+        if directory == self.plugin_root || directory.parent() == Some(self.plugin_root.as_path()) {
+            mask |= libc::IN_ATTRIB;
+        }
         let watch_descriptor =
             platform::inotify_add_watch(self.fd.get_ref().as_fd(), directory, mask)?;
         self.watched_directories
@@ -2336,8 +2389,12 @@ impl InotifyWatcher {
         }
     }
 
-    fn affected_plugins(&mut self, events: Vec<InotifyEvent>) -> io::Result<Vec<String>> {
+    fn affected_plugins(
+        &mut self,
+        events: Vec<InotifyEvent>,
+    ) -> io::Result<(Vec<String>, AttributeChanges)> {
         let mut changed = HashSet::new();
+        let mut attributes = AttributeChanges::default();
         let mut rebuild = false;
         for event in events {
             if event.mask & libc::IN_Q_OVERFLOW != 0 {
@@ -2358,6 +2415,7 @@ impl InotifyWatcher {
             let path = event
                 .name
                 .map_or_else(|| directory.clone(), |name| directory.join(name));
+            attributes.record(&self.plugin_root, &path, event.mask);
             let is_directory = event.mask & libc::IN_ISDIR != 0;
             if event.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0
                 && path != self.plugin_root
@@ -2387,7 +2445,7 @@ impl InotifyWatcher {
         }
         let mut changed = changed.into_iter().collect::<Vec<_>>();
         changed.sort_unstable();
-        Ok(changed)
+        Ok((changed, attributes))
     }
 }
 const INOTIFY_EVENT_HEADER_SIZE: usize =
@@ -2484,6 +2542,73 @@ fn changed_plugin_directory(plugin_root: &Path, source: &Path) -> Option<String>
     }
 }
 
+/// Directories whose attributes changed, as seen by the plugin root watcher.
+#[derive(Default)]
+struct AttributeChanges {
+    plugin_root: bool,
+    directories: HashSet<String>,
+}
+
+impl AttributeChanges {
+    fn everything() -> Self {
+        Self {
+            plugin_root: true,
+            directories: HashSet::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.plugin_root && self.directories.is_empty()
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.plugin_root |= other.plugin_root;
+        self.directories.extend(other.directories);
+    }
+
+    /// Records an event on `path`: the plugin root itself, a plugin directory, or
+    /// an entry inside a plugin directory.
+    fn record(&mut self, plugin_root: &Path, path: &Path, mask: u32) {
+        if mask & libc::IN_ATTRIB == 0 {
+            return;
+        }
+        if path == plugin_root {
+            self.plugin_root = true;
+            return;
+        }
+        let Ok(relative) = path.strip_prefix(plugin_root) else {
+            return;
+        };
+        if let Some(Component::Normal(directory)) = relative.components().next()
+            && let Some(directory) = directory.to_str()
+            && !directory.starts_with('.')
+        {
+            self.directories.insert(directory.to_owned());
+        }
+    }
+
+    fn covers(&self, directory: &str) -> bool {
+        self.plugin_root || self.directories.contains(directory)
+    }
+}
+
+/// Names of the plugins to load again: refused for their owner, and named by
+/// `changes`. Each candidate is (name, directory, start error).
+fn ownership_retry_targets(
+    candidates: &[(String, String, Option<String>)],
+    changes: &AttributeChanges,
+) -> Vec<String> {
+    let mut targets = candidates
+        .iter()
+        .filter(|(_, directory, error)| {
+            changes.covers(directory) && error.as_deref().is_some_and(is_plugin_ownership_error)
+        })
+        .map(|(name, _, _)| name.clone())
+        .collect::<Vec<_>>();
+    targets.sort_unstable();
+    targets
+}
+
 async fn live_reload_loop(
     plugin_root: PathBuf,
     registry: Weak<PluginRegistry>,
@@ -2511,6 +2636,16 @@ async fn live_reload_loop(
             return;
         }
     };
+    // An owner change made before the watcher existed leaves no event to wait for.
+    match registry.upgrade() {
+        Some(owner) => {
+            owner
+                .retry_ownership_failed(&AttributeChanges::everything())
+                .await
+        }
+        None => return,
+    }
+    let mut pending_attributes = AttributeChanges::default();
     loop {
         let events = tokio::select! {
             biased;
@@ -2528,6 +2663,20 @@ async fn live_reload_loop(
                     return;
                 }
             },
+            _ = sleep(OWNERSHIP_RETRY_DEBOUNCE), if !pending_attributes.is_empty() => {
+                let Some(owner) = registry.upgrade() else {
+                    return;
+                };
+                if owner.shutting_down.load(Ordering::Acquire) {
+                    return;
+                }
+                if owner.live_reload_paused.load(Ordering::Acquire) == 0 {
+                    owner
+                        .retry_ownership_failed(&std::mem::take(&mut pending_attributes))
+                        .await;
+                }
+                continue;
+            }
         };
         let Some(owner) = registry.upgrade() else {
             return;
@@ -2551,13 +2700,14 @@ async fn live_reload_loop(
             continue;
         };
 
-        let changed_plugins = match watcher.affected_plugins(events) {
+        let (changed_plugins, attributes) = match watcher.affected_plugins(events) {
             Ok(changed) => changed,
             Err(error) => {
                 eprintln!("Could not update plugin live reload watches: {error}");
                 return;
             }
         };
+        pending_attributes.merge(attributes);
         for directory in changed_plugins {
             if !plugin_root.join(&directory).is_dir() {
                 continue;
@@ -3305,5 +3455,91 @@ mod launcher_failure_tests {
         completed.unwrap().unwrap();
         assert!(registry.shutting_down.load(Ordering::Acquire));
         assert!(!socket_directory.exists());
+    }
+}
+
+#[cfg(test)]
+mod ownership_retry_tests {
+    use super::*;
+
+    fn candidate(
+        name: &str,
+        directory: &str,
+        error: Option<String>,
+    ) -> (String, String, Option<String>) {
+        (name.to_owned(), directory.to_owned(), error)
+    }
+
+    fn ownership(directory: &str) -> Option<String> {
+        Some(plugin_ownership_error(Path::new(directory), 0, 1000))
+    }
+
+    fn changes(events: &[(&str, u32)]) -> AttributeChanges {
+        let root = Path::new("/plugins");
+        let mut changes = AttributeChanges::default();
+        for (path, mask) in events {
+            changes.record(root, Path::new(path), *mask);
+        }
+        changes
+    }
+
+    #[test]
+    fn attribute_events_name_the_plugin_directory() {
+        let attrib = libc::IN_ATTRIB;
+        let changed = changes(&[
+            ("/plugins/alpha", attrib | libc::IN_ISDIR),
+            ("/plugins/beta/main.py", attrib),
+            ("/plugins/.hidden", attrib),
+            ("/elsewhere/gamma", attrib),
+            ("/plugins/delta", libc::IN_CLOSE_WRITE),
+        ]);
+        assert!(!changed.plugin_root);
+        assert!(changed.covers("alpha"));
+        assert!(changed.covers("beta"));
+        assert!(!changed.covers(".hidden"));
+        assert!(!changed.covers("gamma"));
+        assert!(!changed.covers("delta"));
+        assert!(changes(&[("/plugins", attrib)]).plugin_root);
+        assert!(changes(&[("/plugins/alpha", libc::IN_CREATE)]).is_empty());
+    }
+
+    #[test]
+    fn only_plugins_refused_for_their_owner_are_retried() {
+        let candidates = [
+            candidate("Refused", "refused", ownership("/plugins/refused")),
+            candidate(
+                "Also Refused",
+                "also-refused",
+                ownership("/plugins/also-refused"),
+            ),
+            candidate("Healthy", "healthy", None),
+            candidate(
+                "Other Failure",
+                "other",
+                Some("Could not update plugin directory permissions".to_owned()),
+            ),
+        ];
+        let attrib = libc::IN_ATTRIB;
+
+        assert_eq!(
+            ownership_retry_targets(&candidates, &changes(&[("/plugins/refused", attrib)])),
+            ["Refused"]
+        );
+        assert_eq!(
+            ownership_retry_targets(&candidates, &changes(&[("/plugins/healthy", attrib)])),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ownership_retry_targets(&candidates, &changes(&[("/plugins/other", attrib)])),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ownership_retry_targets(&candidates, &changes(&[("/plugins", attrib)])),
+            ["Also Refused", "Refused"]
+        );
+        assert_eq!(
+            ownership_retry_targets(&candidates, &AttributeChanges::default()),
+            Vec::<String>::new()
+        );
     }
 }
