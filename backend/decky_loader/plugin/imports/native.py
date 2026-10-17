@@ -25,4 +25,7 @@ def dumps(value: object, *, ensure_ascii: bool = True) -> str:
             "the loaded _decky_native_json extension is incompatible: "
             "it does not provide callable dumps"
         )
-    return dumps_impl(value, ensure_ascii=ensure_ascii)
+    result = dumps_impl(value, ensure_ascii=ensure_ascii)
+    if not isinstance(result, str):
+        raise TypeError("the loaded _decky_native_json extension returned a non-string value")
+    return result
