@@ -78,12 +78,23 @@ export async function getStoreBaseURL(): Promise<string> {
   return storeURL;
 }
 
+// Fork: store data goes through the backend's authenticated /fetch proxy. A browser fetch
+// with X-Decky-Version needs a CORS preflight, which static hosts such as GitHub Pages refuse.
+async function storeFetch(url: string): Promise<Response> {
+  const version = await window.DeckyPluginLoader.updateVersion();
+  return window.DeckyPluginLoader.fetchNoCors(url, {
+    method: 'GET',
+    headers: {
+      'X-Decky-Version': version.current,
+    },
+    excludedHeaders: [],
+  });
+}
+
 export async function getPluginList(
   sort_by: SortOptions | null = null,
   sort_direction: SortDirections | null = null,
 ): Promise<StorePlugin[]> {
-  let version = await window.DeckyPluginLoader.updateVersion();
-
   let query: URLSearchParams | string = new URLSearchParams();
   sort_by && query.set('sort_by', sort_by);
   sort_direction && query.set('sort_direction', sort_direction);
@@ -91,26 +102,14 @@ export async function getPluginList(
 
   const storeURL = await getStoreBaseURL();
 
-  return fetch(storeURL + query, {
-    method: 'GET',
-    headers: {
-      'X-Decky-Version': version.current,
-    },
-  }).then((r) => r.json());
+  return storeFetch(storeURL + query).then((r) => r.json());
 }
 
 export async function getVersionList(): Promise<UpdateEndpointVersions> {
-  let version = await window.DeckyPluginLoader.updateVersion();
-
   const storeURL = await getStoreBaseURL();
 
   try {
-    const response = await fetch(storeURL + '/versions', {
-      method: 'GET',
-      headers: {
-        'X-Decky-Version': version.current,
-      },
-    });
+    const response = await storeFetch(storeURL + '/versions');
     if (response.ok) {
       const versions = await response.json();
       if (versions && typeof versions === 'object' && !Array.isArray(versions)) return versions;
