@@ -58,7 +58,7 @@ def digest(path: Path) -> str:
 
 
 def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path, release_version: str,
-            *, build_provenance: dict | None = None) -> dict:
+            *, build_provenance: dict | None = None, source_root: Path = REPO) -> dict:
     if not release_version or any(ord(character) < 32 or ord(character) == 127 for character in release_version):
         raise ValueError('release version must be a non-empty printable identifier')
     for executable in (worker, rust):
@@ -130,8 +130,8 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
             for path in (bundle / '_internal').rglob('*'):
                 path.chmod(0o755)
         shutil.copy2(rust, bundle / 'decky-loader-runtime')
-        shutil.copy2(BACKEND_RUST / 'install.py', bundle / 'install.py')
-        shutil.copy2(BACKEND_RUST / 'process_observer.py', bundle / 'process_observer.py')
+        shutil.copy2(source_root / 'backend-rust/install.py', bundle / 'install.py')
+        shutil.copy2(source_root / 'backend-rust/process_observer.py', bundle / 'process_observer.py')
         shutil.copytree(assets, bundle / 'assets')
         shutil.copytree(locales, bundle / 'locales')
         manifest = {
@@ -164,7 +164,7 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
             (plugin / 'package.json').write_text(json.dumps(package))
         for script in ('verify.py', 'validate_user.py'):
             shutil.copy2(HERE / 'validation' / script, staging / script)
-        shutil.copy2(BACKEND_RUST / 'process_observer.py', staging / 'process_observer.py')
+        shutil.copy2(source_root / 'backend-rust/process_observer.py', staging / 'process_observer.py')
         staging.rename(output)
     return {'output': str(output), 'files': len(manifest['sha256']), 'runtime': runtime, 'source_baseline': source_baseline}
 

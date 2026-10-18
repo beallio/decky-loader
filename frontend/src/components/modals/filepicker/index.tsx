@@ -181,6 +181,7 @@ const FilePicker: FunctionComponent<FilePickerProps> = ({
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
       setLoading(true);
       try {
@@ -195,6 +196,7 @@ const FilePicker: FunctionComponent<FilePickerProps> = ({
           page,
           max,
         );
+        if (cancelled) return;
         // The backend may list another folder: home for an empty path, the parent for a file.
         if (listing.realpath !== path) setPath(listing.realpath);
         setRawError(null);
@@ -204,6 +206,7 @@ const FilePicker: FunctionComponent<FilePickerProps> = ({
         setListing(listing);
         logger.log('reloaded', path, listing);
       } catch (theError: any) {
+        if (cancelled) return;
         setListing({ files: [], realpath: path, total: 0 });
         setLoading(false);
         switch (theError) {
@@ -223,6 +226,9 @@ const FilePicker: FunctionComponent<FilePickerProps> = ({
         return;
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, [error, path, includeFiles, includeFolders, showHidden, sort, selectedExts, page]);
 
   return (

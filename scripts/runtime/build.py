@@ -153,7 +153,7 @@ def build(output: Path, release_version: str, python_archive: Path | None) -> di
         result = prepare(work / 'worker-dist/DeckyPluginWorker/DeckyPluginWorker',
                          work / f'cargo-target/release/{RUNTIME_NAME}',
                          source / 'backend/decky_loader/static', source / 'backend/decky_loader/locales',
-                         output, release_version, build_provenance=provenance)
+                         output, release_version, build_provenance=provenance, source_root=source)
     artifact = output / f'{ARTIFACT_NAME}.zip'
     bundle = output / 'bundle'
     with zipfile.ZipFile(artifact, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
