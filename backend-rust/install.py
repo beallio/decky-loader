@@ -73,6 +73,11 @@ def _fail(message: str) -> NoReturn:
     raise InstallerError(message)
 
 
+def _require_system_python() -> None:
+    if sys.version_info < (3, 11):
+        _fail('Python 3.11 or newer is required')
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
     try:
@@ -109,11 +114,8 @@ def _write_json(path: Path, value: object, mode: int = 0o600) -> None:
 
 def _write_json_exclusive(path: Path, value: object, mode: int = 0o600) -> bool:
     data = (json.dumps(value, sort_keys=True, indent=2) + '\n').encode('utf-8')
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
-    try:
-        descriptor = os.open(path, flags, mode)
-    except FileExistsError:
-        return False
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.tmp', dir=path.parent)
+    temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, 'wb') as stream:
@@ -121,13 +123,19 @@ def _write_json_exclusive(path: Path, value: object, mode: int = 0o600) -> bool:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        temporary.unlink()
         _fsync_directory(path.parent)
         return True
     except BaseException:
         if descriptor >= 0:
             os.close(descriptor)
-        path.unlink(missing_ok=True)
         raise
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1180,6 +1188,7 @@ def _make_runtime(bundle: Path, manifest: dict[str, Any], paths: dict[str, Path]
                 copied = staging / relative
                 if not copied.is_file() or _digest(copied) != expected:
                     _fail(f'copied runtime checksum mismatch: {relative}')
+        _sync_bundle_tree(staging)
         return staging, final
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
@@ -5662,7 +5671,11 @@ def _adopt_root_plugin(runtime: Path, homebrew: Path, directory: str, user: pwd.
             os.close(source_fd)
         old = f'.decky-root-old-{uuid.uuid4().hex}'
         os.rename(directory, old, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
-        os.rename(stage, directory, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+        try:
+            os.rename(stage, directory, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+        except BaseException:
+            os.rename(old, directory, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+            raise
         stage = ''
         shutil.rmtree(old, dir_fd=plugins_fd, ignore_errors=True)
         return approved
@@ -5725,16 +5738,36 @@ def _write_root_host_files(user: pwd.struct_passwd, homebrew: Path, state: Path,
 
     config = state / 'config.json'
     previous = _read_root_host_json(config) or {}
-    _write_json(config, {
-        'protocol': ROOT_HOST_PROTOCOL, 'user': user.pw_name, 'uid': user.pw_uid, 'gid': user.pw_gid,
-        'homebrew': str(homebrew), 'runtime': runtime.name, 'release_version': manifest.get('release_version'),
-        'store_hosts': list(ROOT_HOST_STORE_HOSTS),
-        'release_repository': previous.get('release_repository') or DEFAULT_RELEASE_REPOSITORY,
-    }, 0o644)
     group = grp.getgrgid(user.pw_gid).gr_name
-    for name, text in _root_host_units(user, group, runtime, config).items():
-        _write_atomic(ROOT_HOST_UNIT_DIRECTORY / name, text.encode(), 0o644)
-    _systemctl({'unit': Path(f'{_root_host_unit_name(user)}.socket'), 'scope': 'system'}, 'daemon-reload')
+    unit_files = {
+        ROOT_HOST_UNIT_DIRECTORY / name: text.encode()
+        for name, text in _root_host_units(user, group, runtime, config).items()
+    }
+    targets = (config, *unit_files)
+    snapshots: dict[Path, tuple[bytes, int] | None] = {}
+    for path in targets:
+        info = _lstat_regular_or_absent(path)
+        snapshots[path] = None if info is None else (path.read_bytes(), stat.S_IMODE(info.st_mode))
+    try:
+        _write_json(config, {
+            'protocol': ROOT_HOST_PROTOCOL, 'user': user.pw_name, 'uid': user.pw_uid, 'gid': user.pw_gid,
+            'homebrew': str(homebrew), 'runtime': runtime.name, 'release_version': manifest.get('release_version'),
+            'store_hosts': list(ROOT_HOST_STORE_HOSTS),
+            'release_repository': previous.get('release_repository') or DEFAULT_RELEASE_REPOSITORY,
+        }, 0o644)
+        for path, data in unit_files.items():
+            _write_atomic(path, data, 0o644)
+        _systemctl({'unit': Path(f'{_root_host_unit_name(user)}.socket'), 'scope': 'system'}, 'daemon-reload')
+    except BaseException:
+        for path, snapshot in snapshots.items():
+            if snapshot is None:
+                if _lstat_regular_or_absent(path) is not None:
+                    path.unlink()
+                    _fsync_directory(path.parent)
+            else:
+                data, mode = snapshot
+                _write_atomic(path, data, mode)
+        raise
 
 
 def _prune_root_runtimes(state: Path, keep: set[str]) -> None:
@@ -6143,6 +6176,7 @@ def main() -> int:
     update_root.add_argument('--tag', required=True, metavar='TAG')
     args = parser.parse_args()
     try:
+        _require_system_python()
         if args.command == 'legacy-user-stop':
             output = _run_legacy_user_stop(args)
         elif args.command == 'enable-root-plugins':

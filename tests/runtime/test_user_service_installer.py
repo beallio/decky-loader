@@ -7,6 +7,7 @@ import pwd
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -424,6 +425,202 @@ class UserServiceInstallerTests(unittest.TestCase):
                 properties_calls[0] = 0
                 installer.stop_service(unit)
                 self.assertFalse(state_file.exists())
+
+    def test_exclusive_json_is_not_visible_until_fully_written(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "accepted.json"
+            write_started = threading.Event()
+            allow_write = threading.Event()
+            results = []
+            errors = []
+            original_fdopen = os.fdopen
+
+            class PausedStream:
+                def __init__(self, stream):
+                    self.stream = stream
+
+                def __enter__(self):
+                    self.stream.__enter__()
+                    return self
+
+                def __exit__(self, *arguments):
+                    return self.stream.__exit__(*arguments)
+
+                def write(self, data):
+                    write_started.set()
+                    if not allow_write.wait(5):
+                        raise TimeoutError("writer was not released")
+                    return self.stream.write(data)
+
+                def flush(self):
+                    return self.stream.flush()
+
+                def fileno(self):
+                    return self.stream.fileno()
+
+            def paused_fdopen(descriptor, mode):
+                return PausedStream(original_fdopen(descriptor, mode))
+
+            def write_json():
+                try:
+                    results.append(installer._write_json_exclusive(path, {"payload": "complete" * 4096}))
+                except BaseException as error:
+                    errors.append(error)
+
+            with patch.object(installer.os, "fdopen", side_effect=paused_fdopen):
+                writer = threading.Thread(target=write_json)
+                writer.start()
+                try:
+                    self.assertTrue(write_started.wait(5))
+                    self.assertFalse(path.exists(), "readers must not observe the final path during the write")
+                finally:
+                    allow_write.set()
+                    writer.join(timeout=5)
+
+            self.assertFalse(writer.is_alive())
+            if errors:
+                raise errors[0]
+            self.assertEqual(results, [True])
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"payload": "complete" * 4096})
+            self.assertFalse(installer._write_json_exclusive(path, {"payload": "replacement"}))
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"payload": "complete" * 4096})
+
+    def test_installer_requires_python_311(self):
+        with patch.object(installer.sys, "version_info", (3, 10, 13)):
+            with self.assertRaisesRegex(installer.InstallerError, "Python 3.11 or newer"):
+                installer._require_system_python()
+        with patch.object(installer.sys, "version_info", (3, 11, 0)):
+            installer._require_system_python()
+
+    def test_runtime_staging_fsyncs_copied_files_and_directories(self):
+        user = pwd.getpwuid(os.geteuid())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            self.write_bundle(bundle, "v3.2.10", "v3.2.10")
+            manifest = json.loads((bundle / "bundle.json").read_text(encoding="utf-8"))
+            paths = {name: root / name for name in ("runtimes", "homebrew", "services", "state")}
+            for path in paths.values():
+                path.mkdir()
+            files_synced = []
+            directories_synced = []
+            original_sync_file = installer._fsync_file
+            original_sync_directory = installer._fsync_directory
+
+            def sync_file(path):
+                files_synced.append(path)
+                original_sync_file(path)
+
+            def sync_directory(path):
+                directories_synced.append(path)
+                original_sync_directory(path)
+
+            with (
+                patch.object(installer, "_check_runtime_access"),
+                patch.object(installer, "_fsync_file", side_effect=sync_file),
+                patch.object(installer, "_fsync_directory", side_effect=sync_directory),
+            ):
+                staging, final = installer._make_runtime(bundle, manifest, paths, "transaction", user)
+
+            expected_files = {path for path in staging.rglob("*") if path.is_file()}
+            expected_directories = {staging, *(path for path in staging.rglob("*") if path.is_dir())}
+            self.assertEqual(set(files_synced), expected_files)
+            self.assertEqual(set(directories_synced), expected_directories)
+            self.assertTrue(staging.is_dir())
+            self.assertFalse(final.exists())
+
+    def test_root_plugin_adoption_restores_original_when_stage_rename_fails(self):
+        user = pwd.getpwuid(os.geteuid())
+        with tempfile.TemporaryDirectory() as temporary:
+            plugins = Path(temporary) / "plugins"
+            original = plugins / "Demo"
+            original.mkdir(parents=True)
+            (original / "plugin.json").write_text('{"flags":["root"]}', encoding="utf-8")
+            (original / "main.py").write_text("original plugin\n", encoding="utf-8")
+            plugins_fd = os.open(plugins, os.O_RDONLY | os.O_DIRECTORY)
+            created_stage_inodes = set()
+            original_mkdir = os.mkdir
+            original_fstat = os.fstat
+            original_rename = os.rename
+            rename_calls = []
+
+            def record_stage_mkdir(name, mode=0o777, *, dir_fd=None):
+                result = original_mkdir(name, mode, dir_fd=dir_fd)
+                if isinstance(name, str) and name.startswith(".decky-root-adopt-"):
+                    created_stage_inodes.add(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_ino)
+                return result
+
+            def report_root_owned_stage(descriptor):
+                info = original_fstat(descriptor)
+                if info.st_ino in created_stage_inodes:
+                    return os.stat_result((*info[:4], 0, *info[5:]))
+                return info
+
+            def fail_install_rename(source, destination, **kwargs):
+                rename_calls.append((source, destination))
+                if len(rename_calls) == 2:
+                    raise OSError("synthetic staged rename failure")
+                return original_rename(source, destination, **kwargs)
+
+            # _adopt_root_plugin owns the descriptor from _open_plugins_root and closes it.
+            with (
+                patch.object(installer, "_open_plugins_root", return_value=plugins_fd),
+                patch.object(installer, "_root_host_tree_hash", return_value={"tree_sha256": "a" * 64}),
+                patch.object(installer.os, "mkdir", side_effect=record_stage_mkdir),
+                patch.object(installer.os, "fstat", side_effect=report_root_owned_stage),
+                patch.object(installer.os, "rename", side_effect=fail_install_rename),
+            ):
+                with self.assertRaisesRegex(OSError, "synthetic staged rename failure"):
+                    installer._adopt_root_plugin(Path("/runtime"), Path(temporary), "Demo", user)
+
+            self.assertEqual((original / "plugin.json").read_text(encoding="utf-8"), '{"flags":["root"]}')
+            self.assertEqual((original / "main.py").read_text(encoding="utf-8"), "original plugin\n")
+            self.assertEqual({path.name for path in plugins.iterdir()}, {"Demo"})
+
+    def test_root_host_files_are_restored_when_daemon_reload_fails(self):
+        user = pwd.getpwuid(os.geteuid())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            units = root / "systemd"
+            state.mkdir()
+            units.mkdir()
+            config = state / "config.json"
+            original_config = json.dumps({"release_repository": "owner/previous"}).encode()
+            config.write_bytes(original_config)
+            config.chmod(0o640)
+            unit_name = installer._root_host_unit_name(user)
+            service = units / f"{unit_name}.service"
+            socket = units / f"{unit_name}.socket"
+            original_service = b"previous service unit\n"
+            service.write_bytes(original_service)
+            service.chmod(0o600)
+
+            def read_config(path):
+                if not path.exists():
+                    return None
+                return json.loads(path.read_text(encoding="utf-8"))
+
+            with (
+                patch.object(installer, "ROOT_HOST_UNIT_DIRECTORY", units),
+                patch.object(installer, "_read_root_host_json", side_effect=read_config),
+                patch.object(
+                    installer,
+                    "_systemctl",
+                    side_effect=installer.InstallerError("synthetic reload failure"),
+                ),
+            ):
+                with self.assertRaisesRegex(installer.InstallerError, "synthetic reload failure"):
+                    installer._write_root_host_files(
+                        user, root / "homebrew", state, root / "runtime", {"release_version": "new-release"}
+                    )
+
+            self.assertEqual(config.read_bytes(), original_config)
+            self.assertEqual(config.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(service.read_bytes(), original_service)
+            self.assertEqual(service.stat().st_mode & 0o777, 0o600)
+            self.assertFalse(socket.exists())
 
 
 if __name__ == "__main__":

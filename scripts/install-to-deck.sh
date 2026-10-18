@@ -1051,7 +1051,7 @@ target_action() {
     [[ $TMPDIR == /* ]] || fail 'TMPDIR must be absolute'
     [[ -d $TMPDIR ]] || mkdir -p -- "$TMPDIR"
     [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'This bundle requires Linux x86-64'
-    python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else "Python 3.10 or newer is required")'
+    python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else "Python 3.11 or newer is required")'
     kit="$homebrew/services/.decky-user-deploy/$unit"
     legacy_root="/var/lib/decky-loader-runtime/legacy-migrations/$target_uid/$unit"
     legacy_record="$legacy_root/status.json"
@@ -1148,6 +1148,9 @@ PY
         if [[ $unit_directory_source == persisted ]]; then
             legacy_restore_args+=(--user-unit-directory "$unit_directory")
         fi
+        # Get sudo access first: if that fails, nothing was restored and cleanup restarts
+        # the user service. Once the helper runs, it owns recovery, even if it fails.
+        "${sudo_args[@]}" -v || fail 'Administrator access was refused; nothing was restored'
         restore_helper_started=1
         "${sudo_args[@]}" python3 -B "$legacy_helper" restore-legacy-system "${legacy_restore_args[@]}" \
             2>&1 | tee -a "${failure_log:-/dev/null}"
