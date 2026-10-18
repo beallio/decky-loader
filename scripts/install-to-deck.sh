@@ -1159,7 +1159,7 @@ PY
         [[ -f $kit/install.py ]] || fail 'Install the Rust runtime before changing root plugin support'
         "${sudo_args[@]}" python3 -B "$kit/install.py" disable-root-plugins --homebrew "$homebrew" --user "$user"
         systemctl --user restart -- "$unit" || fail "Could not restart $unit"
-        printf 'Root plugin support is off. Plugins that need root are owned by %s again and do not run.\n' "$user"
+        printf 'Root plugin support is off. Plugins that need root, and the settings, data and logs they wrote, are owned by %s again; those plugins do not run.\n' "$user"
         exit 0
     fi
 

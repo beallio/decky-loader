@@ -5887,6 +5887,11 @@ def _run_disable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
     if user.pw_uid == 0 or user.pw_name != args.user:
         _fail('--user must name the non-root account that runs Decky')
     homebrew = _homebrew_path(args.homebrew)
+    # Root plugins write their settings, data and logs as root into the user's
+    # homebrew folders. Check that all of it can be handed back before stopping
+    # anything, so an unsafe file (for example one with extra hard links) leaves
+    # root plugin support unchanged.
+    _user_data_ownership(homebrew, user, apply=False)
     state = ROOT_HOST_STATE / str(user.pw_uid)
     name = _root_host_unit_name(user)
     paths: dict[str, Any] = {'unit': Path(f'{name}.socket'), 'scope': 'system'}
@@ -5909,6 +5914,8 @@ def _run_disable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
         finally:
             os.close(directory_fd)
         returned.append(directory)
+    # The host and its plugins are stopped, so nothing writes as root any more.
+    user_data_returned = _user_data_ownership(homebrew, user, apply=True)
     shutil.rmtree(state, ignore_errors=True)
     shutil.rmtree(ROOT_HOST_RUN / str(user.pw_uid), ignore_errors=True)
     for path in (ROOT_HOST_STATE, ROOT_HOST_STATE.parent):
@@ -5916,7 +5923,8 @@ def _run_disable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
             path.rmdir()
         except OSError:
             break
-    return {'ok': True, 'root_host': 'disabled', 'returned_to_user': returned}
+    return {'ok': True, 'root_host': 'disabled', 'returned_to_user': returned,
+            'user_data_returned': user_data_returned}
 
 
 def _root_host_status(user: pwd.struct_passwd) -> dict[str, object]:

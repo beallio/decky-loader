@@ -137,8 +137,10 @@ Decky, without following symlinks.
   verified runtime to the root location, writes the units and the allow list, and enables the
   socket unit. Approving an installed root plugin copies it into new root-owned files and swaps
   the folders, so a user process that held a plugin file open for writing cannot change the
-  approved code. `--disable-root-plugins` stops everything, removes the units and runtime, and
-  gives root plugin folders back to the user.
+  approved code. `--disable-root-plugins` first checks that every root-owned item in the user's
+  homebrew folder (outside `services/`) can be handed back safely, then stops everything, removes
+  the units and runtime, and gives root plugin folders and the settings, data and logs that root
+  plugins wrote back to the user.
 - **Start:** the socket unit starts the host when the backend connects. The backend connects only
   if at least one enabled plugin needs root. Without root plugins, no root process runs.
 - **Backend restart or crash:** root plugins belong to the control connection that started them.
