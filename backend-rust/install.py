@@ -38,7 +38,11 @@ from process_observer import Process, cgroup_processes, read_process
 
 
 KIND = 'decky-loader-runtime'
+# The upstream SDK tag that the bundle builder pins. Bundles built on another
+# upstream tag are accepted when their own records agree (see _validate_bundle),
+# so an installed loader can update to a release on a newer upstream base.
 BASELINE_TAG = 'v3.2.10'
+SDK_TAG = re.compile(r'v\d+\.\d+\.\d+(-pre\d+)?')
 SERVICE_STOP_DIRECTORY = Path('/run/decky-loader-runtime-stops')
 LEGACY_MIGRATION_ROOT = Path('/var/lib/decky-loader-runtime/legacy-migrations')
 # On SteamOS /var is a small partition (about 230 MB) and each runtime is about
@@ -971,8 +975,8 @@ def _validate_bundle(bundle_value: str, user: pwd.struct_passwd) -> tuple[Path, 
     if not isinstance(release_version, str) or not release_version or any(ord(character) < 32 or ord(character) == 127 for character in release_version):
         _fail('bundle has no valid Rust release identity')
     source = manifest.get('source_baseline')
-    if not isinstance(source, dict) or source.get('tag') != BASELINE_TAG:
-        _fail(f'bundle must retain the {BASELINE_TAG} source baseline')
+    if not isinstance(source, dict) or not isinstance(source.get('tag'), str) or not SDK_TAG.fullmatch(source['tag']):
+        _fail('bundle has no valid upstream source baseline tag')
     for field in ('commit', 'backend_tree', 'frontend_tree'):
         value = source.get(field)
         if not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{40}', value):
@@ -985,8 +989,8 @@ def _validate_bundle(bundle_value: str, user: pwd.struct_passwd) -> tuple[Path, 
         _fail('bundle has no worker runtime description')
     if runtime.get('frozen') is not True or not isinstance(runtime.get('python'), str) or not runtime['python'].startswith('3.11.'):
         _fail('bundle requires a frozen CPython 3.11 worker')
-    if runtime.get('decky_version') != BASELINE_TAG:
-        _fail(f'worker does not report the {BASELINE_TAG} source baseline')
+    if runtime.get('decky_version') != source['tag']:
+        _fail(f'worker does not report the bundle source baseline {source["tag"]}')
     packaging = manifest.get('worker_packaging')
     if packaging not in ('onefile', 'onedir'):
         _fail('bundle has an unsupported worker packaging variant')

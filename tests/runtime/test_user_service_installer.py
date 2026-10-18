@@ -23,47 +23,68 @@ from process_observer import Process
 
 
 class UserServiceInstallerTests(unittest.TestCase):
+    def write_bundle(self, bundle: Path, sdk_tag: str, worker_version: str) -> None:
+        files = {
+            "decky-loader-runtime": b"rust executable",
+            "DeckyPluginWorker": b"worker executable",
+            "install.py": b"installer payload",
+            "process_observer.py": b"observer payload",
+            "assets/index.js": b"frontend asset",
+            "locales/en-US.json": b"{}",
+        }
+        for relative, contents in files.items():
+            path = bundle / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents)
+            if relative in ("decky-loader-runtime", "DeckyPluginWorker"):
+                path.chmod(0o755)
+        manifest = {
+            "kind": "decky-loader-runtime",
+            "release_version": "v1.2.3-rust.4",
+            "rust_executable": "decky-loader-runtime",
+            "source_baseline": {
+                "tag": sdk_tag,
+                "commit": "a" * 40,
+                "backend_tree": "b" * 40,
+                "frontend_tree": "c" * 40,
+            },
+            "cargo_lock_sha256": "d" * 64,
+            "runtime": {
+                "frozen": True,
+                "python": "3.11.9",
+                "decky_version": worker_version,
+            },
+            "worker_packaging": "onefile",
+            "sha256": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()},
+        }
+        (bundle / "bundle.json").write_text(json.dumps(manifest), encoding="utf-8")
+
     def test_stable_bundle_without_private_candidate_flags_is_accepted(self):
         user = pwd.getpwuid(os.geteuid())
         with tempfile.TemporaryDirectory() as temporary:
             bundle = Path(temporary)
-            files = {
-                "decky-loader-runtime": b"rust executable",
-                "DeckyPluginWorker": b"worker executable",
-                "install.py": b"installer payload",
-                "process_observer.py": b"observer payload",
-                "assets/index.js": b"frontend asset",
-                "locales/en-US.json": b"{}",
-            }
-            for relative, contents in files.items():
-                path = bundle / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(contents)
-                if relative in ("decky-loader-runtime", "DeckyPluginWorker"):
-                    path.chmod(0o755)
-            manifest = {
-                "kind": "decky-loader-runtime",
-                "release_version": "v1.2.3-rust.4",
-                "rust_executable": "decky-loader-runtime",
-                "source_baseline": {
-                    "tag": "v3.2.10",
-                    "commit": "a" * 40,
-                    "backend_tree": "b" * 40,
-                    "frontend_tree": "c" * 40,
-                },
-                "cargo_lock_sha256": "d" * 64,
-                "runtime": {
-                    "frozen": True,
-                    "python": "3.11.9",
-                    "decky_version": "v3.2.10",
-                },
-                "worker_packaging": "onefile",
-                "sha256": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()},
-            }
-            (bundle / "bundle.json").write_text(json.dumps(manifest), encoding="utf-8")
+            self.write_bundle(bundle, "v3.2.10", "v3.2.10")
             validated, parsed = installer._validate_bundle(str(bundle), user)
         self.assertEqual(validated, bundle)
         self.assertEqual(parsed["release_version"], "v1.2.3-rust.4")
+
+    def test_bundles_on_another_upstream_base_need_matching_records(self):
+        # An installed loader must accept a release built on a newer upstream base.
+        user = pwd.getpwuid(os.geteuid())
+        for sdk_tag, worker_version, accepted in (
+            ("v3.3.0-pre1", "v3.3.0-pre1", True),
+            ("v3.3.0", "v3.3.0", True),
+            ("v3.3.0", "v3.2.10", False),
+            ("main", "main", False),
+        ):
+            with self.subTest(sdk_tag=sdk_tag, worker_version=worker_version), tempfile.TemporaryDirectory() as temporary:
+                bundle = Path(temporary)
+                self.write_bundle(bundle, sdk_tag, worker_version)
+                if accepted:
+                    installer._validate_bundle(str(bundle), user)
+                else:
+                    with self.assertRaises(installer.InstallerError):
+                        installer._validate_bundle(str(bundle), user)
 
     def test_manager_unit_directory_comes_from_structured_manager_path(self):
         user = pwd.getpwuid(os.geteuid())
