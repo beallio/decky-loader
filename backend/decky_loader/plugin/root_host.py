@@ -36,7 +36,7 @@ import urllib.request
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 from decky_loader.plugin import launcher, worker
 
@@ -210,7 +210,8 @@ def _download(url: str, limit: int) -> bytes:
     try:
         import certifi  # pyright: ignore[reportMissingImports]
 
-        context = ssl.create_default_context(cafile=cast(str, certifi.where()))  # pyright: ignore[reportUnknownMemberType]
+        where: Callable[[], str] = getattr(certifi, "where")
+        context = ssl.create_default_context(cafile=where())
     except ImportError:
         context = ssl.create_default_context()
     request = urllib.request.Request(url, headers={"User-Agent": "Decky root plugin host"})
