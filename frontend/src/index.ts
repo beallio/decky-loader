@@ -43,16 +43,7 @@ const isSteamAppInitialized = () => {
     }
   }
   console.debug('[Decky:Boot] Setting up @decky/ui...');
-  const DFL = await import('@decky/ui');
-  // Deferred like @decky/ui itself: its class maps need the Steam webpack globals set above.
-  const { quickAccessClasses } = await import('./utils/quickAccessClasses');
-  // Plugins read these maps from window.DFL; serve the merged map when Steam split it.
-  window.DFL = DFL.quickAccessMenuClasses
-    ? DFL
-    : new Proxy(DFL, {
-        get: (target, key) =>
-          key === 'quickAccessMenuClasses' || key === 'staticClasses' ? quickAccessClasses : Reflect.get(target, key),
-      });
+  window.DFL = await import('@decky/ui');
   console.debug('[Decky:Boot] Authenticating with Decky backend...');
   window.deckyAuthToken = await fetch('http://127.0.0.1:1337/auth/token').then((r) => r.text());
   console.debug('[Decky:Boot] Connecting to Decky backend...');

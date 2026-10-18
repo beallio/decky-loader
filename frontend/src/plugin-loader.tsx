@@ -7,11 +7,12 @@ import {
   PanelSectionRow,
   QuickAccessTab,
   findSP,
+  quickAccessMenuClasses,
   showModal,
   sleep,
 } from '@decky/ui';
 import { FC, lazy } from 'react';
-import { FaDownload, FaExclamationCircle, FaPlug } from 'react-icons/fa';
+import { FaDownload, FaExclamationCircle, FaExclamationTriangle, FaPlug } from 'react-icons/fa';
 
 import DeckyIcon from './components/DeckyIcon';
 import { DeckyState, DeckyStateContextProvider, UserInfo, useDeckyState } from './components/DeckyState';
@@ -37,7 +38,6 @@ import TabsHook from './tabs-hook';
 import Toaster from './toaster';
 import { getVersionInfo } from './updater';
 import { getPluginDisplayName } from './utils/pluginHelpers';
-import { quickAccessClasses } from './utils/quickAccessClasses';
 import { getSetting, setSetting } from './utils/settings';
 import TranslationHelper, { TranslationClass } from './utils/TranslationHelper';
 
@@ -155,6 +155,9 @@ class PluginLoader extends Logger {
     Promise.all([this.getUserInfo(), this.updateVersion()])
       .then(() => this.loadPlugins())
       .then(() => this.log('Initialized'))
+      .then(() => {
+        this.notifySupportStatus();
+      }) // TODO safeguard this
       .then(() => sleep(30000)) // Internet might not immediately be up
       .then(() => this.checkPluginUpdates());
   }
@@ -221,6 +224,19 @@ class PluginLoader extends Logger {
     this.log(`Loaded ${plugins.length} plugins in ${loadEnd - loadStart}ms`);
 
     this.checkPluginUpdates();
+  }
+
+  private async notifySupportStatus() {
+    await this.routerHook.waitForUnlock();
+    if (!this.deckyState.publicState().versionInfo?.supported) {
+      this.toaster.toast({
+        title: <TranslationHelper transClass={TranslationClass.PLUGIN_LOADER} transText="decky_unsupported" />,
+        body: <TranslationHelper transClass={TranslationClass.PLUGIN_LOADER} transText="decky_unsupported_body" />,
+        logo: <DeckyIcon />,
+        icon: <FaExclamationTriangle />,
+        onClick: () => Navigation.Navigate('/decky/settings'),
+      });
+    }
   }
 
   public async getUserInfo() {
@@ -536,7 +552,7 @@ class PluginLoader extends Logger {
       const TheError: FC<{}> = () => (
         <PanelSection>
           <PanelSectionRow>
-            <div className={quickAccessClasses.FriendsTitle} style={{ display: 'flex', justifyContent: 'center' }}>
+            <div className={quickAccessMenuClasses.FriendsTitle} style={{ display: 'flex', justifyContent: 'center' }}>
               <TranslationHelper transClass={TranslationClass.PLUGIN_LOADER} transText="error" />
             </div>
           </PanelSectionRow>
@@ -546,7 +562,7 @@ class PluginLoader extends Logger {
             </pre>
           </PanelSectionRow>
           <PanelSectionRow>
-            <div className={quickAccessClasses.Text}>
+            <div className={quickAccessMenuClasses.Text}>
               <TranslationHelper
                 transClass={TranslationClass.PLUGIN_LOADER}
                 transText={backendError ? 'plugin_backend_error' : 'plugin_error_uninstall'}

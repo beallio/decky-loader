@@ -1,10 +1,9 @@
-import { DialogButton, Focusable, Navigation } from '@decky/ui';
+import { DialogButton, Focusable, Navigation, staticClasses } from '@decky/ui';
 import { CSSProperties, FC } from 'react';
 import { useTranslation } from 'react-i18next';
 import { BsGearFill } from 'react-icons/bs';
 import { FaArrowLeft, FaStore } from 'react-icons/fa';
 
-import { quickAccessClasses } from '../utils/quickAccessClasses';
 import { useDeckyState } from './DeckyState';
 
 const titleStyles: CSSProperties = {
@@ -30,7 +29,7 @@ const TitleView: FC = () => {
 
   if (activePlugin === null) {
     return (
-      <Focusable style={titleStyles} className={quickAccessClasses.Title}>
+      <Focusable style={titleStyles} className={staticClasses.Title}>
         <div style={{ marginRight: 'auto', flex: 0.9 }}>Decky</div>
         <DialogButton
           style={{ height: '28px', width: '40px', minWidth: 0, padding: '10px 12px' }}
@@ -51,7 +50,7 @@ const TitleView: FC = () => {
   }
 
   return (
-    <Focusable className={quickAccessClasses.Title} style={titleStyles}>
+    <Focusable className={staticClasses.Title} style={titleStyles}>
       <DialogButton
         style={{ height: '28px', width: '40px', minWidth: 0, padding: '10px 12px' }}
         onClick={closeActivePlugin}

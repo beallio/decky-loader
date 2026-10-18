@@ -34,12 +34,10 @@ SDK_OVERLAYS = (
     'frontend/tsconfig.json',
     'frontend/src/components/settings/pages/general/RemoteDebugging.tsx',
     'backend/decky_loader/locales/en-US.json',
-    'backend/decky_loader/injector.py',
-    'frontend/src/index.ts',
-    'frontend/src/components/TitleView.tsx',
-    'frontend/src/utils/quickAccessClasses.ts',
     'frontend/src/components/modals/filepicker/index.tsx',
     'frontend/src/components/DeckyState.tsx',
+    # Formatting only: upstream's copy fails the Prettier check that CI runs.
+    'frontend/src/components/settings/pages/developer/index.tsx',
     'backend/decky_loader/settings.py',
 )
 SDK_REMOVALS = (
