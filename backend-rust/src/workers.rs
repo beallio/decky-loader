@@ -831,22 +831,21 @@ impl PluginRegistry {
         previous_error: Option<String>,
     ) -> Option<String> {
         let mut worker = None;
+        let mut metadata = entry.metadata.clone();
+        metadata.disabled = entry.disabled.load(Ordering::Acquire);
         let mut start_error = previous_error;
         let mut restart_error = None;
         if was_running
             && !self.shutting_down.load(Ordering::Acquire)
             && !shutdown_requested(&self.shutdown)
         {
-            if let Err(error) = self.set_approved_plugin_permissions(&entry.metadata) {
+            if let Err(error) = self.set_approved_plugin_permissions(&metadata) {
                 let message = error.to_string();
                 restart_error = Some(message.clone());
                 start_error = Some(message);
             } else {
                 let mut shutdown = self.shutdown.clone();
-                match self
-                    .launch_plugin_worker(&entry.metadata, &mut shutdown)
-                    .await
-                {
+                match self.launch_plugin_worker(&metadata, &mut shutdown).await {
                     Ok(restarted) => {
                         worker = restarted;
                         start_error = None;
@@ -2129,6 +2128,68 @@ mod plugin_permission_tests {
             .find(|entry| entry["name"] == "Example")
             .unwrap();
         assert_eq!(entry["disabled"], true);
+    }
+
+    #[tokio::test]
+    async fn failed_reload_restores_currently_enabled_plugin_metadata() {
+        let temporary = TestDirectory::new();
+        let plugin_root = temporary.0.join("plugins");
+        write_approved_plugin(&plugin_root.join("Example"), &[]);
+        fs::create_dir(temporary.0.join("settings")).unwrap();
+        fs::write(
+            temporary.0.join("settings/loader.json"),
+            br#"{"disabled_plugins":["Example"]}"#,
+        )
+        .unwrap();
+        let (events, _) = broadcast::channel(8);
+        let (_shutdown, shutdown) = watch::channel(false);
+        let ids = platform::effective_user_ids();
+        let user = unistd::User::from_uid(Uid::current())
+            .unwrap()
+            .unwrap()
+            .name;
+        let registry = PluginRegistry::start(
+            WorkerConfiguration {
+                executable: temporary.0.join("missing-worker"),
+                mode: WorkerMode::Exec,
+                bootstrap: WorkerBootstrap::Lean,
+                auth_token: "recovery-test".into(),
+                server_host: "127.0.0.1".into(),
+                server_port: 1339,
+                chown_plugin_path: false,
+                loader_version: "dev".into(),
+            },
+            plugin_root,
+            temporary.0.clone(),
+            user,
+            ids,
+            events,
+            shutdown,
+        )
+        .await
+        .unwrap();
+        let entry = registry
+            .plugins
+            .read()
+            .await
+            .get("Example")
+            .cloned()
+            .unwrap();
+        assert!(entry.metadata.disabled);
+        entry.disabled.store(false, Ordering::Release);
+
+        let restart_error = registry.restore_previous_entry(&entry, true, None).await;
+        let runtime = entry.runtime.lock().await;
+        assert!(
+            restart_error.is_some(),
+            "rollback skipped launching the enabled plugin"
+        );
+        assert!(
+            runtime.start_error.is_some(),
+            "failed rollback incorrectly cleared the backend error"
+        );
+        drop(runtime);
+        registry.shutdown().await;
     }
 
     #[test]
@@ -3484,6 +3545,15 @@ async fn monitor_worker(
     }
 
     mark_worker_dead(&state, failure).await;
+    // A descendant of the plugin can keep this socket open without reading it. A call's
+    // write then blocks forever while holding the writer lock. Shutting the socket down
+    // fails that write, so the lock below is released.
+    let socket_fd = reader.get_ref().as_ref().as_raw_fd();
+    // SAFETY: `reader` keeps the socket open until this function returns, so the
+    // descriptor is valid; shutdown(2) only changes the connection state and never closes it.
+    unsafe {
+        libc::shutdown(socket_fd, libc::SHUT_RDWR);
+    }
     let _ = writer.lock().await.shutdown().await;
     let _ = fs::remove_file(socket_path);
 }
@@ -3822,6 +3892,67 @@ mod ownership_retry_tests {
         assert_eq!(
             ownership_retry_targets(&candidates, &AttributeChanges::default()),
             Vec::<String>::new()
+        );
+    }
+}
+#[cfg(test)]
+mod worker_shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn monitor_shuts_socket_before_waiting_for_blocked_writer() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let (reader, writer) = stream.into_split();
+        let handle = WorkerHandle {
+            writer: Arc::new(Mutex::new(writer)),
+            state: Arc::new(Mutex::new(PendingState {
+                alive: true,
+                stopping: false,
+                failure: None,
+                requests: HashMap::new(),
+            })),
+        };
+
+        let blocked_writer = Arc::clone(&handle.writer);
+        let mut blocked_write = tokio::spawn(async move {
+            let mut writer = blocked_writer.lock().await;
+            writer.write_all(&vec![0; 8 * 1024 * 1024]).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !blocked_write.is_finished(),
+            "the test writer did not block on the unread socket"
+        );
+
+        let (stop, _stop_receiver) = mpsc::unbounded_channel();
+        let reaper = tokio::spawn(async { Ok::<_, io::Error>(ExitStatus::from_raw(0)) });
+        let (events, _) = broadcast::channel(1);
+        let mut monitor = tokio::spawn(monitor_worker(
+            reader,
+            reaper,
+            stop,
+            handle,
+            PathBuf::new(),
+            "Example".to_owned(),
+            events,
+        ));
+        let completed = timeout(Duration::from_secs(1), &mut monitor).await;
+        if completed.is_err() {
+            monitor.abort();
+        }
+        assert!(
+            completed.is_ok(),
+            "the monitor waited on the blocked writer instead of closing its socket"
+        );
+        completed.unwrap().unwrap();
+
+        let write_result = timeout(Duration::from_secs(1), &mut blocked_write)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            write_result.is_err(),
+            "socket shutdown did not cancel the write"
         );
     }
 }

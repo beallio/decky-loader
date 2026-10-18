@@ -3,6 +3,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Cursor},
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
 use axum::body::Bytes;
@@ -24,6 +25,8 @@ const SETTINGS_KEYS: [&str; 4] = [
     "pluginOrder",
     "disabled_plugins",
 ];
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct InstallRequest {
@@ -1417,12 +1420,26 @@ fn read_json_file(path: &Path) -> Result<Value, RpcError> {
 }
 
 fn decoding_download_client(backend: &Backend) -> Result<reqwest::Client, RpcError> {
+    decoding_download_client_with_timeouts(
+        &backend.version,
+        DOWNLOAD_CONNECT_TIMEOUT,
+        DOWNLOAD_READ_TIMEOUT,
+    )
+}
+
+fn decoding_download_client_with_timeouts(
+    version: &str,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<reqwest::Client, RpcError> {
     reqwest::Client::builder()
-        .user_agent(format!("Decky/{} (https://decky.xyz)", backend.version))
+        .user_agent(format!("Decky/{version} (https://decky.xyz)"))
         .no_proxy()
         .gzip(true)
         .brotli(true)
         .deflate(true)
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
         .build()
         .map_err(|error| {
             RpcError::failure(format!(
@@ -1774,6 +1791,34 @@ mod tests {
         )
         .await;
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn download_client_read_timeout_rejects_a_stalled_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_sender, accepted) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            let _ = accepted_sender.send(());
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let client = decoding_download_client_with_timeouts(
+            "test",
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let error = client
+            .get(format!("http://{address}/plugin.zip"))
+            .send()
+            .await
+            .unwrap_err();
+        accepted.await.unwrap();
+        assert!(error.is_timeout(), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
         server.abort();
     }
 

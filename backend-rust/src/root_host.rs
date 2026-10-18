@@ -6,6 +6,7 @@
 //! so it stops root plugins through the host.
 
 use std::{
+    os::fd::{AsRawFd, RawFd},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -50,6 +51,7 @@ struct Control {
 
 pub(crate) struct RootHost {
     control: Mutex<Control>,
+    socket_fd: RawFd,
     failed: AtomicBool,
 }
 
@@ -76,12 +78,14 @@ impl RootHost {
             .await
             .context("timed out connecting to the root plugin host")?
             .with_context(|| format!("connecting to the root plugin host at {}", path.display()))?;
+        let socket_fd = stream.as_raw_fd();
         let (output, input) = stream.into_split();
         let host = Self {
             control: Mutex::new(Control {
                 input,
                 output: BufReader::new(output),
             }),
+            socket_fd,
             failed: AtomicBool::new(false),
         };
         let hello = host
@@ -99,7 +103,7 @@ impl RootHost {
             )
             .await?;
         if hello["protocol"].as_i64() != Some(PROTOCOL) {
-            host.failed.store(true, Ordering::Release);
+            host.mark_failed();
             bail!(
                 "the root plugin host speaks protocol {}, but this loader needs {PROTOCOL}; it updates itself, so restart Decky in a few minutes",
                 hello["protocol"]
@@ -110,6 +114,16 @@ impl RootHost {
 
     pub(crate) fn is_failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
+    }
+
+    fn mark_failed(&self) {
+        self.failed.store(true, Ordering::Release);
+        // Closing both directions makes the host release this session immediately.
+        // SAFETY: `self.control` owns both halves of this socket for as long as `self`
+        // exists, so the descriptor is open; shutdown(2) never closes it.
+        unsafe {
+            libc::shutdown(self.socket_fd, libc::SHUT_RDWR);
+        }
     }
 
     /// Starts the plugin in `directory` and returns its PID and IPC socket path.
@@ -129,7 +143,7 @@ impl RootHost {
         match (pid, socket) {
             (Some(pid), Some(socket)) if socket.is_absolute() => Ok((pid, socket)),
             _ => {
-                self.failed.store(true, Ordering::Release);
+                self.mark_failed();
                 bail!("the root plugin host returned an invalid start response: {forked}")
             }
         }
@@ -155,7 +169,7 @@ impl RootHost {
         }
         let status = wait_status(&response);
         if status.is_err() {
-            self.failed.store(true, Ordering::Release);
+            self.mark_failed();
         }
         status.map(Some)
     }
@@ -216,7 +230,7 @@ impl RootHost {
         if let Err(error) = &result
             && error.downcast_ref::<Refused>().is_none()
         {
-            self.failed.store(true, Ordering::Release);
+            self.mark_failed();
         }
         result
     }
@@ -353,5 +367,74 @@ mod tests {
         assert_eq!(host.child_status("b").await.unwrap(), None);
         assert!(host.child_status("b").await.is_err());
         assert!(host.is_failed());
+    }
+
+    #[tokio::test]
+    async fn timed_out_request_closes_session_and_allows_reconnect() {
+        let directory =
+            std::env::temp_dir().join(format!("decky-root-host-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("host.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let hello = lines.next_line().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&hello).unwrap()["op"],
+                "hello"
+            );
+            write
+                .write_all(b"{\"ok\":true,\"op\":\"hello\",\"protocol\":1}\n")
+                .await
+                .unwrap();
+            let stalled_request = lines.next_line().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&stalled_request).unwrap()["op"],
+                "stall"
+            );
+            let peer_saw_eof = lines.next_line().await.unwrap().is_none();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let hello = lines.next_line().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&hello).unwrap()["op"],
+                "hello"
+            );
+            write
+                .write_all(b"{\"ok\":true,\"op\":\"hello\",\"protocol\":1}\n")
+                .await
+                .unwrap();
+            let _ = std::fs::remove_dir_all(directory);
+            peer_saw_eof
+        });
+
+        let host = RootHost::connect(&path, ENVIRONMENT).await.unwrap();
+        let error = host
+            .request(
+                json!({"op": "stall"}),
+                "finished",
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(host.is_failed());
+
+        let reconnected = timeout(
+            Duration::from_secs(1),
+            RootHost::connect(&path, ENVIRONMENT),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(reconnected);
+        assert!(
+            server.await.unwrap(),
+            "the old host session did not see EOF"
+        );
     }
 }
