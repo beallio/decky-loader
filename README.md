@@ -95,6 +95,7 @@ The output also has a `resources` section. It shows CPU and memory for each plug
 - **Decky does not appear.** Restart the Deck. If it is still missing, run `--status`, then install again.
 - **A plugin shows "This plugin needs root".** See [Plugins that need administrator access](#plugins-that-need-administrator-access).
 - **A plugin shows "Decky could not start".** The plugin failed to start. Update or remove it in Decky's settings.
+- **An update in Decky stops or fails, and you have version `v3.2.10-rust.8-rc.1` to `rc.10`.** These versions cannot update in Decky to `v3.3.0` and later. Run the install command once with `--channel preview`; after that, updates in Decky work again.
 - **Another program uses port 1337 or 8080.** Decky needs these ports. Syncthing often uses 8080; change Syncthing to 8384.
 - **The script stops with a space error.** Free some storage or choose a different `--backup-dir`, then try again. The script stops before it changes anything.
 - **The install fails part way.** The script puts back the previous version automatically. It prints the location of a log file. Attach that file, or the ZIP from [collect-debug-info.sh](scripts/collect-debug-info.sh), when you [report a problem](https://github.com/beallio/decky-loader/issues).
