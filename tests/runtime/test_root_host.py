@@ -11,6 +11,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
 
+from decky_loader import helpers  # noqa: E402
 from decky_loader.plugin import root_host  # noqa: E402
 
 
@@ -157,6 +158,14 @@ class ProtocolTest(unittest.TestCase):
         ).encode())
         self.assertTrue(response["ok"], response)
         return host
+
+    def test_hello_updates_the_csrf_token_used_by_helpers(self) -> None:
+        original_token = helpers.csrf_token
+        try:
+            self.greeted({})
+            self.assertEqual(helpers.get_csrf_token(), "t")
+        finally:
+            helpers.csrf_token = original_token
 
     def start(self, host: root_host.Host, directory: str) -> dict[str, Any]:
         return host.handle_line(json.dumps({"op": "start", "id": "a", "directory": directory}).encode())

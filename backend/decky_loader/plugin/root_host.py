@@ -579,7 +579,10 @@ class Host:
             raise RootHostError("hello needs auth_token, server_host and server_port")
         if self.greeted:
             raise RootHostError("hello was already sent")
+        from decky_loader import helpers
+
         os.environ.update({"DECKY_AUTH_TOKEN": token, "SERVER_HOST": host, "SERVER_PORT": str(port)})
+        helpers.csrf_token = token
         self.greeted = True
         updating = self.update_runtime(request.get("loader_version"))
         try:
@@ -705,10 +708,18 @@ class Host:
                 tree = plugin_tree_sha256(stage_fd)
             finally:
                 os.close(stage_fd)
-            self._replace(plugins_fd, stage, directory)
+            backup = self._replace(plugins_fd, stage, directory)
             stage = ""
             entry = {"name": name, "version": metadata["version"], "tree_sha256": tree}
-            self.config.record(directory, entry)
+            try:
+                self.config.record(directory, entry)
+            except BaseException:
+                shutil.rmtree(directory, dir_fd=plugins_fd)
+                if backup:
+                    os.rename(backup, directory, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+                raise
+            if backup:
+                shutil.rmtree(backup, dir_fd=plugins_fd, ignore_errors=True)
         finally:
             if stage:
                 shutil.rmtree(stage, dir_fd=plugins_fd, ignore_errors=True)
@@ -716,7 +727,8 @@ class Host:
         return {"ok": True, "op": "installed", "directory": directory, **entry}
 
     @staticmethod
-    def _replace(plugins_fd: int, stage: str, directory: str) -> None:
+    def _replace(plugins_fd: int, stage: str, directory: str) -> str:
+        """Install a staged directory and return its backup for later commit."""
         backup = ""
         try:
             os.stat(directory, dir_fd=plugins_fd, follow_symlinks=False)
@@ -731,8 +743,7 @@ class Host:
             if backup:
                 os.rename(backup, directory, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
             raise
-        if backup:
-            shutil.rmtree(backup, dir_fd=plugins_fd, ignore_errors=True)
+        return backup
 
     def uninstall(self, request: dict[str, Any]) -> dict[str, Any]:
         directory = _directory_name(request.get("directory"))

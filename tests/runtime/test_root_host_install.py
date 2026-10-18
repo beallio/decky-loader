@@ -1,5 +1,6 @@
 """Root plugin host install rules that run without root or network."""
 
+import hashlib
 import io
 import json
 import os
@@ -9,6 +10,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
@@ -77,8 +79,12 @@ class FakeConfig:
     def __init__(self) -> None:
         self.homebrew = Path("/nonexistent")
 
-    def approved_directories(self) -> dict[str, Any]:
-        return {}
+
+class FailingRecordConfig(FakeConfig):
+    uid = os.getuid()
+
+    def record(self, directory: str, entry: dict[str, Any] | None) -> None:
+        raise RuntimeError("approval write failed")
 
 
 class InstallRequestTest(unittest.TestCase):
@@ -90,6 +96,49 @@ class InstallRequestTest(unittest.TestCase):
         host = root_host.Host(config, left)
         host.greeted = True
         return host
+
+    def test_install_restores_the_old_plugin_when_approval_record_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            plugins = Path(temporary) / "plugins"
+            old_plugin = plugins / "Tools"
+            old_plugin.mkdir(parents=True)
+            (old_plugin / "sentinel").write_text("old plugin")
+            plugins_fd = os.open(plugins, os.O_RDONLY | os.O_DIRECTORY)
+            config = FailingRecordConfig()
+            config.homebrew = Path(temporary)
+            real_fstat = os.fstat
+
+            def root_owned(descriptor: int) -> Any:
+                # The host requires a root-owned staging folder; keep the real identity fields.
+                info = real_fstat(descriptor)
+                return SimpleNamespace(st_uid=0, st_mode=info.st_mode, st_dev=info.st_dev, st_ino=info.st_ino)
+            left, right = socket.socketpair()
+            self.addCleanup(left.close)
+            self.addCleanup(right.close)
+            host = root_host.Host(config, left)
+            host.greeted = True
+            payload = b"plugin archive"
+            request = {
+                "directory": "Tools",
+                "name": "Tools",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "artifact": "https://cdn.tzatzikiweeb.moe/Tools.zip",
+            }
+
+            with mock.patch.object(host, "_plugin_root_fd", return_value=plugins_fd), \
+                    mock.patch.object(root_host, "_download", return_value=payload), \
+                    mock.patch.object(root_host.os, "fstat", side_effect=root_owned), \
+                    mock.patch.object(root_host, "_extract_plugin_archive"), \
+                    mock.patch.object(root_host, "plugin_metadata", return_value={
+                        "name": "Tools", "version": "1.0.0", "flags": ["root"],
+                    }), \
+                    mock.patch.object(root_host, "_download_remote_binaries"), \
+                    mock.patch.object(root_host, "plugin_tree_sha256", return_value="tree"):
+                with self.assertRaisesRegex(RuntimeError, "approval write failed"):
+                    host.install(request)
+
+            self.assertEqual((old_plugin / "sentinel").read_text(), "old plugin")
+            self.assertEqual(sorted(path.name for path in plugins.iterdir()), ["Tools"])
 
     def test_install_accepts_only_store_downloads_with_a_hash(self) -> None:
         good = {"op": "install", "directory": "Tools", "name": "Tools", "sha256": "a" * 64,
