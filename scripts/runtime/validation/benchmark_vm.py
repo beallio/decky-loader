@@ -13,6 +13,7 @@ from pathlib import Path
 import platform
 import pwd
 import random
+import re
 import shlex
 import shutil
 import signal
@@ -49,7 +50,10 @@ SCALING_VARIANTS = ('python-installed', 'rust-lean-fork')
 SCALING_EXPECTED_INSTALLED_PLUGINS = (*EXPECTED_ACTIVE_PLUGINS, *EXPECTED_PASSIVE_PLUGINS)
 SCALING_FIXTURE_NAME_PREFIX = 'Decky Runtime Scaling Fixture'
 SCALING_FIXTURE_DIRECTORY_PREFIX = 'DeckyRuntimeScalingFixture'
-SDK_VERSION = 'v3.2.10'
+# Version of the official Python backend binary that serves as the baseline.
+PYTHON_SDK_VERSION = 'v3.2.10'
+# The Rust worker may be built on a newer upstream base than the Python baseline.
+SDK_TAG = re.compile(r'v\d+\.\d+\.\d+(-pre\d+)?')
 INPUT_DIRECTORIES = ('plugins', 'settings', 'data', 'themes')
 STOP_TIMEOUT_SECONDS = 55
 UNIT_STOP_SECONDS = 45
@@ -263,8 +267,8 @@ def worker_description(path: Path, temp_dir: Path) -> dict[str, object]:
         raise BenchmarkError(f'{path} --describe returned a non-object')
     if not str(description.get('python', '')).startswith('3.11.'):
         raise BenchmarkError(f'{path} is not the required CPython 3.11 worker: {description}')
-    if description.get('decky_version') != SDK_VERSION or description.get('frozen') is not True:
-        raise BenchmarkError(f'{path} does not describe the frozen Decky {SDK_VERSION} worker: {description}')
+    if not SDK_TAG.fullmatch(str(description.get('decky_version'))) or description.get('frozen') is not True:
+        raise BenchmarkError(f'{path} does not describe a frozen Decky worker on an upstream release tag: {description}')
     return description
 
 
@@ -915,6 +919,7 @@ def run_trial(
     assets: Path,
     locales: Path,
     release_version: str,
+    rust_sdk_version: str,
     python_inventory_fingerprint: str,
     rust_bundle_fingerprint: str,
     startup_timeout: float,
@@ -997,8 +1002,8 @@ def run_trial(
         if variant_config is None:
             raise BenchmarkError(f'unknown benchmark variant: {variant}')
         _, worker_mode, worker_bootstrap = variant_config
-        expected_current_version = SDK_VERSION if worker_mode is None else release_version
-        expected_sdk_version = None if worker_mode is None else SDK_VERSION
+        expected_current_version = PYTHON_SDK_VERSION if worker_mode is None else release_version
+        expected_sdk_version = None if worker_mode is None else rust_sdk_version
         if worker_mode is None:
             service_command = _normal_service_command(python_executable)
         else:
@@ -1815,12 +1820,12 @@ def prepare_inputs(args: argparse.Namespace, work_root: Path) -> dict[str, objec
     python_inventory = {
         'executable': str(python_executable),
         'executable_sha256': python_hash,
-        'sdk_version': SDK_VERSION,
+        'sdk_version': PYTHON_SDK_VERSION,
         'homebrew_input_snapshot': 'recorded after one read-only capture',
     }
     rust_bundle = {
         'release_version': args.release_version,
-        'sdk_version': SDK_VERSION,
+        'sdk_version': worker_info['decky_version'],
         'rust_executable': str(rust_executable),
         'rust_executable_sha256': rust_hash,
         'worker': str(worker),
@@ -1915,11 +1920,10 @@ def run_benchmark(args: argparse.Namespace) -> int:
             'iterations_per_variant': args.iterations,
             'iterations_per_variant_and_count': args.iterations,
             'release_version': release_version,
-            'sdk_version': SDK_VERSION,
+            'python_sdk_version': PYTHON_SDK_VERSION,
             'version_identity_contract': {
-                'python_current': SDK_VERSION,
+                'python_current': PYTHON_SDK_VERSION,
                 'rust_current': release_version,
-                'rust_sdk_version': SDK_VERSION,
             },
             'variants': [
                 {'name': name, 'worker_mode': mode, 'worker_bootstrap': bootstrap}
@@ -1963,6 +1967,10 @@ def run_benchmark(args: argparse.Namespace) -> int:
         work_root.mkdir(mode=0o755)
         preflight = prepare_inputs(args, work_root)
         raw['inputs'] = preflight
+        rust_sdk_version = preflight['rust_bundle_inventory']['sdk_version']
+        configuration = raw['configuration']
+        configuration['rust_sdk_version'] = rust_sdk_version
+        configuration['version_identity_contract']['rust_sdk_version'] = rust_sdk_version
 
         snapshot = work_root / 'snapshot'
         source_info = copy_snapshot(HOME_BREW, snapshot)
@@ -2039,6 +2047,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 assets=assets,
                 locales=locales,
                 release_version=release_version,
+                rust_sdk_version=rust_sdk_version,
                 python_inventory_fingerprint=preflight['python_source_inventory_fingerprint'],
                 rust_bundle_fingerprint=preflight['rust_bundle_fingerprint'],
                 startup_timeout=args.startup_timeout,
