@@ -166,12 +166,18 @@ impl Updater {
 
     async fn version_info(&self, backend: &Backend) -> Value {
         let versions = self.versions.read().await;
+        let release = backend.version.as_str() != "unknown" && backend.version.as_str() != "dev";
         json!({
             "current": backend.version.as_str(),
             "sdk_version": backend.sdk_version.as_str(),
             "remote": versions.remote,
             "all": versions.all,
-            "updatable": backend.version.as_str() != "unknown" && backend.version.as_str() != "dev",
+            "updatable": release,
+            // The frontend shows an "unsupported installation" warning unless this is true.
+            "supported": true,
+            "repo": backend.config.release_repository.trim_matches('/'),
+            // Releases are published from main; development builds are marked like upstream's.
+            "gitBranch": if release { "main" } else { "dirty" },
         })
     }
 

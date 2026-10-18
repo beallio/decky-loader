@@ -1027,14 +1027,29 @@ async fn increment_install_count(backend: &Backend, request: &InstallRequest, is
         if is_update { "true" } else { "false" },
     );
     let client = backend.client.clone();
-    tokio::spawn(async move { send_install_count(&client, url, INSTALL_COUNT_TIMEOUT).await });
+    let version = backend.version.clone();
+    tokio::spawn(
+        async move { send_install_count(&client, url, &version, INSTALL_COUNT_TIMEOUT).await },
+    );
 }
 
 // The count is informational. The timeout only bounds the background task.
 const INSTALL_COUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn send_install_count(client: &reqwest::Client, url: String, timeout: std::time::Duration) {
-    match client.post(&url).timeout(timeout).send().await {
+async fn send_install_count(
+    client: &reqwest::Client,
+    url: String,
+    version: &str,
+    timeout: std::time::Duration,
+) {
+    // The store reads the loader version from this header, as official Decky sends it.
+    match client
+        .post(&url)
+        .header("X-Decky-Version", version)
+        .timeout(timeout)
+        .send()
+        .await
+    {
         Ok(response) if response.status().is_success() => {}
         Ok(response) => eprintln!(
             "Plugin store did not accept the install count ({})",
@@ -1627,6 +1642,7 @@ mod tests {
         send_install_count(
             &client,
             format!("http://{address}/plugin/versions/1/increment?isUpdate=false"),
+            "dev",
             std::time::Duration::from_millis(200),
         )
         .await;

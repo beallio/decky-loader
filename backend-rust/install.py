@@ -38,10 +38,9 @@ from process_observer import Process, cgroup_processes, read_process
 
 
 KIND = 'decky-loader-runtime'
-# The upstream SDK tag that the bundle builder pins. Bundles built on another
-# upstream tag are accepted when their own records agree (see _validate_bundle),
-# so an installed loader can update to a release on a newer upstream base.
-BASELINE_TAG = 'v3.2.10'
+# Bundles may be built on any upstream SDK tag. The installer accepts a bundle
+# when its own records agree (see _validate_bundle), so an installed loader can
+# update to a release on a newer upstream base.
 SDK_TAG = re.compile(r'v\d+\.\d+\.\d+(-pre\d+)?')
 SERVICE_STOP_DIRECTORY = Path('/run/decky-loader-runtime-stops')
 LEGACY_MIGRATION_ROOT = Path('/var/lib/decky-loader-runtime/legacy-migrations')

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import pwd
+import re
 from urllib.parse import quote
 
 import aiohttp
@@ -97,7 +98,7 @@ async def main(base: str, privileged: bool, expected_version: str, expected_user
             assert user == {'username': account.pw_name, 'path': account.pw_dir}, user
             version = await client.call('updater/get_version_info')
             assert version['current'] == expected_version, version
-            assert version['sdk_version'] == 'v3.2.10', version
+            assert re.fullmatch(r'v\d+\.\d+\.\d+(-pre\d+)?', version['sdk_version']), version
 
             modern = await client.call('loader/call_plugin_method', 'Rust Probe Modern', 'compute', [3, 4])
             assert modern['total'] == 25 and modern['alias'] and modern['user'] == account.pw_uid, modern
