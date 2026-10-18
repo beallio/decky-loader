@@ -104,12 +104,33 @@ export async function getVersionList(): Promise<UpdateEndpointVersions> {
 
   const storeURL = await getStoreBaseURL();
 
-  return fetch(storeURL + '/versions', {
-    method: 'GET',
-    headers: {
-      'X-Decky-Version': version.current,
-    },
-  }).then((r) => r.json());
+  try {
+    const response = await fetch(storeURL + '/versions', {
+      method: 'GET',
+      headers: {
+        'X-Decky-Version': version.current,
+      },
+    });
+    if (response.ok) {
+      const versions = await response.json();
+      if (versions && typeof versions === 'object' && !Array.isArray(versions)) return versions;
+    }
+  } catch (e) {
+    console.debug('Store version list unavailable, using the plugin list', e);
+  }
+  // Fork: a store that cannot answer <store URL>/versions (for example a single
+  // plugins.json file) still gets update checks, from its full plugin list.
+  return versionsFromPluginList(await getPluginList());
+}
+
+function versionsFromPluginList(plugins: StorePlugin[]): UpdateEndpointVersions {
+  const versions: UpdateEndpointVersions = {};
+  for (const plugin of plugins) {
+    const latest = plugin.versions?.[0];
+    if (!latest || plugin.name in versions) continue;
+    versions[plugin.name] = latest.artifact ? [latest.name, latest.hash, latest.artifact] : [latest.name, latest.hash];
+  }
+  return versions;
 }
 
 export async function installFromURL(url: string) {
