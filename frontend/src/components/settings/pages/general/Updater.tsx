@@ -90,7 +90,7 @@ function PatchNotesModal({ versionInfo, closeModal }: { versionInfo: VerInfo | n
 }
 
 export default function UpdaterSettings() {
-  const { isLoaderUpdating, versionInfo, setVersionInfo } = useDeckyState();
+  const { isLoaderUpdating, versionInfo, setVersionInfo, setIsLoaderUpdating } = useDeckyState();
 
   const [checkingForUpdates, setCheckingForUpdates] = useState<boolean>(false);
   const [updateProgress, setUpdateProgress] = useState<number>(-1);
@@ -152,7 +152,19 @@ export default function UpdaterSettings() {
                   }
                 : async () => {
                     setUpdateProgress(0);
-                    doUpdate();
+                    try {
+                      await doUpdate();
+                    } catch (e) {
+                      // Fork: report a failed update; upstream left the progress bar frozen until a restart.
+                      setUpdateProgress(-1);
+                      setReloading(false);
+                      setIsLoaderUpdating(false);
+                      DeckyPluginLoader.toaster.toast({
+                        title: t('Updater.updates.failed'),
+                        body: e instanceof Error ? e.message : String(e),
+                        icon: <FaExclamation />,
+                      });
+                    }
                   }
             }
           >

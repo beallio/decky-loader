@@ -40,6 +40,7 @@ SDK_OVERLAYS = (
     'frontend/src/components/settings/pages/developer/index.tsx',
     'backend/decky_loader/settings.py',
     'frontend/src/store.tsx',
+    'frontend/src/components/settings/pages/general/Updater.tsx',
 )
 SDK_REMOVALS = (
     'frontend/src/steamfixes/README.md',
