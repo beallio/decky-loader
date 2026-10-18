@@ -13,7 +13,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, NoReturn
+from typing import Any, Iterable, NoReturn
 import pwd
 import re
 import shutil
@@ -5732,42 +5732,61 @@ def _install_root_runtime(bundle: Path, user: pwd.struct_passwd, state: Path, cr
     return runtime, manifest
 
 
+def _root_host_unit_paths(user: pwd.struct_passwd) -> tuple[Path, Path]:
+    name = _root_host_unit_name(user)
+    return ROOT_HOST_UNIT_DIRECTORY / f'{name}.socket', ROOT_HOST_UNIT_DIRECTORY / f'{name}.service'
+
+
+def _snapshot_files(paths: Iterable[Path]) -> dict[Path, tuple[bytes, int] | None]:
+    """Contents and mode of each regular file, or None for a missing one."""
+    snapshots: dict[Path, tuple[bytes, int] | None] = {}
+    for path in paths:
+        info = _lstat_regular_or_absent(path)
+        snapshots[path] = None if info is None else (path.read_bytes(), stat.S_IMODE(info.st_mode))
+    return snapshots
+
+
+def _restore_root_host(user: pwd.struct_passwd, snapshots: dict[Path, tuple[bytes, int] | None]) -> None:
+    """Put config, state and units back after a failed enable or update.
+
+    Without this, the units would point at a runtime that the failed command deletes.
+    """
+    paths: dict[str, Any] = {'unit': Path(f'{_root_host_unit_name(user)}.socket'), 'scope': 'system'}
+    socket_unit, service_unit = _root_host_unit_paths(user)
+    if snapshots.get(socket_unit) is None:
+        # This command created the units, so it may also have enabled them.
+        _systemctl(paths, 'disable', '--now', socket_unit.name, check=False)
+        _systemctl(paths, 'stop', service_unit.name, check=False)
+    for path, snapshot in snapshots.items():
+        if snapshot is None:
+            if _lstat_regular_or_absent(path) is not None:
+                path.unlink()
+                _fsync_directory(path.parent)
+        else:
+            data, mode = snapshot
+            _write_atomic(path, data, mode)
+    _systemctl(paths, 'daemon-reload', check=False)
+
+
 def _write_root_host_files(user: pwd.struct_passwd, homebrew: Path, state: Path, runtime: Path, manifest: dict[str, Any]) -> None:
-    """Write config.json and the units for `runtime`, then reload systemd."""
+    """Write config.json and the units for `runtime`, then reload systemd.
+
+    Callers snapshot these files first and call _restore_root_host if any later step fails.
+    """
     import grp
 
     config = state / 'config.json'
     previous = _read_root_host_json(config) or {}
     group = grp.getgrgid(user.pw_gid).gr_name
-    unit_files = {
-        ROOT_HOST_UNIT_DIRECTORY / name: text.encode()
-        for name, text in _root_host_units(user, group, runtime, config).items()
-    }
-    targets = (config, *unit_files)
-    snapshots: dict[Path, tuple[bytes, int] | None] = {}
-    for path in targets:
-        info = _lstat_regular_or_absent(path)
-        snapshots[path] = None if info is None else (path.read_bytes(), stat.S_IMODE(info.st_mode))
-    try:
-        _write_json(config, {
-            'protocol': ROOT_HOST_PROTOCOL, 'user': user.pw_name, 'uid': user.pw_uid, 'gid': user.pw_gid,
-            'homebrew': str(homebrew), 'runtime': runtime.name, 'release_version': manifest.get('release_version'),
-            'store_hosts': list(ROOT_HOST_STORE_HOSTS),
-            'release_repository': previous.get('release_repository') or DEFAULT_RELEASE_REPOSITORY,
-        }, 0o644)
-        for path, data in unit_files.items():
-            _write_atomic(path, data, 0o644)
-        _systemctl({'unit': Path(f'{_root_host_unit_name(user)}.socket'), 'scope': 'system'}, 'daemon-reload')
-    except BaseException:
-        for path, snapshot in snapshots.items():
-            if snapshot is None:
-                if _lstat_regular_or_absent(path) is not None:
-                    path.unlink()
-                    _fsync_directory(path.parent)
-            else:
-                data, mode = snapshot
-                _write_atomic(path, data, mode)
-        raise
+    _write_json(config, {
+        'protocol': ROOT_HOST_PROTOCOL, 'user': user.pw_name, 'uid': user.pw_uid, 'gid': user.pw_gid,
+        'homebrew': str(homebrew), 'runtime': runtime.name, 'release_version': manifest.get('release_version'),
+        'store_hosts': list(ROOT_HOST_STORE_HOSTS),
+        'release_repository': previous.get('release_repository') or DEFAULT_RELEASE_REPOSITORY,
+    }, 0o644)
+    for name, text in _root_host_units(user, group, runtime, config).items():
+        _write_atomic(ROOT_HOST_UNIT_DIRECTORY / name, text.encode(), 0o644)
+    _systemctl({'unit': Path(f'{_root_host_unit_name(user)}.socket'), 'scope': 'system'}, 'daemon-reload')
 
 
 def _prune_root_runtimes(state: Path, keep: set[str]) -> None:
@@ -5786,12 +5805,14 @@ def _run_enable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
     paths: dict[str, Any] = {'unit': Path(f'{_root_host_unit_name(user)}.socket'), 'scope': 'system'}
     created: list[Path] = []
     adopted: list[str] = []
+    snapshots: dict[Path, tuple[bytes, int] | None] | None = None
     try:
         runtime, manifest = _install_root_runtime(Path(args.bundle), user, state, created)
         plugins: dict[str, Any] = dict((_read_root_host_json(state / 'state.json') or {}).get('plugins') or {})
         for directory in args.adopt or ():
             plugins[directory] = _adopt_root_plugin(runtime, homebrew, directory, user)
             adopted.append(directory)
+        snapshots = _snapshot_files((state / 'state.json', state / 'config.json', *_root_host_unit_paths(user)))
         _write_json(state / 'state.json', {'plugins': plugins}, 0o644)
         _write_root_host_files(user, homebrew, state, runtime, manifest)
         # A running host keeps its old runtime until it stops; it holds no state.
@@ -5799,6 +5820,11 @@ def _run_enable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
         _systemctl(paths, 'enable', '--now', paths['unit'].name)
         _prune_root_runtimes(state, {runtime.name})
     except BaseException:
+        if snapshots is not None:
+            try:
+                _restore_root_host(user, snapshots)
+            except (OSError, InstallerError) as error:
+                print(f'install.py: could not restore the root plugin service files: {error}', file=sys.stderr)
         for directory in adopted:
             try:
                 directory_fd = _open_plugin_directory(homebrew, directory, user)
@@ -5890,6 +5916,7 @@ def _run_update_root_host(args: argparse.Namespace) -> dict[str, object]:
         _fail(f'{ROOT_HOST_BUNDLE_ASSET}.sha256 is malformed')
     work = state / 'runtimes' / f'.download-{uuid.uuid4().hex}'
     created: list[Path] = []
+    snapshots: dict[Path, tuple[bytes, int] | None] | None = None
     _root_directory(state / 'runtimes', 0o755)
     work.mkdir(mode=0o700)
     try:
@@ -5901,10 +5928,16 @@ def _run_update_root_host(args: argparse.Namespace) -> dict[str, object]:
         runtime, manifest = _install_root_runtime(work / 'bundle', user, state, created)
         if manifest.get('release_version') != args.tag:
             _fail(f'release {args.tag} contains bundle {manifest.get("release_version")}')
+        snapshots = _snapshot_files((state / 'config.json', *_root_host_unit_paths(user)))
         _write_root_host_files(user, homebrew, state, runtime, manifest)
         # Keep the runtime that the host runs now; it switches at its next start.
         _prune_root_runtimes(state, {runtime.name, str(config.get('runtime'))})
     except BaseException:
+        if snapshots is not None:
+            try:
+                _restore_root_host(user, snapshots)
+            except (OSError, InstallerError) as error:
+                print(f'install.py: could not restore the root plugin service files: {error}', file=sys.stderr)
         for path in reversed(created):
             if path.parent == state / 'runtimes':
                 shutil.rmtree(path, ignore_errors=True)

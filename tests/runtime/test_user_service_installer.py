@@ -1,4 +1,5 @@
 """User-manager, bundle identity, and legacy restoration safety behavior."""
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -578,49 +579,70 @@ class UserServiceInstallerTests(unittest.TestCase):
             self.assertEqual((original / "main.py").read_text(encoding="utf-8"), "original plugin\n")
             self.assertEqual({path.name for path in plugins.iterdir()}, {"Demo"})
 
-    def test_root_host_files_are_restored_when_daemon_reload_fails(self):
+    def test_failed_root_enable_restores_files_and_removes_the_new_runtime(self):
         user = pwd.getpwuid(os.geteuid())
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            state = root / "state"
-            units = root / "systemd"
-            state.mkdir()
-            units.mkdir()
-            config = state / "config.json"
-            original_config = json.dumps({"release_repository": "owner/previous"}).encode()
-            config.write_bytes(original_config)
-            config.chmod(0o640)
-            unit_name = installer._root_host_unit_name(user)
-            service = units / f"{unit_name}.service"
-            socket = units / f"{unit_name}.socket"
-            original_service = b"previous service unit\n"
-            service.write_bytes(original_service)
-            service.chmod(0o600)
+        for failing in ("daemon-reload", "enable"):
+            with self.subTest(failing=failing), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state_root = root / "root-host"
+                state = state_root / str(user.pw_uid)
+                units = root / "systemd"
+                state.mkdir(parents=True)
+                units.mkdir()
+                config = state / "config.json"
+                original_config = json.dumps({"release_repository": "owner/previous", "runtime": "old"}).encode()
+                config.write_bytes(original_config)
+                config.chmod(0o640)
+                state_file = state / "state.json"
+                original_state = b'{"plugins": {}}\n'
+                state_file.write_bytes(original_state)
+                unit_name = installer._root_host_unit_name(user)
+                service = units / f"{unit_name}.service"
+                socket = units / f"{unit_name}.socket"
+                original_service = b"previous service unit\n"
+                service.write_bytes(original_service)
+                service.chmod(0o600)
+                new_runtime = state / "runtimes" / "new"
+                calls = []
 
-            def read_config(path):
-                if not path.exists():
-                    return None
-                return json.loads(path.read_text(encoding="utf-8"))
+                def install_runtime(bundle, account, state_directory, created):
+                    new_runtime.mkdir(parents=True)
+                    created.append(new_runtime)
+                    return new_runtime, {"release_version": "new-release"}
 
-            with (
-                patch.object(installer, "ROOT_HOST_UNIT_DIRECTORY", units),
-                patch.object(installer, "_read_root_host_json", side_effect=read_config),
-                patch.object(
-                    installer,
-                    "_systemctl",
-                    side_effect=installer.InstallerError("synthetic reload failure"),
-                ),
-            ):
-                with self.assertRaisesRegex(installer.InstallerError, "synthetic reload failure"):
-                    installer._write_root_host_files(
-                        user, root / "homebrew", state, root / "runtime", {"release_version": "new-release"}
-                    )
+                def systemctl(paths, *arguments, check=True, **kwargs):
+                    calls.append(arguments)
+                    # Forward steps run checked; the rollback's own calls are unchecked and succeed.
+                    if check and arguments[0] == failing:
+                        raise installer.InstallerError(f"synthetic {failing} failure")
+                    return subprocess.CompletedProcess(arguments, 0, "", "")
 
-            self.assertEqual(config.read_bytes(), original_config)
-            self.assertEqual(config.stat().st_mode & 0o777, 0o640)
-            self.assertEqual(service.read_bytes(), original_service)
-            self.assertEqual(service.stat().st_mode & 0o777, 0o600)
-            self.assertFalse(socket.exists())
+                def read_config(path):
+                    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+                args = argparse.Namespace(user=user.pw_name, homebrew=str(root / "homebrew"),
+                                          bundle=str(root / "bundle"), adopt=None)
+                with (
+                    patch.object(installer, "_require_root"),
+                    patch.object(installer, "_homebrew_path", return_value=root / "homebrew"),
+                    patch.object(installer, "ROOT_HOST_STATE", state_root),
+                    patch.object(installer, "ROOT_HOST_UNIT_DIRECTORY", units),
+                    patch.object(installer, "_install_root_runtime", side_effect=install_runtime),
+                    patch.object(installer, "_read_root_host_json", side_effect=read_config),
+                    patch.object(installer, "_systemctl", side_effect=systemctl),
+                ):
+                    with self.assertRaisesRegex(installer.InstallerError, f"synthetic {failing} failure"):
+                        installer._run_enable_root_plugins(args)
+
+                self.assertEqual(config.read_bytes(), original_config)
+                self.assertEqual(config.stat().st_mode & 0o777, 0o640)
+                self.assertEqual(state_file.read_bytes(), original_state)
+                self.assertEqual(service.read_bytes(), original_service)
+                self.assertEqual(service.stat().st_mode & 0o777, 0o600)
+                self.assertFalse(socket.exists())
+                self.assertFalse(new_runtime.exists())
+                # The socket did not exist before, so a socket this command enabled is disabled again.
+                self.assertIn(("disable", "--now", socket.name), calls)
 
 
 if __name__ == "__main__":
