@@ -41,7 +41,10 @@ KIND = 'decky-loader-runtime'
 BASELINE_TAG = 'v3.2.10'
 SERVICE_STOP_DIRECTORY = Path('/run/decky-loader-runtime-stops')
 LEGACY_MIGRATION_ROOT = Path('/var/lib/decky-loader-runtime/legacy-migrations')
-ROOT_HOST_STATE = Path('/var/lib/decky-loader-runtime/root-host')
+# On SteamOS /var is a small partition (about 230 MB) and each runtime is about
+# 100 MB, so the root runtime lives on the large /home partition. /home belongs
+# to root, so the user cannot change anything below this folder.
+ROOT_HOST_STATE = Path('/home/.decky-loader-runtime/root-host')
 ROOT_HOST_RUN = Path('/run/decky-loader-runtime')
 ROOT_HOST_UNIT_DIRECTORY = Path('/etc/systemd/system')
 ROOT_HOST_PROTOCOL = 1
@@ -5580,6 +5583,9 @@ def _install_root_runtime(bundle: Path, user: pwd.struct_passwd, state: Path, cr
 
     The copy is checked, not the source, because the user can change the source.
     """
+    parent = ROOT_HOST_STATE.parent.parent.lstat()
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or parent.st_mode & 0o022:
+        _fail(f'{ROOT_HOST_STATE.parent.parent} must be a folder that only root can change')
     for path in (ROOT_HOST_STATE.parent, ROOT_HOST_STATE, state, state / 'runtimes'):
         if not path.exists():
             created.append(path)
@@ -5802,6 +5808,11 @@ def _run_disable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
         returned.append(directory)
     shutil.rmtree(state, ignore_errors=True)
     shutil.rmtree(ROOT_HOST_RUN / str(user.pw_uid), ignore_errors=True)
+    for path in (ROOT_HOST_STATE, ROOT_HOST_STATE.parent):
+        try:
+            path.rmdir()
+        except OSError:
+            break
     return {'ok': True, 'root_host': 'disabled', 'returned_to_user': returned}
 
 

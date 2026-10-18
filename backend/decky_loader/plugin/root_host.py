@@ -41,7 +41,6 @@ from typing import Any, Callable, cast
 from decky_loader.plugin import launcher, worker
 
 PROTOCOL = 1
-STATE_ROOT = Path("/var/lib/decky-loader-runtime/root-host")
 RUN_ROOT = Path("/run/decky-loader-runtime")
 IDLE_EXIT_SECONDS = 60.0
 _STOP_TIMEOUT = 5.0

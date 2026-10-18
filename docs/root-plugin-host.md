@@ -51,7 +51,7 @@ Consequences:
      `deck` made cannot pass, because `deck` cannot create root-owned files. A swapped root-owned
      folder fails the hash check.
    - Each root plugin runs in its own mount namespace. The checked folder is mounted read-only
-     at a root-owned path, `/var/lib/decky-loader-runtime/root-host/<uid>/mnt/<dir>`, with
+     at a root-owned path, `/home/.decky-loader-runtime/root-host/<uid>/mnt/<dir>`, with
      slave propagation so new USB and SD card mounts still appear. `DECKY_PLUGIN_DIR` and the
      plugin's `__file__` point there. Linux binds only from mounts in the caller's namespace, so
      after `unshare` the child opens the public path again and mounts it only if its device and
@@ -85,9 +85,9 @@ flowchart LR
 
 | Part | Where | Owner |
 |---|---|---|
-| Root host binary and Python worker | `/var/lib/decky-loader-runtime/root-host/<uid>/runtimes/<id>/` (copied from a verified bundle) | root, mode 0755 |
+| Root host binary and Python worker | `/home/.decky-loader-runtime/root-host/<uid>/runtimes/<id>/` (copied from a verified bundle). Not `/var/lib`: on SteamOS `/var` is a 230 MB partition and each runtime is about 100 MB | root, mode 0755 |
 | Root plugin code | `~/homebrew/plugins/<dir>/`, as on official Decky; tree hash in `state.json` | root, no group or other write |
-| Root host state (installed plugins, versions, hashes, store URL) | `/var/lib/decky-loader-runtime/root-host/<uid>/state.json` | root, 0600 |
+| Root host config and state (approved plugins, tree hashes, runtime, store hosts) | `/home/.decky-loader-runtime/root-host/<uid>/{config,state}.json` | root, 0644 |
 | Control socket | `/run/decky-loader-runtime/<uid>/root-host.sock`, from a systemd socket unit | file owned by `deck`, mode 0600; the folder is root-owned, mode 0711 |
 | Root plugin IPC sockets | `/run/decky-loader-runtime/<uid>/root-plugins/` | root folder 0711; each socket is given to `deck` with mode 0600 |
 | Units | `/etc/systemd/system/decky-root-plugins-<user>.{socket,service}` | root |
