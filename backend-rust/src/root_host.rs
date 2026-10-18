@@ -27,6 +27,8 @@ const PROTOCOL: i64 = 1;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 // The host waits up to 5 s for SIGTERM, then sends SIGKILL and reaps the group.
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+// The host downloads and checks the plugin itself.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 pub(crate) const NOT_ENABLED: &str = "This plugin needs root. Run `bash install-to-deck.sh --enable-root-plugins` to allow plugins that need root.";
 
@@ -38,6 +40,7 @@ pub(crate) struct HostEnvironment<'a> {
     pub auth_token: &'a str,
     pub server_host: &'a str,
     pub server_port: u16,
+    pub loader_version: &'a str,
 }
 
 struct Control {
@@ -89,6 +92,7 @@ impl RootHost {
                     "auth_token": environment.auth_token,
                     "server_host": environment.server_host,
                     "server_port": environment.server_port,
+                    "loader_version": environment.loader_version,
                 }),
                 "hello",
                 CONTROL_TIMEOUT,
@@ -97,7 +101,7 @@ impl RootHost {
         if hello["protocol"].as_i64() != Some(PROTOCOL) {
             host.failed.store(true, Ordering::Release);
             bail!(
-                "the root plugin host speaks protocol {}, but this loader needs {PROTOCOL}; run the installer again",
+                "the root plugin host speaks protocol {}, but this loader needs {PROTOCOL}; it updates itself, so restart Decky in a few minutes",
                 hello["protocol"]
             );
         }
@@ -162,6 +166,37 @@ impl RootHost {
             .request(json!({"op": "stop", "id": id}), "stopped", STOP_TIMEOUT)
             .await?;
         wait_status(&response)
+    }
+
+    /// Has the host download a store plugin that needs root, check it against its
+    /// store SHA-256, and put it in `directory`. The host accepts only store URLs.
+    pub(crate) async fn install(
+        &self,
+        directory: &str,
+        name: &str,
+        sha256: &str,
+        artifact: &str,
+    ) -> Result<()> {
+        self.request(
+            json!({
+                "op": "install", "directory": directory, "name": name,
+                "sha256": sha256, "artifact": artifact,
+            }),
+            "installed",
+            INSTALL_TIMEOUT,
+        )
+        .await
+        .map(drop)
+    }
+
+    pub(crate) async fn uninstall(&self, directory: &str) -> Result<()> {
+        self.request(
+            json!({"op": "uninstall", "directory": directory}),
+            "uninstalled",
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .map(drop)
     }
 
     pub(crate) async fn forget_child(&self, id: &str) -> Result<()> {
@@ -239,6 +274,7 @@ mod tests {
         auth_token: "token",
         server_host: "127.0.0.1",
         server_port: 1337,
+        loader_version: "v3.2.10-rust.8",
     };
 
     /// A fake host that answers each request with the next scripted reply and

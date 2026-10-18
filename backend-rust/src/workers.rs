@@ -118,6 +118,7 @@ pub struct PluginRegistry {
     server_host: String,
     server_port: u16,
     chown_plugin_path: bool,
+    loader_version: String,
     socket_directory: PathBuf,
     events: broadcast::Sender<Value>,
     shutdown: watch::Receiver<bool>,
@@ -185,6 +186,8 @@ pub struct WorkerConfiguration {
     pub server_host: String,
     pub server_port: u16,
     pub chown_plugin_path: bool,
+    /// Sent to the root plugin host, which updates its runtime to match.
+    pub loader_version: String,
 }
 
 struct WorkerLaunchConfig<'a> {
@@ -360,6 +363,7 @@ impl PluginRegistry {
             server_host,
             server_port,
             chown_plugin_path,
+            loader_version,
         } = worker;
         let loader_settings_path = plugin_root
             .parent()
@@ -387,6 +391,7 @@ impl PluginRegistry {
             server_host,
             server_port,
             chown_plugin_path,
+            loader_version,
             socket_directory,
             events,
             shutdown: shutdown.clone(),
@@ -1241,6 +1246,11 @@ impl PluginRegistry {
         metadata.requires_root && platform::effective_user_ids().0 != 0
     }
 
+    /// The connection to the root plugin host, opened on first use.
+    pub(crate) async fn root_host(&self) -> std::result::Result<Arc<RootHost>, WorkerError> {
+        self.ensure_root_host().await
+    }
+
     async fn ensure_root_host(&self) -> std::result::Result<Arc<RootHost>, WorkerError> {
         let mut current = self.root_host.lock().await;
         if let Some(host) = current.as_ref()
@@ -1257,6 +1267,7 @@ impl PluginRegistry {
                 auth_token: &self.auth_token,
                 server_host: &self.server_host,
                 server_port: self.server_port,
+                loader_version: &self.loader_version,
             },
         )
         .await
@@ -2092,6 +2103,7 @@ mod plugin_permission_tests {
                 server_host: "127.0.0.1".into(),
                 server_port: 1339,
                 chown_plugin_path: false,
+                loader_version: "dev".into(),
             },
             plugin_root,
             temporary.0.clone(),
@@ -3684,6 +3696,7 @@ mod launcher_failure_tests {
                     server_host: "127.0.0.1".into(),
                     server_port: 1339,
                     chown_plugin_path: false,
+                    loader_version: "dev".into(),
                 },
                 plugin_root,
                 homebrew.0.clone(),

@@ -235,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
             server_host: address.ip().to_string(),
             server_port: address.port(),
             chown_plugin_path: config.chown_plugin_path,
+            loader_version: version.clone(),
         },
         plugin_root,
         homebrew.clone(),

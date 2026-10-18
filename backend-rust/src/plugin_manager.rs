@@ -14,6 +14,7 @@ use zip::ZipArchive;
 
 use crate::{
     backend::{Backend, RpcError},
+    platform,
     workers::WorkerError,
 };
 
@@ -220,6 +221,7 @@ impl Drop for FilesystemReplacement {
 #[derive(Clone)]
 struct PluginCandidate {
     name: String,
+    requires_root: bool,
 }
 
 pub struct PluginManager {
@@ -454,6 +456,13 @@ impl PluginManager {
             )));
         }
         let installed_name = candidate.name.clone();
+        if candidate.requires_root && platform::effective_user_ids().0 != 0 {
+            // Root plugin files must come from root, not from this account's download.
+            drop(stage);
+            self.install_root_plugin(backend, request, &archive_directory, &installed_name)
+                .await?;
+            return Ok(installed_name);
+        }
         download_info(backend, 95, "Store.download_progress_info.download_remote");
         download_remote_binaries(backend, &stage.path).await?;
         let stage_name = stage.directory_name()?.to_owned();
@@ -465,6 +474,114 @@ impl PluginManager {
         self.commit_staged_plugin(backend, &installed_name, &archive_directory, &stage)
             .await?;
         Ok(installed_name)
+    }
+
+    /// Installs or updates a plugin that needs root through the root plugin host.
+    /// The host downloads the archive itself and accepts only store URLs and the
+    /// store's SHA-256, so this account cannot hand it other code.
+    async fn install_root_plugin(
+        &self,
+        backend: &Backend,
+        request: &InstallRequest,
+        directory: &str,
+        name: &str,
+    ) -> Result<(), RpcError> {
+        let store_only = || {
+            RpcError::failure("Plugins that need root can only be installed from the Decky store")
+        };
+        let sha256 = request
+            .hash
+            .as_str()
+            .filter(|hash| !hash.is_empty())
+            .ok_or_else(store_only)?;
+        if !request.artifact.starts_with("https://") {
+            return Err(store_only());
+        }
+        let host = backend.registry.root_host().await.map_err(worker_error)?;
+        let _transaction = backend
+            .registry
+            .begin_install_transaction()
+            .map_err(worker_error)?;
+        let plugin_root = canonical_plugin_root(backend.registry.plugin_root())?;
+        let registered_directory = backend.registry.directory(name).await;
+        let was_registered = registered_directory.is_some();
+        let old_directory = match registered_directory {
+            Some(directory) => Some(checked_plugin_directory(&plugin_root, &directory)?),
+            None => find_plugin_directory(&plugin_root, name)?,
+        };
+        let target = plugin_root.join(directory);
+        match &old_directory {
+            Some(old) if old != &target => {
+                return Err(RpcError::failure(format!(
+                    "Plugin {name} now uses the folder {directory}; uninstall it, then install it again"
+                )));
+            }
+            None if target.exists() => {
+                return Err(RpcError::failure(format!(
+                    "Plugin directory {} is already occupied",
+                    target.display()
+                )));
+            }
+            _ => {}
+        }
+        let was_installed = was_registered || old_directory.is_some();
+        let before_settings = if was_registered {
+            Some(read_settings_lists(backend, &SETTINGS_KEYS).await?)
+        } else if !was_installed {
+            Some(read_settings_lists(backend, &["pluginOrder"]).await?)
+        } else {
+            None
+        };
+        if was_registered {
+            backend
+                .registry
+                .remove(name, true)
+                .await
+                .map_err(worker_error)?;
+        } else if was_installed {
+            backend.emit("loader/unload_plugin", vec![Value::String(name.to_owned())]);
+        }
+
+        download_info(
+            backend,
+            95,
+            "Store.download_progress_info.installing_plugin",
+        );
+        if let Err(error) = host
+            .install(directory, name, sha256, &request.artifact)
+            .await
+        {
+            let restore_error = if was_registered {
+                restore_registered_plugin(backend, old_directory.as_deref())
+                    .await
+                    .err()
+            } else {
+                None
+            };
+            return Err(RpcError::failure(with_rollback_error(
+                format!("Could not install {name}: {error:#}"),
+                restore_error,
+            )));
+        }
+
+        if let Some(before) = &before_settings {
+            let mut after = before.clone();
+            if was_registered {
+                for key in SETTINGS_KEYS {
+                    remove_first(after.get_mut(key), name);
+                }
+            } else {
+                after.get_mut("pluginOrder").push(name.to_owned());
+            }
+            persist_settings_lists(backend, before, &after).await?;
+        }
+        backend
+            .registry
+            .import_directory(directory, false, false)
+            .await
+            .map_err(|error| {
+                RpcError::failure(format!("Could not load installed plugin {name}: {error}"))
+            })
     }
 
     async fn commit_staged_plugin(
@@ -683,7 +800,7 @@ impl PluginManager {
             }
         }
 
-        if let Err(error) = tokio::fs::remove_dir_all(&directory).await {
+        if let Err(error) = remove_plugin_directory(backend, &directory).await {
             let settings_error = if let Some(before) = &before_settings {
                 restore_settings_lists(backend, before).await.err()
             } else {
@@ -1142,9 +1259,39 @@ fn read_plugin_candidate(directory: &Path) -> Result<PluginCandidate, RpcError> 
             ));
         }
     }
+    let requires_root = flags.iter().any(|flag| flag.as_str() == Some("root"));
     Ok(PluginCandidate {
         name: name.to_owned(),
+        requires_root,
     })
+}
+
+/// Removes a plugin folder. Folders that root owns (approved root plugins) are
+/// removed by the root plugin host, because this account cannot change them.
+async fn remove_plugin_directory(backend: &Backend, directory: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let owner = fs::symlink_metadata(directory)
+        .map_err(|error| error.to_string())?
+        .uid();
+    if owner == 0 && platform::effective_user_ids().0 != 0 {
+        let name = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "plugin folder name is not valid UTF-8".to_owned())?;
+        let host = backend
+            .registry
+            .root_host()
+            .await
+            .map_err(|error| error.to_string())?;
+        return host
+            .uninstall(name)
+            .await
+            .map_err(|error| format!("{error:#}"));
+    }
+    tokio::fs::remove_dir_all(directory)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn read_json_file(path: &Path) -> Result<Value, RpcError> {

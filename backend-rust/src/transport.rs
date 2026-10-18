@@ -1019,6 +1019,7 @@ mod tests {
                     server_host: "127.0.0.1".into(),
                     server_port: 1339,
                     chown_plugin_path: false,
+                    loader_version: "dev".into(),
                 },
                 plugin_root,
                 directory.0.clone(),
