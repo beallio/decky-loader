@@ -353,15 +353,29 @@ impl Updater {
             "{}/{repository}/actions/artifacts/{artifact_id}.zip",
             backend.config.testing_download_url.trim_end_matches('/')
         );
-        // nightly.link artifacts have no checksum sidecar.
-        self.download_bundle_and_handoff(
-            backend,
-            &archive_url,
-            &format!("PR-{pr_id}"),
-            artifact_size,
-            None,
-        )
-        .await?;
+
+        let mut temporary = UpdateFiles::new(backend).await?;
+        let archive = temporary.reserve("zip").await?;
+        download_to_file(backend, &archive_url, &archive, artifact_size).await?;
+        let artifact = temporary.reserve_directory("artifact").await?;
+        extract_bundle_archive(archive.clone(), artifact.clone()).await?;
+        tokio::fs::remove_file(&archive)
+            .await
+            .map_err(|error| io_failure("removing downloaded testing artifact", error))?;
+
+        let (bundle_archive, checksum) = testing_bundle_paths(&artifact);
+        verify_testing_bundle_digest(&bundle_archive, &checksum).await?;
+        let bundle = temporary.reserve_directory("bundle").await?;
+        extract_bundle_archive(bundle_archive, bundle.clone()).await?;
+        let version = bundle_release_version(&bundle).await?;
+        queue_install_bundle(backend, &bundle, &version)
+            .await
+            .map_err(|error| {
+                RpcError::failure(format!(
+                    "testing version PR-{pr_id} install failed: {}",
+                    error.message()
+                ))
+            })?;
         Ok(Value::Null)
     }
 
@@ -386,6 +400,34 @@ impl Updater {
             .map_err(|error| io_failure("removing downloaded bundle archive", error))?;
         queue_install_bundle(backend, &bundle, version).await
     }
+}
+fn testing_bundle_paths(artifact: &Path) -> (PathBuf, PathBuf) {
+    (
+        artifact.join(RUST_BUNDLE_ASSET),
+        artifact.join(RUST_CHECKSUM_ASSET),
+    )
+}
+
+async fn verify_testing_bundle_digest(archive: &Path, checksum: &Path) -> Result<(), RpcError> {
+    let sidecar = tokio::fs::read_to_string(checksum)
+        .await
+        .map_err(|error| io_failure("reading testing bundle checksum", error))?;
+    let expected = parse_checksum_sidecar(&sidecar)?;
+    verify_bundle_digest(&expected, &file_sha256(archive.to_path_buf()).await?)
+}
+
+async fn bundle_release_version(bundle: &Path) -> Result<String, RpcError> {
+    let metadata = tokio::fs::read(bundle.join("bundle.json"))
+        .await
+        .map_err(|error| io_failure("reading testing bundle metadata", error))?;
+    let metadata: Value = serde_json::from_slice(&metadata)
+        .map_err(|error| RpcError::failure(format!("invalid Rust bundle metadata: {error}")))?;
+    metadata
+        .get("release_version")
+        .and_then(Value::as_str)
+        .filter(|version| !version.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| RpcError::failure("Rust bundle metadata has no release_version"))
 }
 
 impl Default for Updater {
@@ -971,12 +1013,14 @@ fn io_failure(operation: &str, error: io::Error) -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::{
-        RUST_BUNDLE_ASSET, RUST_CHECKSUM_ASSET, RUST_TESTING_ARTIFACT, default_branch,
-        filter_releases, parse_checksum_sidecar, resolve_branch, rust_bundle_asset,
-        rust_checksum_asset, rust_testing_artifact, secure_staging_directory, verify_bundle_digest,
+        RUST_BUNDLE_ASSET, RUST_CHECKSUM_ASSET, RUST_TESTING_ARTIFACT, bundle_release_version,
+        default_branch, filter_releases, parse_checksum_sidecar, resolve_branch, rust_bundle_asset,
+        rust_checksum_asset, rust_testing_artifact, secure_staging_directory, testing_bundle_paths,
+        verify_bundle_digest, verify_testing_bundle_digest,
     };
     use crate::backend::RpcError;
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use std::{
         fs,
         os::unix::fs::{MetadataExt, PermissionsExt, symlink},
@@ -1126,6 +1170,60 @@ mod tests {
         symlink(&target, &link).unwrap();
         assert!(secure_staging_directory(&link, uid).is_err());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn testing_artifact_selects_the_inner_runtime_zip_and_sidecar() {
+        let artifact =
+            std::env::temp_dir().join(format!("decky-artifact-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&artifact).unwrap();
+        let (archive, checksum) = testing_bundle_paths(&artifact);
+        fs::write(&archive, b"inner runtime zip").unwrap();
+        fs::write(&checksum, format!("{DIGEST}  {RUST_BUNDLE_ASSET}\n")).unwrap();
+
+        assert!(archive.is_file());
+        assert!(checksum.is_file());
+        assert_eq!(
+            archive.file_name().unwrap().to_str().unwrap(),
+            RUST_BUNDLE_ASSET
+        );
+        assert_eq!(
+            checksum.file_name().unwrap().to_str().unwrap(),
+            RUST_CHECKSUM_ASSET
+        );
+        fs::remove_dir_all(artifact).unwrap();
+    }
+
+    #[tokio::test]
+    async fn testing_bundle_digest_is_checked_against_its_sidecar() {
+        let artifact =
+            std::env::temp_dir().join(format!("decky-artifact-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&artifact).unwrap();
+        let (archive, checksum) = testing_bundle_paths(&artifact);
+        let contents = b"inner runtime zip";
+        fs::write(&archive, contents).unwrap();
+        let digest = format!("{:x}", Sha256::digest(contents));
+        fs::write(&checksum, format!("{digest}  {RUST_BUNDLE_ASSET}\n")).unwrap();
+
+        verify_testing_bundle_digest(&archive, &checksum)
+            .await
+            .unwrap();
+        fs::write(&archive, b"corrupted runtime zip").unwrap();
+        let error = verify_testing_bundle_digest(&archive, &checksum)
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("does not match"));
+        fs::remove_dir_all(artifact).unwrap();
+    }
+
+    #[tokio::test]
+    async fn testing_install_version_comes_from_bundle_metadata() {
+        let bundle = std::env::temp_dir().join(format!("decky-bundle-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&bundle).unwrap();
+        fs::write(bundle.join("bundle.json"), br#"{"release_version":"dev"}"#).unwrap();
+
+        assert_eq!(bundle_release_version(&bundle).await.unwrap(), "dev");
+        fs::remove_dir_all(bundle).unwrap();
     }
 
     #[test]
