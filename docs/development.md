@@ -95,7 +95,7 @@ The output directory must not already exist. A successful build produces:
 
 The manifest records source hashes, tool and package versions, and the Rust release identity. These records support repeatable builds; they do not promise byte-for-byte identical binaries on different hosts. Developer tools and tests are build inputs, not installed runtime payloads.
 
-The Python plugin support code and frontend are based on upstream `v3.3.0-pre1` (see `sdk` in [build-config.json](../backend-rust/build-config.json)). Bundle assembly verifies the pinned upstream baseline, records the worker startup changes, and checks packaged helper code against its source. The Rust release identity is separate; `dev` builds do not offer updates. CI fetches the upstream SDK tag and verifies its pinned commit and source hashes, so a fork does not need its own copy of that tag. The installer accepts a bundle on any upstream base when the bundle's recorded base and its worker's reported version agree, so installed loaders can update in-app across a base change.
+The Python plugin support code and frontend are based on upstream `v3.3.0` (see `sdk` in [build-config.json](../backend-rust/build-config.json)). Bundle assembly verifies the pinned upstream baseline, records the worker startup changes, and checks packaged helper code against its source. The Rust release identity is separate; `dev` builds do not offer updates. CI fetches the upstream SDK tag and verifies its pinned commit and source hashes, so a fork does not need its own copy of that tag. The installer accepts a bundle on any upstream base when the bundle's recorded base and its worker's reported version agree, so installed loaders can update in-app across a base change.
 
 ### Worker compatibility boundaries
 
@@ -155,7 +155,7 @@ The [Deck installer](../scripts/install-to-deck.sh) downloads the latest stable 
 
 ## Upstream sync
 
-The `Upstream Sync` workflow runs every week and can be started by hand. It runs `scripts/runtime/upstream_check.py`, which compares the pinned SDK tag in [build-config.json](../backend-rust/build-config.json) with the newest stable upstream tag `vX.Y.Z`. Pre-release tags are ignored. When a newer tag exists, the workflow opens one issue, `Upstream vX.Y.Z is available`, with the `upstream-sync` label. It updates that issue on later runs. When the fork is up to date, it does nothing.
+The `Upstream Sync` workflow runs every week and can be started by hand. It runs `scripts/runtime/upstream_check.py`, which compares the pinned SDK tag in [build-config.json](../backend-rust/build-config.json) with the newest upstream tag. Stable tags `vX.Y.Z` always count, and a stable release ranks above its prereleases. Prerelease tags `vX.Y.Z-preN` count only while the pin is itself a prerelease. When a newer tag exists, the workflow opens one issue, `Upstream vX.Y.Z is available`, with the `upstream-sync` label. It updates that issue on later runs. When the fork is up to date, it does nothing.
 
 The report has three parts:
 

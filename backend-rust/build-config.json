@@ -13,9 +13,9 @@
   "poetry_dynamic_versioning": "1.9.1",
   "pyinstaller": "6.22.3",
   "sdk": {
-    "tag": "v3.3.0-pre1",
-    "commit": "3d319c1a3364739da8efa8ab24690d897e6b5b06",
+    "tag": "v3.3.0",
+    "commit": "67196adfa9b299f20dfb0cc932e88a169417b7d5",
     "backend_tree": "6de1145f79df698a456915212a16d0b8c201aeb6",
-    "frontend_tree": "b4c1f0cb2350271b83385eb91376de5b0033bbcc"
+    "frontend_tree": "e05a98c68e9446f187df3c69cf8fcf2dc865e3c8"
   }
 }

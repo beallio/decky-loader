@@ -36,8 +36,6 @@ SDK_OVERLAYS = (
     'backend/decky_loader/locales/en-US.json',
     'frontend/src/components/modals/filepicker/index.tsx',
     'frontend/src/components/DeckyState.tsx',
-    # Formatting only: upstream's copy fails the Prettier check that CI runs.
-    'frontend/src/components/settings/pages/developer/index.tsx',
     'backend/decky_loader/settings.py',
     'frontend/src/store.tsx',
     'frontend/src/components/settings/pages/general/Updater.tsx',
