@@ -186,6 +186,57 @@ def _ensure_root_directory(path: Path, mode: int) -> None:
     os.chmod(path, mode)
 
 
+def _release_key(tag: Any) -> tuple[int, int, int, int, float] | None:
+    match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)-rust\.(\d+)(?:-rc\.(\d+))?", tag) if isinstance(tag, str) else None
+    if match is None:
+        return None
+    major, minor, patch, rust, rc = match.groups()
+    # A final release sorts after all of its release candidates.
+    return int(major), int(minor), int(patch), int(rust), float(rc) if rc is not None else float("inf")
+
+
+def _newer_release(candidate: str, current: Any) -> bool:
+    """True when `candidate` is a newer release than `current`.
+
+    The root runtime only moves forward, so a process that pretends to be an
+    older loader cannot make root install an older release. A `dev` runtime
+    (not a release) is always replaced.
+    """
+    new, old = _release_key(candidate), _release_key(current)
+    return new is not None and (old is None or new > old)
+
+
+def _only_root_can_change(path: Path) -> bool:
+    """True when the real path and every folder above it belong to root and are not group or other writable."""
+    try:
+        resolved = Path(os.path.realpath(path))
+        for part in (resolved, *resolved.parents):
+            info = os.lstat(part)
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def _root_system_pythonpaths() -> list[str]:
+    """System Python module folders for root plugins.
+
+    The user service asks python3 as the user, which includes the user's own
+    module folders. Root must not import from folders that the user can change,
+    so this asks an isolated python3 (no user site, no environment) and keeps
+    only folders that only root can change.
+    """
+    try:
+        result = subprocess.run(
+            ["/usr/bin/python3", "-I", "-c", "import sys; print('\\n'.join(p for p in sys.path if p))"],
+            capture_output=True, text=True, env={}, cwd="/", timeout=30, check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [path for path in result.stdout.splitlines() if path and _only_root_can_change(Path(path))]
+
+
 def _write_root_file(path: Path, value: Any) -> None:
     """Replace a root-owned JSON file in a folder that only root can change."""
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -381,6 +432,7 @@ class Host:
         self.update: subprocess.Popen[bytes] | None = None
         self.update_version = ""
         self.failed_updates: set[str] = set()
+        self.root_pythonpaths: list[str] | None = None
 
     # Connection handling
 
@@ -521,7 +573,8 @@ class Host:
             return True
         if not isinstance(loader_version, str) or not RELEASE_TAG.fullmatch(loader_version):
             return False
-        if loader_version == self.config.current().get("release_version") or loader_version in self.failed_updates:
+        current = self.config.current().get("release_version")
+        if loader_version in self.failed_updates or not _newer_release(loader_version, current):
             return False
         installer = Path(sys.executable).parent / "install.py"
         if not getattr(sys, "frozen", False) or not installer.is_file():
@@ -530,7 +583,9 @@ class Host:
         self.update = subprocess.Popen(
             ["/usr/bin/python3", "-B", str(installer), "update-root-host", "--user", self.config.user,
              "--homebrew", str(self.config.homebrew), "--tag", loader_version],
+            # A minimal environment: nothing from this process reaches the root installer.
             stdin=subprocess.DEVNULL, cwd="/", close_fds=True,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
         )
         print(f"DeckyRootHost: installing the root runtime for {loader_version}", file=sys.stderr, flush=True)
         return True
@@ -542,6 +597,11 @@ class Host:
             self.failed_updates.add(self.update_version)
             print(f"DeckyRootHost: root runtime update to {self.update_version} failed", file=sys.stderr, flush=True)
         self.update = None
+
+    def system_pythonpaths(self) -> list[str]:
+        if self.root_pythonpaths is None:
+            self.root_pythonpaths = _root_system_pythonpaths()
+        return self.root_pythonpaths
 
     def should_restart(self) -> bool:
         """True when an updated runtime is installed and nothing would be interrupted."""
@@ -718,7 +778,7 @@ class Host:
                     "descriptor": {"pid": os.getpid(), "fd": directory_fd, "device": info.st_dev, "inode": info.st_ino},
                     "metadata": metadata,
                 },
-                "system_pythonpaths": launcher._shared_system_pythonpaths(self.config.user),  # pyright: ignore[reportPrivateUsage]
+                "system_pythonpaths": self.system_pythonpaths(),
                 "socket_owner": [self.config.uid, self.config.gid],
                 "private_plugin_mount": {
                     "source_fd": directory_fd,
@@ -839,12 +899,12 @@ def _activation_socket() -> socket.socket:
     return listener
 
 
-def _tree_hash_command(directory: str) -> int:
-    directory_fd = os.open(directory, _DIRECTORY_FLAGS)
+def _tree_hash_command(directory: str | None, descriptor: int | None) -> int:
+    directory_fd = os.dup(descriptor) if descriptor is not None else os.open(cast(str, directory), _DIRECTORY_FLAGS)
     try:
         metadata = plugin_metadata(directory_fd)
         if "root" not in metadata["flags"]:
-            raise RootHostError(f"{directory} is not marked as a root plugin")
+            raise RootHostError(f"{directory or 'the plugin folder'} is not marked as a root plugin")
         print(json.dumps({
             "tree_sha256": plugin_tree_sha256(directory_fd),
             "name": metadata["name"],
@@ -859,10 +919,12 @@ def admin_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Root plugin host administration")
     commands = parser.add_subparsers(dest="command", required=True)
     tree_hash = commands.add_parser("tree-hash", help="check and hash a root-owned plugin folder")
-    tree_hash.add_argument("--directory", required=True)
+    source = tree_hash.add_mutually_exclusive_group(required=True)
+    source.add_argument("--directory")
+    source.add_argument("--fd", type=int, help="an open folder descriptor passed by the installer")
     args = parser.parse_args(argv)
     try:
-        return _tree_hash_command(args.directory)
+        return _tree_hash_command(args.directory, args.fd)
     except (RootHostError, OSError, ValueError) as error:
         print(f"DeckyRootHost: {error}", file=sys.stderr)
         return 1

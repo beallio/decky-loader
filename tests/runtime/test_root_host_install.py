@@ -112,6 +112,17 @@ class InstallRequestTest(unittest.TestCase):
                 self.assertFalse(host.update_runtime(version))
                 self.assertIsNone(host.update)
 
+    def test_root_runtime_only_moves_to_newer_releases(self) -> None:
+        current = "v3.2.10-rust.8-rc.9"
+        newer = ["v3.2.10-rust.8", "v3.2.10-rust.8-rc.10", "v3.2.10-rust.9-rc.1", "v3.3.0-rust.1-rc.1"]
+        not_newer = ["v3.2.10-rust.8-rc.9", "v3.2.10-rust.8-rc.8", "v3.2.10-rust.7", "v3.2.9-rust.9"]
+        for version in newer:
+            self.assertTrue(root_host._newer_release(version, current), version)  # pyright: ignore[reportPrivateUsage]
+        for version in not_newer:
+            self.assertFalse(root_host._newer_release(version, current), version)  # pyright: ignore[reportPrivateUsage]
+        # A development runtime is always replaced by a release.
+        self.assertTrue(root_host._newer_release("v3.2.10-rust.8-rc.1", "dev"))  # pyright: ignore[reportPrivateUsage]
+
 
 if __name__ == "__main__":
     unittest.main()

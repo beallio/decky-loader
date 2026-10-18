@@ -129,8 +129,10 @@ Decky, without following symlinks.
 
 - **Opt-in:** `bash install-to-deck.sh --enable-root-plugins`. It uses sudo once. It copies the
   verified runtime to the root location, writes the units and the allow list, and enables the
-  socket unit. `--disable-root-plugins` stops everything and removes the units and runtime. It
-  keeps plugin code and data unless `--purge` is also given.
+  socket unit. Approving an installed root plugin copies it into new root-owned files and swaps
+  the folders, so a user process that held a plugin file open for writing cannot change the
+  approved code. `--disable-root-plugins` stops everything, removes the units and runtime, and
+  gives root plugin folders back to the user.
 - **Start:** the socket unit starts the host when the backend connects. The backend connects only
   if at least one enabled plugin needs root. Without root plugins, no root process runs.
 - **Backend restart or crash:** root plugins belong to the control connection that started them.
@@ -140,17 +142,23 @@ Decky, without following symlinks.
 - **Store install:** the backend sees the `root` flag in the downloaded `plugin.json` and sends
   `install` instead of unpacking the ZIP itself. Root plugins from a URL or a local ZIP are
   refused. Uninstall goes through the host for root-owned folders.
-- **Loader update:** the backend sends its version in `hello`. If it is a release tag that differs
-  from the root runtime, the host starts `install.py update-root-host` from its own root-owned
-  runtime. That downloads the release ZIP and its `.sha256` file from the fork's GitHub releases,
-  checks them, unpacks and checks the bundle, and installs it as a new root runtime with new units.
-  It changes only files. The running host keeps serving; when a new connection arrives and it has
-  no connection and no plugins, it exits without accepting, and systemd starts the new runtime for
-  that connection. The previous runtime is kept until the next update.
+- **Loader update:** the backend sends its version in `hello`. If it is a release tag that is newer
+  than the root runtime (the root runtime never moves back, so a process that reports an old
+  version cannot make root install an old release), the host starts `install.py update-root-host`
+  from its own root-owned runtime with a minimal environment. That downloads the release ZIP and
+  its `.sha256` file from the fork's GitHub releases, checks them, unpacks and checks the bundle,
+  and installs it as a new root runtime with new units. It changes only files. The running host
+  keeps serving; when a new connection arrives and it has no connection and no plugins, it exits
+  without accepting, and systemd starts the new runtime for that connection. The previous runtime
+  is kept until the next update.
 - **Status:** `install-to-deck.sh --status` shows the root host, its runtime and release, and the
   approved plugins.
-- **Undo:** after `--undo`, the backend reports the older release tag and the host installs that
-  release the same way. `dev` builds never trigger an update.
+- **Undo:** `--undo` changes only the user service. The root runtime stays on the newer release,
+  which speaks the same protocol. `dev` builds never trigger an update.
+- **Python module paths:** root plugins get only the system module folders of an isolated root
+  `python3 -I`, and only folders that only root can change. The user service's paths come from
+  `python3` run as the user and include the user's own module folder, which root must not import
+  from.
 - **Without opt-in:** root plugins show "This plugin needs root. Run `install-to-deck.sh
   --enable-root-plugins` to allow plugins that need root." in place of today's message.
 

@@ -5531,13 +5531,35 @@ def _change_tree_owner(directory_fd: int, uid: int, gid: int, *, clear_group_oth
             _fail(f'plugin folder contains an unsupported item: {name}')
 
 
-def _open_plugin_directory(homebrew: Path, directory: str) -> int:
+_PLUGIN_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _open_plugins_root(homebrew: Path, user: pwd.struct_passwd) -> int:
+    """Open <homebrew>/plugins one level at a time without following links.
+
+    The folder must belong to the user, so a redirected path cannot make root
+    change a root-owned folder somewhere else. The root host uses the same rule.
+    """
+    descriptor = os.open('/', _PLUGIN_DIRECTORY_FLAGS)
+    try:
+        for part in (*homebrew.parts[1:], 'plugins'):
+            child = os.open(part, _PLUGIN_DIRECTORY_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        if os.fstat(descriptor).st_uid != user.pw_uid:
+            _fail(f'{homebrew / "plugins"} must belong to {user.pw_name}')
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_plugin_directory(homebrew: Path, directory: str, user: pwd.struct_passwd) -> int:
     if directory in ('', '.', '..') or '/' in directory:
         _fail(f'plugin folder must be a plain name: {directory!r}')
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    root = os.open(homebrew / 'plugins', flags)
+    root = _open_plugins_root(homebrew, user)
     try:
-        return os.open(directory, flags, dir_fd=root)
+        return os.open(directory, _PLUGIN_DIRECTORY_FLAGS, dir_fd=root)
     finally:
         os.close(root)
 
@@ -5550,21 +5572,101 @@ def _plugin_requires_root(directory_fd: int) -> bool:
     return isinstance(flags, list) and 'root' in flags
 
 
-def _root_host_tree_hash(runtime: Path, homebrew: Path, directory: str) -> dict[str, Any]:
+def _copy_tree_at(source_fd: int, destination_fd: int) -> None:
+    """Copy a plugin tree into new files that root creates.
+
+    New files matter: a user process may hold files of the old tree open for
+    writing, and it must not be able to change code that root later runs.
+    """
+    with os.scandir(source_fd) as entries:
+        names = sorted(entry.name for entry in entries)
+    for name in names:
+        info = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            os.mkdir(name, 0o755, dir_fd=destination_fd)
+            source = os.open(name, _PLUGIN_DIRECTORY_FLAGS, dir_fd=source_fd)
+            try:
+                destination = os.open(name, _PLUGIN_DIRECTORY_FLAGS, dir_fd=destination_fd)
+                try:
+                    os.fchmod(destination, 0o755)
+                    _copy_tree_at(source, destination)
+                finally:
+                    os.close(destination)
+            finally:
+                os.close(source)
+        elif stat.S_ISREG(info.st_mode):
+            source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=source_fd)
+            try:
+                if not stat.S_ISREG(os.fstat(source).st_mode):
+                    _fail(f'plugin item changed while it was copied: {name}')
+                destination = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=destination_fd)
+                try:
+                    while chunk := os.read(source, 1024 * 1024):
+                        os.write(destination, chunk)
+                    os.fchmod(destination, stat.S_IMODE(info.st_mode) & 0o755)
+                finally:
+                    os.close(destination)
+            finally:
+                os.close(source)
+        elif stat.S_ISLNK(info.st_mode):
+            # The root host's folder check refuses links that leave the folder.
+            os.symlink(os.readlink(name, dir_fd=source_fd), name, dir_fd=destination_fd)
+        else:
+            _fail(f'plugin folder contains an unsupported item: {name}')
+
+
+def _root_host_tree_hash(runtime: Path, directory_fd: int, label: str) -> dict[str, Any]:
+    """Check and hash a root-owned plugin folder with the root runtime's own code."""
     result = subprocess.run(
-        [str(runtime / WORKER_EXECUTABLE), '--root-host-admin', 'tree-hash', '--directory', str(homebrew / 'plugins' / directory)],
+        [str(runtime / WORKER_EXECUTABLE), '--root-host-admin', 'tree-hash', '--fd', str(directory_fd)],
         check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-        env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'HOME': '/root'}, cwd='/',
+        env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'HOME': '/root'}, cwd='/', pass_fds=(directory_fd,),
     )
     if result.returncode:
-        _fail(f'could not check root plugin {directory}: {result.stderr.strip() or result.stdout.strip()}')
+        _fail(f'could not check root plugin {label}: {result.stderr.strip() or result.stdout.strip()}')
     try:
         value = json.loads(result.stdout)
     except json.JSONDecodeError as error:
-        raise InstallerError(f'root plugin check returned invalid JSON for {directory}') from error
+        raise InstallerError(f'root plugin check returned invalid JSON for {label}') from error
     if not isinstance(value, dict) or not re.fullmatch(r'[0-9a-f]{64}', str(value.get('tree_sha256'))):
-        _fail(f'root plugin check returned no tree hash for {directory}')
+        _fail(f'root plugin check returned no tree hash for {label}')
     return {'name': value.get('name'), 'version': value.get('version'), 'tree_sha256': value['tree_sha256']}
+
+
+def _adopt_root_plugin(runtime: Path, homebrew: Path, directory: str, user: pwd.struct_passwd) -> dict[str, Any]:
+    """Approve an installed plugin: replace its folder with a root-owned copy and hash the copy."""
+    if directory in ('', '.', '..') or '/' in directory:
+        _fail(f'plugin folder must be a plain name: {directory!r}')
+    plugins_fd = _open_plugins_root(homebrew, user)
+    stage = f'.decky-root-adopt-{uuid.uuid4().hex}'
+    try:
+        source_fd = os.open(directory, _PLUGIN_DIRECTORY_FLAGS, dir_fd=plugins_fd)
+        try:
+            if not _plugin_requires_root(source_fd):
+                _fail(f'{directory} is not marked as a plugin that needs root')
+            os.mkdir(stage, 0o700, dir_fd=plugins_fd)
+            stage_fd = os.open(stage, _PLUGIN_DIRECTORY_FLAGS, dir_fd=plugins_fd)
+            try:
+                info = os.fstat(stage_fd)
+                if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+                    _fail('the root staging folder was replaced')
+                _copy_tree_at(source_fd, stage_fd)
+                os.fchmod(stage_fd, 0o755)
+                approved = _root_host_tree_hash(runtime, stage_fd, directory)
+            finally:
+                os.close(stage_fd)
+        finally:
+            os.close(source_fd)
+        old = f'.decky-root-old-{uuid.uuid4().hex}'
+        os.rename(directory, old, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+        os.rename(stage, directory, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+        stage = ''
+        shutil.rmtree(old, dir_fd=plugins_fd, ignore_errors=True)
+        return approved
+    finally:
+        if stage:
+            shutil.rmtree(stage, dir_fd=plugins_fd, ignore_errors=True)
+        os.close(plugins_fd)
 
 
 def _read_root_host_json(path: Path) -> dict[str, Any] | None:
@@ -5652,15 +5754,8 @@ def _run_enable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
         runtime, manifest = _install_root_runtime(Path(args.bundle), user, state, created)
         plugins: dict[str, Any] = dict((_read_root_host_json(state / 'state.json') or {}).get('plugins') or {})
         for directory in args.adopt or ():
-            directory_fd = _open_plugin_directory(homebrew, directory)
-            try:
-                if not _plugin_requires_root(directory_fd):
-                    _fail(f'{directory} is not marked as a plugin that needs root')
-                adopted.append(directory)
-                _change_tree_owner(directory_fd, 0, 0, clear_group_other_write=True)
-            finally:
-                os.close(directory_fd)
-            plugins[directory] = _root_host_tree_hash(runtime, homebrew, directory)
+            plugins[directory] = _adopt_root_plugin(runtime, homebrew, directory, user)
+            adopted.append(directory)
         _write_json(state / 'state.json', {'plugins': plugins}, 0o644)
         _write_root_host_files(user, homebrew, state, runtime, manifest)
         # A running host keeps its old runtime until it stops; it holds no state.
@@ -5670,7 +5765,7 @@ def _run_enable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
     except BaseException:
         for directory in adopted:
             try:
-                directory_fd = _open_plugin_directory(homebrew, directory)
+                directory_fd = _open_plugin_directory(homebrew, directory, user)
                 try:
                     _change_tree_owner(directory_fd, user.pw_uid, user.pw_gid, clear_group_other_write=False)
                 finally:
@@ -5801,10 +5896,12 @@ def _run_disable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
     plugins = (_read_root_host_json(state / 'state.json') or {}).get('plugins') or {}
     for directory in sorted(plugins):
         try:
-            directory_fd = _open_plugin_directory(homebrew, directory)
+            directory_fd = _open_plugin_directory(homebrew, directory, user)
         except FileNotFoundError:
             continue
         try:
+            if os.fstat(directory_fd).st_uid != 0:
+                continue
             _change_tree_owner(directory_fd, user.pw_uid, user.pw_gid, clear_group_other_write=False)
         finally:
             os.close(directory_fd)
