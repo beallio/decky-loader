@@ -120,6 +120,32 @@ class UpstreamCheckTests(unittest.TestCase):
 
         self.assertEqual(self.check()["latest"], "v1.10.0")
 
+    def pin(self, tag):
+        self.pinned_commit = self.git(self.upstream, "rev-parse", f"{tag}^{{commit}}").strip()
+
+    def test_prerelease_pin_follows_newer_prereleases_then_stable(self):
+        self.release(self.upstream, "v1.1.0-pre1")
+        self.pin("v1.1.0-pre1")
+        self.assertFalse(self.check(pinned="v1.1.0-pre1")["update_available"])
+
+        self.edit_line(self.upstream, 3, "second prerelease")
+        self.release(self.upstream, "v1.1.0-pre2")
+        report = self.check(pinned="v1.1.0-pre1")
+        self.assertEqual((report["latest"], report["update_available"]), ("v1.1.0-pre2", True))
+        self.assertTrue(report["latest_is_prerelease"])
+        self.assertEqual(self.statuses(report, "overlays")[OVERLAY], "clean")
+
+        self.release(self.upstream, "v1.1.0")
+        report = self.check(pinned="v1.1.0-pre1")
+        self.assertEqual((report["latest"], report["latest_is_prerelease"]), ("v1.1.0", False))
+
+    def test_stable_pin_does_not_move_to_prereleases(self):
+        self.release(self.upstream, "v1.1.0")
+        self.pin("v1.1.0")
+        self.release(self.upstream, "v1.2.0-pre1")
+
+        self.assertFalse(self.check(pinned="v1.1.0")["update_available"])
+
     def test_pin_that_does_not_match_upstream_is_an_error(self):
         self.release(self.upstream, "v1.1.0")
         self.pinned_commit = "0" * 40

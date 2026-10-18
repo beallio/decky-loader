@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compare the pinned SDK tag with the newest stable upstream release.
+"""Compare the pinned SDK tag with the newest upstream release.
+
+Stable vX.Y.Z tags always count. While the pin is an upstream prerelease
+(vX.Y.Z-preN), newer prereleases count too, so the fork can follow the
+prerelease line until the stable release appears.
 
 The check uses git only. For each fork overlay it runs a three-way merge of the
 pinned tag (base), fork HEAD (ours), and the new tag (theirs). It prints a JSON
@@ -20,7 +24,7 @@ import tempfile
 from prepare_bundle import BUILD_CONFIG, REPO, SDK_OVERLAYS, SDK_REMOVALS
 
 DEFAULT_REMOTE = 'https://github.com/SteamDeckHomebrew/decky-loader.git'
-STABLE_TAG = re.compile(r'v(\d+)\.(\d+)\.(\d+)')
+RELEASE_TAG = re.compile(r'v(\d+)\.(\d+)\.(\d+)(?:-pre(\d+))?')
 TAKEN_AS_IS = ('backend/decky_loader', 'frontend')
 MARKDOWN_LIST_LIMIT = 100
 
@@ -37,18 +41,27 @@ def git(repo: Path, *arguments: str, ok: tuple[int, ...] = (0,)) -> subprocess.C
     return result
 
 
-def version_key(tag: str) -> tuple[int, int, int] | None:
-    match = STABLE_TAG.fullmatch(tag)
-    return tuple(int(part) for part in match.groups()) if match else None
+def version_key(tag: str) -> tuple[int, int, int, int, int] | None:
+    """Sort key for vX.Y.Z and vX.Y.Z-preN; a stable release ranks above its prereleases."""
+    match = RELEASE_TAG.fullmatch(tag)
+    if not match:
+        return None
+    major, minor, patch, pre = match.groups()
+    return (int(major), int(minor), int(patch), 0, int(pre)) if pre else (int(major), int(minor), int(patch), 1, 0)
 
 
-def newest_stable_tag(remote: str) -> str:
+def is_prerelease(tag: str) -> bool:
+    key = version_key(tag)
+    return key is not None and key[3] == 0
+
+
+def newest_tag(remote: str, include_prereleases: bool) -> str:
     listing = git(Path.cwd(), 'ls-remote', '--tags', '--refs', remote).stdout.decode()
     tags = [line.split('refs/tags/', 1)[1] for line in listing.splitlines() if 'refs/tags/' in line]
-    stable = [tag for tag in tags if version_key(tag)]
-    if not stable:
-        raise UpstreamError(f'no stable vX.Y.Z tag found at {remote}')
-    return max(stable, key=version_key)
+    candidates = [tag for tag in tags if version_key(tag) and (include_prereleases or not is_prerelease(tag))]
+    if not candidates:
+        raise UpstreamError(f'no vX.Y.Z release tag found at {remote}')
+    return max(candidates, key=version_key)
 
 
 def blob_id(repo: Path, revision: str, path: str) -> str | None:
@@ -92,13 +105,15 @@ def other_changes(upstream: Path, base_tag: str, new_tag: str, excluded: tuple[s
 
 def check(fork: Path, remote: str, pinned_tag: str, pinned_commit: str,
           overlays: tuple[str, ...], removals: tuple[str, ...]) -> dict:
-    if version_key(pinned_tag) is None:
-        raise UpstreamError(f'pinned SDK tag is not a stable vX.Y.Z tag: {pinned_tag}')
+    pinned_key = version_key(pinned_tag)
+    if pinned_key is None:
+        raise UpstreamError(f'pinned SDK tag is not a vX.Y.Z or vX.Y.Z-preN tag: {pinned_tag}')
     if Path(remote).exists():
         remote = str(Path(remote).resolve())
-    latest = newest_stable_tag(remote)
+    latest = newest_tag(remote, include_prereleases=is_prerelease(pinned_tag))
     report = {'remote': remote, 'pinned': pinned_tag, 'latest': latest,
-              'update_available': version_key(latest) > version_key(pinned_tag)}
+              'latest_is_prerelease': is_prerelease(latest),
+              'update_available': version_key(latest) > pinned_key}
     if not report['update_available']:
         return report
     with tempfile.TemporaryDirectory(prefix='upstream-check-') as scratch_name:
@@ -126,7 +141,8 @@ def markdown(report: dict) -> str:
     if not report['update_available']:
         return f"## Upstream check\n\nThe fork is up to date. Pinned SDK: `{report['pinned']}`.\n"
     lines = [f"## Upstream {report['latest']} is available", '',
-             f"The fork pins `{report['pinned']}`. Newest stable upstream release: `{report['latest']}` "
+             f"The fork pins `{report['pinned']}`. Newest upstream "
+             f"{'prerelease' if report['latest_is_prerelease'] else 'stable release'}: `{report['latest']}` "
              f"({report['remote']}).", '', '### Fork overlays (3-way merge)', '',
              '| File | Result |', '| --- | --- |']
     for item in report['overlays']:
