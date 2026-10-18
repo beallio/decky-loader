@@ -707,6 +707,36 @@ def _append_system_pythonpaths(get_system_pythonpaths: Any) -> None:
             sys.path.append(python_path)
 
 
+class _BackendClosed(Exception):
+    pass
+
+
+class BackendLossListener:
+    """Mixin for the SDK's LocalSocket: end the plugin when the backend closes the socket.
+
+    The SDK listener reads an empty line at end of file and loops on it at full
+    speed. The backend connects to each worker once and never reconnects, so a
+    closed socket means the plugin can no longer be used. It is then shut down
+    as on SIGTERM, which also runs its unload function.
+    """
+
+    on_backend_closed: Callable[[], object] | None = None
+
+    async def _read_single_line(self, reader: asyncio.StreamReader) -> str:
+        line = cast(str, await super()._read_single_line(reader))  # type: ignore[misc]
+        if not line and reader.at_eof():
+            raise _BackendClosed
+        return line
+
+    async def _listen_for_method_call(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await super()._listen_for_method_call(reader, writer)  # type: ignore[misc]
+        except _BackendClosed:
+            writer.close()
+            if self.on_backend_closed is not None:
+                self.on_backend_closed()
+
+
 def launch(args: argparse.Namespace) -> None:
     directory_fd, metadata = _acquire_approved_launch(getattr(args, "approved_launch", None))
     process_owned = False
@@ -755,7 +785,7 @@ def launch(args: argparse.Namespace) -> None:
         # user's backend can connect. Only the root host sets this.
         socket_owner = cast("list[int] | None", getattr(args, "socket_owner", None))
 
-        class TrackedLocalSocket(LocalSocket):
+        class TrackedLocalSocket(BackendLossListener, LocalSocket):
             server_ready = False
             startup_error: Exception | None = None
 
@@ -799,6 +829,8 @@ def launch(args: argparse.Namespace) -> None:
             api_version,
             entrypoint_loader=bridge.entrypoint_loader,
         )
+        # Same path as SIGTERM: run the plugin's unload function, then exit.
+        tracked_socket.on_backend_closed = lambda: asyncio.ensure_future(plugin.shutdown())
         try:
             plugin.initialize(tracked_socket)
         except SystemExit as error:
