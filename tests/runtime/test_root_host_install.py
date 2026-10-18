@@ -10,6 +10,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
 
@@ -104,6 +105,39 @@ class InstallRequestTest(unittest.TestCase):
             with self.subTest(label):
                 response = self.host().handle_line(json.dumps(request).encode())
                 self.assertFalse(response["ok"], response)
+
+    def test_install_from_the_set_store_needs_its_exact_listing(self) -> None:
+        store = "https://store.example/plugins.json"
+        artifact = "https://github.com/author/tools/releases/download/v1/Tools.zip"
+        listing = [
+            {"name": "Other", "versions": [{"name": "1", "hash": "a" * 64, "artifact": artifact}]},
+            {"name": "Tools", "versions": [
+                {"name": "2", "hash": "b" * 64, "artifact": artifact.replace("v1", "v2")},
+                {"name": "1", "hash": "a" * 64, "artifact": artifact},
+            ]},
+        ]
+        good = {"op": "install", "directory": "Tools", "name": "Tools", "sha256": "a" * 64,
+                "artifact": artifact, "store_url": store}
+
+        def download(url: str, limit: int) -> bytes:
+            if url == store:
+                return json.dumps(listing).encode()
+            raise root_host.RootHostError(f"fetched plugin {url}")
+
+        cases = {
+            "listed": (good, "fetched plugin"),
+            "other hash": ({**good, "sha256": "c" * 64}, "only be installed"),
+            "other plugin's entry": ({**good, "name": "Tools2"}, "only be installed"),
+            "other download": ({**good, "artifact": artifact + "?x"}, "only be installed"),
+            "no store": ({k: v for k, v in good.items() if k != "store_url"}, "only be installed"),
+            "plain http store": ({**good, "store_url": "http://store.example/plugins.json"}, "only be installed"),
+        }
+        with mock.patch.object(root_host, "_download", side_effect=download):
+            for label, (request, expected) in cases.items():
+                with self.subTest(label):
+                    response = self.host().handle_line(json.dumps(request).encode())
+                    self.assertFalse(response["ok"], response)
+                    self.assertIn(expected, response["error"])
 
     def test_runtime_updates_only_follow_release_tags(self) -> None:
         host = self.host()

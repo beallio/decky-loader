@@ -183,6 +183,18 @@
             "label": "Allow Remote CEF Debugging"
         }
     },
+    "RootPluginConfirm": {
+        "acknowledge": "I understand that {{name}} gets full control of this device",
+        "button_cancel": "Cancel",
+        "button_install": "Install as root",
+        "button_update": "Update as root",
+        "button_wait": "Please wait {{timer}} seconds",
+        "desc": "{{name}} {{version}} needs root. A root plugin has full control of this device: it can read and change every file, account and setting, and install other software. Decky cannot limit what it does. Continue only if you trust the plugin author and the store it comes from.",
+        "expired": "{{name}} was not installed: the root confirmation timed out",
+        "failed": "Could not answer the root confirmation for {{name}}",
+        "source": "Download from {{host}}, listed by the store {{store}}",
+        "title": "{{name}} will run as root"
+    },
     "SettingsDeveloperIndex": {
         "cef_console": {
             "button": "Open Console",

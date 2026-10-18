@@ -22,6 +22,7 @@ import MultiplePluginsInstallModal from './components/modals/MultiplePluginsInst
 import PluginDisableModal from './components/modals/PluginDisableModal';
 import PluginInstallModal from './components/modals/PluginInstallModal';
 import PluginUninstallModal from './components/modals/PluginUninstallModal';
+import RootPluginConfirmModal from './components/modals/RootPluginConfirmModal';
 import NotificationBadge from './components/NotificationBadge';
 import PluginView from './components/PluginView';
 import { useQuickAccessVisible } from './components/QuickAccessVisibleState';
@@ -103,6 +104,7 @@ class PluginLoader extends Logger {
       'loader/add_multiple_plugins_install_prompt',
       this.addMultiplePluginsInstallPrompt.bind(this),
     );
+    DeckyBackend.addEventListener('loader/root_plugin_install_prompt', this.addRootPluginInstallPrompt.bind(this));
     DeckyBackend.addEventListener('updater/update_download_percentage', () => {
       this.deckyState.setIsLoaderUpdating(true);
     });
@@ -324,6 +326,33 @@ class PluginLoader extends Logger {
         disabled={this.deckyState.publicState().disabledPlugins.some((p) => p.name === artifact)}
         onOK={() => DeckyBackend.call<[string]>('utilities/confirm_plugin_install', request_id)}
         onCancel={() => DeckyBackend.call<[string]>('utilities/cancel_plugin_install', request_id)}
+      />,
+    );
+  }
+
+  public addRootPluginInstallPrompt(
+    name: string,
+    version: string,
+    request_id: string,
+    install_type: InstallType,
+    artifact_host: string,
+    store_url: string,
+    valid_seconds: number,
+  ) {
+    showModal(
+      <RootPluginConfirmModal
+        name={name}
+        version={version}
+        installType={install_type}
+        artifactHost={artifact_host}
+        storeUrl={store_url}
+        validSeconds={valid_seconds}
+        onAnswer={(confirmed) =>
+          DeckyBackend.call<[string]>(
+            confirmed ? 'utilities/confirm_root_plugin_install' : 'utilities/cancel_root_plugin_install',
+            request_id,
+          )
+        }
       />,
     );
   }

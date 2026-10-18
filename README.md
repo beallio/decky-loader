@@ -75,8 +75,10 @@ This installs the current version, asks for your `sudo` password once, and lists
 
 After this, you install, update and remove plugins that need root in the Decky store as usual. You do not need to run the command again. When Decky updates itself, the root service updates itself to the same version.
 
+Before each install or update of a plugin that needs root, Decky shows a warning. You must wait 10 seconds and switch on "I understand" before the plugin is installed.
+
 - **Cost:** while at least one root plugin is on, one extra background process uses about 25 MB of memory. With no root plugins, nothing extra runs. It uses no CPU while idle.
-- **Risk:** a plugin that runs as root can change anything on your Deck. Install only plugins you trust. Plugins that need root can only come from the Decky store, not from a URL or a ZIP file. As in the official Decky, a root plugin keeps its settings in your normal Decky folders.
+- **Risk:** a plugin that runs as root can change anything on your Deck. Install only plugins you trust. Plugins that need root can only come from the Decky store, or from the custom store that is set in Decky's settings, not from a URL or a ZIP file. If you use a custom store, you trust it as much as the official one. As in the official Decky, a root plugin keeps its settings in your normal Decky folders.
 
 To turn root plugin support off, run `bash install-to-deck.sh --disable-root-plugins`. Root plugins then stop and become owned by `deck` again.
 

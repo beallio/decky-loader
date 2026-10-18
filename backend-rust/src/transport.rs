@@ -999,11 +999,9 @@ mod tests {
         drop(pending_response);
     }
 
-    #[tokio::test]
-    async fn replayed_calls_do_not_repeat_persistent_settings_changes() {
-        let directory = TestDirectory(
-            std::env::temp_dir().join(format!("decky-rpc-test-{}", uuid::Uuid::new_v4())),
-        );
+    async fn test_backend(
+        directory: &TestDirectory,
+    ) -> (Arc<crate::workers::PluginRegistry>, Arc<Backend>) {
         let plugin_root = directory.0.join("plugins");
         tokio::fs::create_dir_all(&plugin_root).await.unwrap();
         let (events, _) = tokio::sync::broadcast::channel(8);
@@ -1043,6 +1041,39 @@ mod tests {
             .await
             .unwrap(),
         );
+        (registry, backend)
+    }
+
+    #[tokio::test]
+    async fn root_install_answers_reach_the_waiting_install() {
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("decky-rpc-test-{}", uuid::Uuid::new_v4())),
+        );
+        let (registry, backend) = test_backend(&directory).await;
+        // Without a waiting install the plugin manager must answer, not "route not found".
+        for route in [
+            "utilities/confirm_root_plugin_install",
+            "utilities/cancel_root_plugin_install",
+        ] {
+            let error = backend
+                .dispatch(route, vec![json!("no-such-prompt")])
+                .await
+                .unwrap_err();
+            let error = format!("{error:?}");
+            assert!(
+                error.contains("Unknown root plugin prompt"),
+                "{route}: {error}"
+            );
+        }
+        registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replayed_calls_do_not_repeat_persistent_settings_changes() {
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("decky-rpc-test-{}", uuid::Uuid::new_v4())),
+        );
+        let (registry, backend) = test_backend(&directory).await;
         let (sender, mut replies) = mpsc::unbounded_channel();
         let state = AppState {
             token: Arc::from("test-token"),

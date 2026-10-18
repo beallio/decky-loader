@@ -8,7 +8,7 @@ use std::{
 use axum::body::Bytes;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
 use zip::ZipArchive;
 
@@ -224,8 +224,49 @@ struct PluginCandidate {
     requires_root: bool,
 }
 
+/// How long a root install waits for the user to answer the confirmation box.
+const ROOT_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Root installs and updates that wait for the user to confirm them in the UI.
+struct RootPrompts {
+    waiting: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+}
+
+impl RootPrompts {
+    fn new() -> Self {
+        Self {
+            waiting: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Registers a prompt, lets `show` display it, and waits for the answer.
+    /// No answer within `limit` counts as a refusal.
+    async fn ask(&self, limit: std::time::Duration, show: impl FnOnce(&str)) -> bool {
+        let id = Uuid::new_v4().to_string();
+        let (sender, receiver) = oneshot::channel();
+        self.waiting.lock().await.insert(id.clone(), sender);
+        show(&id);
+        let answer = tokio::time::timeout(limit, receiver).await;
+        self.waiting.lock().await.remove(&id);
+        matches!(answer, Ok(Ok(true)))
+    }
+
+    async fn answer(&self, id: &str, confirmed: bool) -> Result<(), RpcError> {
+        let sender = self
+            .waiting
+            .lock()
+            .await
+            .remove(id)
+            .ok_or_else(|| RpcError::invalid(format!("Unknown root plugin prompt {id}")))?;
+        // The install may have given up already; then there is nobody to tell.
+        let _ = sender.send(confirmed);
+        Ok(())
+    }
+}
+
 pub struct PluginManager {
     install_requests: Mutex<HashMap<String, PendingInstall>>,
+    root_prompts: RootPrompts,
     operation: Mutex<()>,
 }
 
@@ -233,32 +274,35 @@ impl PluginManager {
     pub fn new() -> Self {
         Self {
             install_requests: Mutex::new(HashMap::new()),
+            root_prompts: RootPrompts::new(),
             operation: Mutex::new(()),
         }
     }
 
+    /// Handles the plugin install and management routes; `None` for any other route.
     pub async fn dispatch(
         &self,
         backend: &Backend,
         route: &str,
-        args: Vec<Value>,
+        args: &[Value],
     ) -> Option<Result<Value, RpcError>> {
         let result = match route {
             "utilities/install_plugin" => self
-                .request_single(backend, &args)
+                .request_single(backend, args)
                 .await
                 .map(|_| Value::Null),
-            "utilities/install_plugins" => self
-                .request_batch(backend, &args)
-                .await
-                .map(|_| Value::Null),
-            "utilities/confirm_plugin_install" => self.confirm_install(backend, &args).await,
-            "utilities/cancel_plugin_install" => self.cancel_install(&args).await,
-            "utilities/uninstall_plugin" => self.uninstall_plugin(backend, &args).await,
-            "utilities/enable_plugin" => self.enable_plugin(backend, &args).await,
-            "utilities/disable_plugin" => self.disable_plugin(backend, &args).await,
+            "utilities/install_plugins" => {
+                self.request_batch(backend, args).await.map(|_| Value::Null)
+            }
+            "utilities/confirm_plugin_install" => self.confirm_install(backend, args).await,
+            "utilities/cancel_plugin_install" => self.cancel_install(args).await,
+            "utilities/confirm_root_plugin_install" => self.answer_root_prompt(args, true).await,
+            "utilities/cancel_root_plugin_install" => self.answer_root_prompt(args, false).await,
+            "utilities/uninstall_plugin" => self.uninstall_plugin(backend, args).await,
+            "utilities/enable_plugin" => self.enable_plugin(backend, args).await,
+            "utilities/disable_plugin" => self.disable_plugin(backend, args).await,
             "utilities/set_all_plugins_disabled" => {
-                self.set_all_plugins_disabled(backend, &args).await
+                self.set_all_plugins_disabled(backend, args).await
             }
             _ => return None,
         };
@@ -365,6 +409,14 @@ impl PluginManager {
         Ok(Value::Null)
     }
 
+    async fn answer_root_prompt(&self, args: &[Value], confirmed: bool) -> Result<Value, RpcError> {
+        exact(args, 1)?;
+        self.root_prompts
+            .answer(string(args, 0)?, confirmed)
+            .await
+            .map(|_| Value::Null)
+    }
+
     async fn install_one(
         &self,
         backend: &Backend,
@@ -459,8 +511,43 @@ impl PluginManager {
         if candidate.requires_root && platform::effective_user_ids().0 != 0 {
             // Root plugin files must come from root, not from this account's download.
             drop(stage);
-            self.install_root_plugin(backend, request, &archive_directory, &installed_name)
-                .await?;
+            let store_url = store_base_url(backend).await;
+            let artifact_host = reqwest::Url::parse(&request.artifact)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_default();
+            // Every root install or update needs an explicit yes in the UI.
+            let confirmed = self
+                .root_prompts
+                .ask(ROOT_CONFIRM_TIMEOUT, |id| {
+                    backend.emit(
+                        "loader/root_plugin_install_prompt",
+                        vec![
+                            Value::String(installed_name.clone()),
+                            Value::String(request.version.clone()),
+                            Value::String(id.to_owned()),
+                            Value::from(request.install_type),
+                            Value::String(artifact_host),
+                            Value::String(store_url.clone()),
+                            // The box closes itself before the install gives up waiting.
+                            Value::from(ROOT_CONFIRM_TIMEOUT.as_secs()),
+                        ],
+                    );
+                })
+                .await;
+            if !confirmed {
+                return Err(RpcError::failure(format!(
+                    "Installation of {installed_name} was cancelled: it needs root and was not confirmed"
+                )));
+            }
+            self.install_root_plugin(
+                backend,
+                request,
+                &archive_directory,
+                &installed_name,
+                &store_url,
+            )
+            .await?;
             return Ok(installed_name);
         }
         download_info(backend, 95, "Store.download_progress_info.download_remote");
@@ -477,17 +564,20 @@ impl PluginManager {
     }
 
     /// Installs or updates a plugin that needs root through the root plugin host.
-    /// The host downloads the archive itself and accepts only store URLs and the
-    /// store's SHA-256, so this account cannot hand it other code.
+    /// The host downloads the archive itself and accepts only official store URLs
+    /// or downloads the store set in Decky lists, with the store's SHA-256.
     async fn install_root_plugin(
         &self,
         backend: &Backend,
         request: &InstallRequest,
         directory: &str,
         name: &str,
+        store_url: &str,
     ) -> Result<(), RpcError> {
         let store_only = || {
-            RpcError::failure("Plugins that need root can only be installed from the Decky store")
+            RpcError::failure(
+                "Plugins that need root can only be installed from the Decky store or the store set in Decky",
+            )
         };
         let sha256 = request
             .hash
@@ -548,7 +638,7 @@ impl PluginManager {
             "Store.download_progress_info.installing_plugin",
         );
         if let Err(error) = host
-            .install(directory, name, sha256, &request.artifact)
+            .install(directory, name, sha256, &request.artifact, store_url)
             .await
         {
             let restore_error = if was_registered {
@@ -1006,10 +1096,14 @@ fn download_info(backend: &Backend, percent: u64, translation: &str) {
     );
 }
 
-/// Starts the store install-count POST in the background; the install does not wait for it.
-async fn increment_install_count(backend: &Backend, request: &InstallRequest, is_update: bool) {
-    let store = backend.setting("store", json!(0)).await;
-    let store_url = match store.as_u64().unwrap_or(0) {
+/// The store Decky is set to: official, testing, or the custom URL.
+async fn store_base_url(backend: &Backend) -> String {
+    match backend
+        .setting("store", json!(0))
+        .await
+        .as_u64()
+        .unwrap_or(0)
+    {
         1 => "https://testing.deckbrew.xyz/plugins".to_owned(),
         2 => backend
             .setting("store-url", json!("https://plugins.deckbrew.xyz/plugins"))
@@ -1018,7 +1112,12 @@ async fn increment_install_count(backend: &Backend, request: &InstallRequest, is
             .unwrap_or("https://plugins.deckbrew.xyz/plugins")
             .to_owned(),
         _ => "https://plugins.deckbrew.xyz/plugins".to_owned(),
-    };
+    }
+}
+
+/// Starts the store install-count POST in the background; the install does not wait for it.
+async fn increment_install_count(backend: &Backend, request: &InstallRequest, is_update: bool) {
+    let store_url = store_base_url(backend).await;
     let url = format!(
         "{}/{}/versions/{}/increment?isUpdate={}",
         store_url.trim_end_matches('/'),
@@ -1626,6 +1725,34 @@ fn with_rollback_error(error: String, rollback_error: Option<String>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn root_install_continues_only_after_an_explicit_yes() {
+        let prompts = std::sync::Arc::new(RootPrompts::new());
+        let long = std::time::Duration::from_secs(30);
+        for (answer, expected) in [(true, true), (false, false)] {
+            let (shown_sender, shown) = oneshot::channel::<String>();
+            let waiter = {
+                let prompts = prompts.clone();
+                tokio::spawn(async move {
+                    prompts
+                        .ask(long, |id| shown_sender.send(id.to_owned()).unwrap())
+                        .await
+                })
+            };
+            let id = shown.await.unwrap();
+            prompts.answer(&id, answer).await.unwrap();
+            assert_eq!(waiter.await.unwrap(), expected, "answer {answer}");
+            // A prompt can be answered only once.
+            assert!(prompts.answer(&id, true).await.is_err());
+        }
+
+        let unanswered = prompts
+            .ask(std::time::Duration::from_millis(20), |_| {})
+            .await;
+        assert!(!unanswered, "no answer must count as a refusal");
+        assert!(prompts.waiting.lock().await.is_empty());
+    }
 
     #[tokio::test]
     async fn install_count_gives_up_when_the_store_never_answers() {

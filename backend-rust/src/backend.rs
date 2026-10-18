@@ -245,22 +245,9 @@ impl Backend {
                 .await
                 .unwrap_or_else(|| Err(missing_route(route)));
         }
-        if matches!(
-            route,
-            "utilities/install_plugin"
-                | "utilities/install_plugins"
-                | "utilities/cancel_plugin_install"
-                | "utilities/confirm_plugin_install"
-                | "utilities/uninstall_plugin"
-                | "utilities/enable_plugin"
-                | "utilities/disable_plugin"
-                | "utilities/set_all_plugins_disabled"
-        ) {
-            return self
-                .plugin_manager
-                .dispatch(self, route, args)
-                .await
-                .unwrap_or_else(|| Err(missing_route(route)));
+        // The plugin manager owns the install and management routes; it returns None for others.
+        if let Some(result) = self.plugin_manager.dispatch(self, route, &args).await {
+            return result;
         }
         match route {
             "loader/get_plugins" => {

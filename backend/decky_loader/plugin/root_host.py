@@ -48,6 +48,8 @@ _MAX_JSON_BYTES = 1 << 20
 _MAX_REQUEST_BYTES = 1 << 16
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _MAX_ARCHIVE_BYTES = 512 << 20
+_MAX_STORE_LIST_BYTES = 64 << 20
+NOT_FROM_STORE = "plugins that need root can only be installed from the Decky store or the store set in Decky"
 RELEASE_TAG = re.compile(r"v\d+\.\d+\.\d+-rust\.\d+(-rc\.\d+)?")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 
@@ -270,6 +272,34 @@ def _download(url: str, limit: int) -> bytes:
     if len(data) > limit:
         raise RootHostError(f"download is larger than {limit} bytes: {url}")
     return data
+
+
+def _listed_in_store(store_url: object, name: str, sha256: str, artifact: str) -> bool:
+    """True when the store set in Decky lists this download and SHA-256 for the plugin.
+
+    The user chose to trust that store for plugins that need root. Checking its list
+    here means the Decky account can only install what the store itself publishes.
+    """
+    if not isinstance(store_url, str) or urllib.parse.urlsplit(store_url).scheme != "https":
+        return False
+    try:
+        plugins = json.loads(_download(store_url, _MAX_STORE_LIST_BYTES))
+    except (OSError, ValueError) as error:
+        raise RootHostError(f"could not read the plugin store list {store_url}: {error}") from error
+    if not isinstance(plugins, list):
+        return False
+    for plugin in cast(list[Any], plugins):
+        if not isinstance(plugin, dict) or cast(dict[str, Any], plugin).get("name") != name:
+            continue
+        versions = cast(dict[str, Any], plugin).get("versions")
+        if isinstance(versions, list) and any(
+            isinstance(version, dict)
+            and cast(dict[str, Any], version).get("hash") == sha256
+            and cast(dict[str, Any], version).get("artifact") == artifact
+            for version in cast(list[Any], versions)
+        ):
+            return True
+    return False
 
 
 def _write_new_file(directory_fd: int, name: str, data: bytes) -> None:
@@ -643,8 +673,12 @@ class Host:
         if not isinstance(artifact, str):
             raise RootHostError("install needs the store download URL")
         parsed = urllib.parse.urlsplit(artifact)
-        if parsed.scheme != "https" or parsed.hostname not in self.config.store_hosts:
-            raise RootHostError("plugins that need root can only be installed from the Decky store")
+        if parsed.scheme != "https":
+            raise RootHostError(NOT_FROM_STORE)
+        if parsed.hostname not in self.config.store_hosts and not _listed_in_store(
+            request.get("store_url"), name, sha256, artifact
+        ):
+            raise RootHostError(NOT_FROM_STORE)
         if any(running == directory for running, _ in self.directories.values()):
             raise RootHostError(f"{directory} is running; stop it first")
         archive = _download(artifact, _MAX_ARCHIVE_BYTES)

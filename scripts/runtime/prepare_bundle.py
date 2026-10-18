@@ -41,6 +41,7 @@ SDK_OVERLAYS = (
     'backend/decky_loader/settings.py',
     'frontend/src/store.tsx',
     'frontend/src/components/settings/pages/general/Updater.tsx',
+    'frontend/src/components/modals/RootPluginConfirmModal.tsx',
 )
 SDK_REMOVALS = (
     'frontend/src/steamfixes/README.md',

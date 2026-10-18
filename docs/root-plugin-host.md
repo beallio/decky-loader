@@ -58,18 +58,24 @@ Consequences:
      inode match the checked descriptor. A swap after the check does not reach the plugin,
      including programs that the plugin starts from its `bin/` folder. Python imports go through
      the checked descriptor as for other plugins.
-3. The root host must not accept plugin code from `deck`. It downloads root plugins itself, only
-   from the store hosts on its allow list, and checks the store's SHA-256.
+3. The root host must not accept plugin code from `deck`. It downloads root plugins itself and
+   checks the store's SHA-256. It accepts a download from the official store hosts on its allow
+   list, or a download that the store set in Decky lists, with the same SHA-256, for that plugin:
+   the host reads that store's plugin list itself.
 
-Accepted risks (the user's decisions; both are the same as on official Decky):
+Accepted risks (the user's decisions; the first two are the same as on official Decky):
 
 - A root plugin's settings, data and log folders stay at `~/homebrew/{settings,data,logs}/<dir>`
   and are owned by `deck`, as on official Decky. A root plugin writes there as root. A `deck`
   process can put a symlink in these folders and make the plugin overwrite a file that `deck` may
   not change. The host does not follow symlinks when it creates these folders, but it cannot
   protect files that the plugin opens later by name.
-- Approval of each root plugin install is a confirmation in the Decky interface, with no password.
-  A `deck` process can therefore install a real store plugin that needs root, but not its own code.
+- Approval of each root plugin install or update is a confirmation box in the Decky interface,
+  with no password. The box waits 10 seconds and needs an "I understand" switch. A `deck` process
+  can answer it itself, so the box protects against mistakes, not against such a process.
+- The store set in Decky is trusted for root plugins (user decision, 2026-10-17). Decky's settings
+  belong to `deck`, so a `deck` process can switch to its own store and have its code installed as
+  root. The listing check only stops downloads that the store set in Decky does not publish.
 
 ## Parts
 
@@ -110,13 +116,13 @@ One JSON object per line on the control socket. The host accepts a connection on
 | `list` | Approved root plugins: folder, name, version, running |
 | `start {id, directory}` | Check the plugin folder (below), start it, and return its PID and IPC socket path |
 | `release`, `status`, `stop`, `forget {id}` | The same plugin lifecycle as the user service's launcher; `stop` sends SIGTERM, then SIGKILL after 5 s |
-| `install {directory, name, sha256, artifact}` | Download `artifact` (https, allowed store host only), check its store SHA-256, unpack the store folder into a root-owned staging folder through descriptors, check `plugin.json` (name matches, `root` flag present), fetch `remote_binary` files (each checked by its SHA-256), record the tree hash, then swap it into place |
+| `install {directory, name, sha256, artifact, store_url}` | Download `artifact` (https; an allowed store host, or a download that the plugin list at `store_url` gives for `name` with the same `sha256`), check its store SHA-256, unpack the store folder into a root-owned staging folder through descriptors, check `plugin.json` (name matches, `root` flag present), fetch `remote_binary` files (each checked by its SHA-256), record the tree hash, then swap it into place |
 | `uninstall {directory}` | Delete a root-owned plugin folder and its approval. Settings and data stay, as on official Decky |
 
 The host never takes file paths, file descriptors or code from the backend. It takes names, and
-for downloads, URLs that must be on the allow list. The allow list is set once by root at opt-in
-time: the default store and its artifact host. A custom store URL in the Decky settings does not
-change it.
+for downloads, URLs that are either on the allow list or listed by the store set in Decky. The
+allow list is set once by root at opt-in time: the default store and its artifact host. The store
+set in Decky is read from the backend with each install, so it follows the Decky settings.
 
 Before each start, the host checks the plugin folder through an open folder descriptor: it and
 every file in it are owned by root and not writable by group or others; there are no symlinks
@@ -201,8 +207,9 @@ Decky, without following symlinks.
 
 ## Decisions (2026-10-17)
 
-1. **Consent:** a confirmation in the Decky interface, as on official Decky. No password per
-   install. Enabling root plugins at all needs sudo once.
+1. **Consent:** a confirmation box in the Decky interface before every root install or update
+   (10-second wait and an "I understand" switch). No password per install. Enabling root plugins
+   at all needs sudo once.
 2. **Code place:** `~/homebrew/plugins/<dir>`, owned by root, as on official Decky, with the tree
    hash check and the read-only bind mount above. Checked on 2026-10-17: the 4 popular root
    plugins (PowerTools 2.0.3, AutoFlatpaks 1.6.8, DeckMTP 1.0.5, Fantastic 0.5.1) use
