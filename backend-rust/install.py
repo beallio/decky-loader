@@ -5575,53 +5575,72 @@ def _read_root_host_json(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _install_root_runtime(bundle: Path, user: pwd.struct_passwd, state: Path, created: list[Path]) -> tuple[Path, dict[str, Any]]:
+    """Copy a bundle to a root-owned runtime folder, then check the copy.
+
+    The copy is checked, not the source, because the user can change the source.
+    """
+    for path in (ROOT_HOST_STATE.parent, ROOT_HOST_STATE, state, state / 'runtimes'):
+        if not path.exists():
+            created.append(path)
+        _root_directory(path, 0o755)
+    stage = state / 'runtimes' / f'.stage-{uuid.uuid4().hex}'
+    created.append(stage)
+    shutil.copytree(bundle, stage, symlinks=True, copy_function=shutil.copy2)
+    stage_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        _change_tree_owner(stage_fd, 0, 0, clear_group_other_write=True)
+    finally:
+        os.close(stage_fd)
+    _, manifest = _validate_bundle(str(stage), user)
+    runtime = state / 'runtimes' / _digest(stage / 'bundle.json')[:24]
+    if runtime.exists():
+        shutil.rmtree(stage)
+    else:
+        stage.rename(runtime)
+        created.append(runtime)
+    created.remove(stage)
+    _validate_bundle(str(runtime), user)
+    _verify_runtime(runtime, manifest, user, runtime / RUST_EXECUTABLE)
+    return runtime, manifest
+
+
+def _write_root_host_files(user: pwd.struct_passwd, homebrew: Path, state: Path, runtime: Path, manifest: dict[str, Any]) -> None:
+    """Write config.json and the units for `runtime`, then reload systemd."""
+    import grp
+
+    config = state / 'config.json'
+    previous = _read_root_host_json(config) or {}
+    _write_json(config, {
+        'protocol': ROOT_HOST_PROTOCOL, 'user': user.pw_name, 'uid': user.pw_uid, 'gid': user.pw_gid,
+        'homebrew': str(homebrew), 'runtime': runtime.name, 'release_version': manifest.get('release_version'),
+        'store_hosts': list(ROOT_HOST_STORE_HOSTS),
+        'release_repository': previous.get('release_repository') or DEFAULT_RELEASE_REPOSITORY,
+    }, 0o644)
+    group = grp.getgrgid(user.pw_gid).gr_name
+    for name, text in _root_host_units(user, group, runtime, config).items():
+        _write_atomic(ROOT_HOST_UNIT_DIRECTORY / name, text.encode(), 0o644)
+    _systemctl({'unit': Path(f'{_root_host_unit_name(user)}.socket'), 'scope': 'system'}, 'daemon-reload')
+
+
+def _prune_root_runtimes(state: Path, keep: set[str]) -> None:
+    for runtime in (state / 'runtimes').iterdir():
+        if runtime.name not in keep and not runtime.is_symlink():
+            shutil.rmtree(runtime, ignore_errors=True)
+
+
 def _run_enable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
     _require_root()
     user = pwd.getpwnam(args.user)
     if user.pw_uid == 0 or user.pw_name != args.user:
         _fail('--user must name the non-root account that runs Decky')
-    import grp
-
-    group = grp.getgrgid(user.pw_gid).gr_name
     homebrew = _homebrew_path(args.homebrew)
     state = ROOT_HOST_STATE / str(user.pw_uid)
     paths: dict[str, Any] = {'unit': Path(f'{_root_host_unit_name(user)}.socket'), 'scope': 'system'}
     created: list[Path] = []
     adopted: list[str] = []
     try:
-        for path in (ROOT_HOST_STATE.parent, ROOT_HOST_STATE, state, state / 'runtimes'):
-            if not path.exists():
-                created.append(path)
-            _root_directory(path, 0o755)
-
-        # Copy first, then check the copy: the user can change the source bundle.
-        stage = state / 'runtimes' / f'.stage-{uuid.uuid4().hex}'
-        created.append(stage)
-        shutil.copytree(Path(args.bundle), stage, symlinks=True, copy_function=shutil.copy2)
-        stage_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        try:
-            _change_tree_owner(stage_fd, 0, 0, clear_group_other_write=True)
-        finally:
-            os.close(stage_fd)
-        _, manifest = _validate_bundle(str(stage), user)
-        runtime_id = _digest(stage / 'bundle.json')[:24]
-        runtime = state / 'runtimes' / runtime_id
-        if runtime.exists():
-            shutil.rmtree(stage)
-        else:
-            stage.rename(runtime)
-            created.append(runtime)
-        created.remove(stage)
-        _validate_bundle(str(runtime), user)
-        _verify_runtime(runtime, manifest, user, runtime / RUST_EXECUTABLE)
-
-        config = state / 'config.json'
-        _write_json(config, {
-            'protocol': ROOT_HOST_PROTOCOL, 'user': user.pw_name, 'uid': user.pw_uid, 'gid': user.pw_gid,
-            'homebrew': str(homebrew), 'runtime': runtime_id, 'release_version': manifest.get('release_version'),
-            'store_hosts': list(ROOT_HOST_STORE_HOSTS),
-        }, 0o644)
-
+        runtime, manifest = _install_root_runtime(Path(args.bundle), user, state, created)
         plugins: dict[str, Any] = dict((_read_root_host_json(state / 'state.json') or {}).get('plugins') or {})
         for directory in args.adopt or ():
             directory_fd = _open_plugin_directory(homebrew, directory)
@@ -5634,14 +5653,11 @@ def _run_enable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
                 os.close(directory_fd)
             plugins[directory] = _root_host_tree_hash(runtime, homebrew, directory)
         _write_json(state / 'state.json', {'plugins': plugins}, 0o644)
-
-        for name, text in _root_host_units(user, group, runtime, config).items():
-            _write_atomic(ROOT_HOST_UNIT_DIRECTORY / name, text.encode(), 0o644)
-        _systemctl(paths, 'daemon-reload')
-        service = f'{_root_host_unit_name(user)}.service'
+        _write_root_host_files(user, homebrew, state, runtime, manifest)
         # A running host keeps its old runtime until it stops; it holds no state.
-        _systemctl(paths, 'stop', service, check=False)
+        _systemctl(paths, 'stop', f'{_root_host_unit_name(user)}.service', check=False)
         _systemctl(paths, 'enable', '--now', paths['unit'].name)
+        _prune_root_runtimes(state, {runtime.name})
     except BaseException:
         for directory in adopted:
             try:
@@ -5656,9 +5672,106 @@ def _run_enable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
             shutil.rmtree(path, ignore_errors=True)
         raise
     return {
-        'ok': True, 'root_host': 'enabled', 'runtime': runtime_id, 'adopted': adopted,
+        'ok': True, 'root_host': 'enabled', 'runtime': runtime.name, 'adopted': adopted,
         'plugins': sorted(plugins), 'socket': str(ROOT_HOST_RUN / str(user.pw_uid) / 'root-host.sock'),
     }
+
+
+ROOT_HOST_RELEASE_TAG = re.compile(r'v\d+\.\d+\.\d+-rust\.\d+(-rc\.\d+)?')
+ROOT_HOST_BUNDLE_ASSET = 'decky-loader-runtime-linux-x86_64.zip'
+
+
+def _download_release_file(url: str, limit: int) -> bytes:
+    request = urllib.request.Request(url, headers={'User-Agent': 'Decky root plugin host'})
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            data = response.read(limit + 1)
+    except (OSError, urllib.error.URLError) as error:
+        raise InstallerError(f'could not download {url}: {error}') from error
+    if len(data) > limit:
+        _fail(f'download is larger than {limit} bytes: {url}')
+    return data
+
+
+def _extract_runtime_zip(archive: Path, destination: Path) -> None:
+    """Unpack a release bundle ZIP with the same member rules as install-to-deck.sh."""
+    import zipfile
+
+    destination.mkdir(mode=0o700)
+    with zipfile.ZipFile(archive) as source:
+        names = [info.filename for info in source.infolist()]
+        if len(names) != len(set(names)):
+            _fail('runtime ZIP contains a duplicate member')
+        for info in source.infolist():
+            name = info.filename.rstrip('/') if info.is_dir() else info.filename
+            path = PurePosixPath(name)
+            mode = info.external_attr >> 16
+            if not name or path.is_absolute() or '..' in path.parts or path.as_posix() != name or '\\' in name or '\x00' in name:
+                _fail(f'runtime ZIP contains an unsafe member path: {info.filename}')
+            target = destination.joinpath(*path.parts)
+            if info.is_dir():
+                target.mkdir(mode=0o755, parents=True, exist_ok=True)
+                continue
+            if not stat.S_ISREG(mode) or mode & 0o6022:
+                _fail(f'runtime ZIP contains a non-regular or unsafe file: {name}')
+            target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            with os.fdopen(descriptor, 'wb') as output, source.open(info) as member:
+                shutil.copyfileobj(member, output)
+                os.fchmod(output.fileno(), stat.S_IMODE(mode) & 0o755)
+
+
+def _run_update_root_host(args: argparse.Namespace) -> dict[str, object]:
+    """Install the root runtime of release `--tag`, downloaded from the fork's releases.
+
+    The root host starts this when the loader reports a different version. It
+    only writes files; the running host switches at its next start.
+    """
+    _require_root()
+    user = pwd.getpwnam(args.user)
+    if user.pw_uid == 0 or user.pw_name != args.user:
+        _fail('--user must name the non-root account that runs Decky')
+    if not ROOT_HOST_RELEASE_TAG.fullmatch(args.tag):
+        _fail(f'not a release tag of this fork: {args.tag}')
+    homebrew = _homebrew_path(args.homebrew)
+    state = ROOT_HOST_STATE / str(user.pw_uid)
+    config = _read_root_host_json(state / 'config.json')
+    if config is None:
+        _fail('root plugin support is not enabled')
+    if config.get('release_version') == args.tag:
+        return {'ok': True, 'root_host': 'current', 'release_version': args.tag}
+    repository = str(config.get('release_repository') or DEFAULT_RELEASE_REPOSITORY)
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
+        _fail(f'invalid release repository: {repository}')
+    base = f'https://github.com/{repository}/releases/download/{args.tag}/{ROOT_HOST_BUNDLE_ASSET}'
+    sidecar = _download_release_file(base + '.sha256', 1024).decode('utf-8', 'replace')
+    match = re.fullmatch(rf'([0-9a-f]{{64}})  {re.escape(ROOT_HOST_BUNDLE_ASSET)}\n?', sidecar)
+    if match is None:
+        _fail(f'{ROOT_HOST_BUNDLE_ASSET}.sha256 is malformed')
+    work = state / 'runtimes' / f'.download-{uuid.uuid4().hex}'
+    created: list[Path] = []
+    _root_directory(state / 'runtimes', 0o755)
+    work.mkdir(mode=0o700)
+    try:
+        archive = work / ROOT_HOST_BUNDLE_ASSET
+        _write_atomic(archive, _download_release_file(base, 512 * 1024 * 1024), 0o600)
+        if _digest(archive) != match.group(1):
+            _fail(f'downloaded {ROOT_HOST_BUNDLE_ASSET} does not match its checksum file')
+        _extract_runtime_zip(archive, work / 'bundle')
+        runtime, manifest = _install_root_runtime(work / 'bundle', user, state, created)
+        if manifest.get('release_version') != args.tag:
+            _fail(f'release {args.tag} contains bundle {manifest.get("release_version")}')
+        _write_root_host_files(user, homebrew, state, runtime, manifest)
+        # Keep the runtime that the host runs now; it switches at its next start.
+        _prune_root_runtimes(state, {runtime.name, str(config.get('runtime'))})
+    except BaseException:
+        for path in reversed(created):
+            if path.parent == state / 'runtimes':
+                shutil.rmtree(path, ignore_errors=True)
+        raise
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return {'ok': True, 'root_host': 'updated', 'runtime': runtime.name, 'release_version': args.tag}
 
 
 def _run_disable_root_plugins(args: argparse.Namespace) -> dict[str, object]:
@@ -5902,6 +6015,10 @@ def main() -> int:
     disable_root = subparsers.add_parser('disable-root-plugins', help='remove the root plugin service and give root plugins back to the user (root only)')
     disable_root.add_argument('--homebrew', required=True, metavar='DIR')
     disable_root.add_argument('--user', required=True, metavar='USER')
+    update_root = subparsers.add_parser('update-root-host', help=argparse.SUPPRESS)
+    update_root.add_argument('--homebrew', required=True, metavar='DIR')
+    update_root.add_argument('--user', required=True, metavar='USER')
+    update_root.add_argument('--tag', required=True, metavar='TAG')
     args = parser.parse_args()
     try:
         if args.command == 'legacy-user-stop':
@@ -5910,6 +6027,8 @@ def main() -> int:
             output = _run_enable_root_plugins(args)
         elif args.command == 'disable-root-plugins':
             output = _run_disable_root_plugins(args)
+        elif args.command == 'update-root-host':
+            output = _run_update_root_host(args)
         elif args.command in ('migrate-legacy-system', 'restore-legacy-system', 'forget-legacy-system'):
             _require_root()
             user = pwd.getpwnam(args.user)

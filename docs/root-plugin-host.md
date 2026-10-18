@@ -1,7 +1,9 @@
 # Root plugin host (design)
 
-Status: phases 1 and 2 built and tested on the SteamOS VM (2026-10-17): the host, opt-in and
-opt-out, folder checks, start and stop, status, and the backend integration. Phases 3 to 5 remain.
+Status: phases 1 to 4 built and tested on the SteamOS VM (2026-10-17): the host, opt-in and
+opt-out, folder checks, start and stop, status, backend integration, store install, update and
+uninstall through the host, and runtime updates that follow Decky updates. Phase 5 (security
+review) remains.
 
 ## Goal
 
@@ -104,12 +106,12 @@ One JSON object per line on the control socket. The host accepts a connection on
 
 | Request | Effect |
 |---|---|
-| `list` | Installed root plugins: name, folder, version, enabled, running, last error |
-| `start {name}` | Check the plugin folder (below), start it, and return its IPC socket path |
-| `stop {name}` | Stop the plugin process group (SIGTERM, then SIGKILL after 5 s) |
-| `install {store_url, name, version, artifact_url, sha256}` | Download from an allowed store host only, check SHA-256, unpack to a staging folder, check `plugin.json` (name matches, `root` flag present), then move it into place |
-| `uninstall {name}` | Stop, then delete the code. Settings and data stay, as on official Decky |
-| `update-host {tag}` | Download that release of this fork, check its `.sha256` file and bundle identity, then switch the root runtime |
+| `hello {protocol, auth_token, server_host, server_port, loader_version}` | First request. When `loader_version` is a release tag that differs from the root runtime, the host starts a runtime update (below) |
+| `list` | Approved root plugins: folder, name, version, running |
+| `start {id, directory}` | Check the plugin folder (below), start it, and return its PID and IPC socket path |
+| `release`, `status`, `stop`, `forget {id}` | The same plugin lifecycle as the user service's launcher; `stop` sends SIGTERM, then SIGKILL after 5 s |
+| `install {directory, name, sha256, artifact}` | Download `artifact` (https, allowed store host only), check its store SHA-256, unpack the store folder into a root-owned staging folder through descriptors, check `plugin.json` (name matches, `root` flag present), fetch `remote_binary` files (each checked by its SHA-256), record the tree hash, then swap it into place |
+| `uninstall {directory}` | Delete a root-owned plugin folder and its approval. Settings and data stay, as on official Decky |
 
 The host never takes file paths, file descriptors or code from the backend. It takes names, and
 for downloads, URLs that must be on the allow list. The allow list is set once by root at opt-in
@@ -135,16 +137,20 @@ Decky, without following symlinks.
   When it closes, the host stops them at once (SIGTERM, then SIGKILL after 5 s). The backend starts
   them again when it reconnects. A root plugin never runs without a backend.
 - **Host exit:** with no running root plugins and no connection for 60 s, the host exits.
-- **Store install:** the backend sees the `root` flag (store tag and `plugin.json`) and sends
-  `install` instead of unpacking the ZIP itself. Uninstall, enable, disable and reload go through
-  the host in the same way.
-- **In-app update:** after the user service updates, the backend sends `update-host` with the new
-  tag. If that fails, root plugins keep running on the old host if the protocol version matches.
-  Otherwise they show "Root plugin host needs an update: run the installer again".
-- **Status:** `install-to-deck.sh --status` shows the root host, its runtime version and each root
-  plugin with memory and CPU.
-- **Undo and rollback:** `--undo` restores the user service. The root runtime keeps its own
-  previous copy and switches back if the protocol version requires it.
+- **Store install:** the backend sees the `root` flag in the downloaded `plugin.json` and sends
+  `install` instead of unpacking the ZIP itself. Root plugins from a URL or a local ZIP are
+  refused. Uninstall goes through the host for root-owned folders.
+- **Loader update:** the backend sends its version in `hello`. If it is a release tag that differs
+  from the root runtime, the host starts `install.py update-root-host` from its own root-owned
+  runtime. That downloads the release ZIP and its `.sha256` file from the fork's GitHub releases,
+  checks them, unpacks and checks the bundle, and installs it as a new root runtime with new units.
+  It changes only files. The running host keeps serving; when a new connection arrives and it has
+  no connection and no plugins, it exits without accepting, and systemd starts the new runtime for
+  that connection. The previous runtime is kept until the next update.
+- **Status:** `install-to-deck.sh --status` shows the root host, its runtime and release, and the
+  approved plugins.
+- **Undo:** after `--undo`, the backend reports the older release tag and the host installs that
+  release the same way. `dev` builds never trigger an update.
 - **Without opt-in:** root plugins show "This plugin needs root. Run `install-to-deck.sh
   --enable-root-plugins` to allow plugins that need root." in place of today's message.
 
@@ -179,12 +185,11 @@ Decky, without following symlinks.
 ## Build order
 
 1. Root host subcommand, control protocol, folder checks, socket units, and
-   `--enable-root-plugins` / `--disable-root-plugins` / `--status`. Root plugins can be installed
-   from the command line with sudo for testing.
-2. Backend integration: start, stop, reload, enable and disable through the host.
-3. Store install, uninstall and update through the host.
-4. Host updates with in-app updates; rollback.
-5. Security review, README section, then a preview release.
+   `--enable-root-plugins` / `--disable-root-plugins` / `--status`. Done.
+2. Backend integration: start, stop, reload, enable and disable through the host. Done.
+3. Store install, uninstall and update through the host. Done.
+4. Host runtime follows loader updates and `--undo`. Done.
+5. Security review, then a stable release.
 
 ## Decisions (2026-10-17)
 

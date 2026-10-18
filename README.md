@@ -71,11 +71,12 @@ Some plugins, for example PowerTools, need administrator (root) access. By defau
 bash install-to-deck.sh --enable-root-plugins
 ```
 
-This installs the current version, asks for your `sudo` password once, and lists the installed plugins that need root. Answer `y` to allow them. Only those plugins run as root, in a separate background service. Decky itself and all other plugins still run as `deck`.
+This installs the current version, asks for your `sudo` password once, and lists the installed plugins that need root. Answer `y` to allow them. Only plugins that need root run as root, in a separate background service. Decky itself and all other plugins still run as `deck`.
+
+After this, you install, update and remove plugins that need root in the Decky store as usual. You do not need to run the command again. When Decky updates itself, the root service updates itself to the same version.
 
 - **Cost:** while at least one root plugin is on, one extra background process uses about 25 MB of memory. With no root plugins, nothing extra runs. It uses no CPU while idle.
-- **Risk:** a plugin that runs as root can change anything on your Deck. Allow only plugins you trust. As in the official Decky, a root plugin keeps its settings in your normal Decky folders.
-- **After you install or update a root plugin,** run the command again to allow the new version.
+- **Risk:** a plugin that runs as root can change anything on your Deck. Install only plugins you trust. Plugins that need root can only come from the Decky store, not from a URL or a ZIP file. As in the official Decky, a root plugin keeps its settings in your normal Decky folders.
 
 To turn root plugin support off, run `bash install-to-deck.sh --disable-root-plugins`. Root plugins then stop and become owned by `deck` again.
 

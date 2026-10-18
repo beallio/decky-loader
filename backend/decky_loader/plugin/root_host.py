@@ -16,17 +16,25 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import posixpath
 import pwd
+import re
 import select
+import shutil
 import signal
 import socket
 import stat
 import struct
+import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
+import uuid
+import zipfile
 from pathlib import Path
 from typing import Any, cast
 
@@ -40,6 +48,9 @@ _STOP_TIMEOUT = 5.0
 _MAX_JSON_BYTES = 1 << 20
 _MAX_REQUEST_BYTES = 1 << 16
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_MAX_ARCHIVE_BYTES = 512 << 20
+RELEASE_TAG = re.compile(r"v\d+\.\d+\.\d+-rust\.\d+(-rc\.\d+)?")
+SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class RootHostError(Exception):
@@ -176,6 +187,128 @@ def _ensure_root_directory(path: Path, mode: int) -> None:
     os.chmod(path, mode)
 
 
+def _write_root_file(path: Path, value: Any) -> None:
+    """Replace a root-owned JSON file in a folder that only root can change."""
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _download(url: str, limit: int) -> bytes:
+    # Imported here: only installs download, and certifi is optional outside the frozen runtime.
+    import ssl
+
+    try:
+        import certifi  # pyright: ignore[reportMissingImports]
+
+        context = ssl.create_default_context(cafile=cast(str, certifi.where()))  # pyright: ignore[reportUnknownMemberType]
+    except ImportError:
+        context = ssl.create_default_context()
+    request = urllib.request.Request(url, headers={"User-Agent": "Decky root plugin host"})
+    with urllib.request.urlopen(request, timeout=120, context=context) as response:
+        data = cast(bytes, response.read(limit + 1))
+    if len(data) > limit:
+        raise RootHostError(f"download is larger than {limit} bytes: {url}")
+    return data
+
+
+def _write_new_file(directory_fd: int, name: str, data: bytes) -> None:
+    descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o755, dir_fd=directory_fd)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+        # Same mode as the user installer gives plugin files.
+        os.fchmod(handle.fileno(), 0o755)
+
+
+def _open_subdirectory(root_fd: int, parts: tuple[str, ...]) -> int:
+    """Open (and create) a folder below root_fd, one level at a time, without links."""
+    descriptor = os.dup(root_fd)
+    try:
+        for part in parts:
+            try:
+                os.mkdir(part, 0o755, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            child = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _extract_plugin_archive(data: bytes, directory: str, stage_fd: int) -> None:
+    """Unpack the store ZIP's `directory/` member tree into stage_fd.
+
+    Follows the user installer's rules: one top folder, no unsafe paths, no
+    links, no duplicates.
+    """
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        seen: set[str] = set()
+        for info in archive.infolist():
+            name = info.filename
+            trimmed = name[:-1] if name.endswith("/") else name
+            parts = tuple(trimmed.split("/"))
+            if (not trimmed or name.startswith("/") or "\\" in name or "\0" in name
+                    or any(part in ("", ".", "..") for part in parts) or ":" in parts[0]):
+                raise RootHostError(f"unsafe path in plugin archive: {name}")
+            if parts[0] != directory:
+                raise RootHostError(f"plugin archive entry is outside {directory}: {name}")
+            relative = parts[1:]
+            if not relative:
+                continue
+            if stat.S_ISLNK(info.external_attr >> 16):
+                raise RootHostError(f"plugin archive contains a link: {name}")
+            if trimmed in seen:
+                raise RootHostError(f"plugin archive contains a duplicate entry: {name}")
+            seen.add(trimmed)
+            if info.is_dir():
+                os.close(_open_subdirectory(stage_fd, relative))
+                continue
+            parent = _open_subdirectory(stage_fd, relative[:-1])
+            try:
+                _write_new_file(parent, relative[-1], archive.read(info))
+            finally:
+                os.close(parent)
+
+
+def _download_remote_binaries(stage_fd: int) -> None:
+    """Fetch `remote_binary` files that package.json lists, checked by their SHA-256."""
+    package = _read_json_at(stage_fd, "package.json")
+    binaries = cast(dict[str, Any], package).get("remote_binary") if isinstance(package, dict) else None
+    if not binaries:
+        return
+    if not isinstance(binaries, list):
+        raise RootHostError("package.json remote_binary must be a list")
+    bin_fd = _open_subdirectory(stage_fd, ("bin",))
+    try:
+        for item in cast(list[Any], binaries):
+            entry = cast(dict[str, Any], item) if isinstance(item, dict) else {}
+            name, url, expected = entry.get("name"), entry.get("url"), entry.get("sha256hash")
+            if not isinstance(name, str) or not name or "/" in name or name in (".", ".."):
+                raise RootHostError(f"invalid remote binary name: {name!r}")
+            if not isinstance(url, str) or urllib.parse.urlsplit(url).scheme != "https":
+                raise RootHostError(f"remote binary {name} needs an https URL")
+            if not isinstance(expected, str) or not SHA256.fullmatch(expected):
+                raise RootHostError(f"remote binary {name} needs a SHA-256")
+            data = _download(url, _MAX_ARCHIVE_BYTES)
+            if hashlib.sha256(data).hexdigest() != expected:
+                raise RootHostError(f"remote binary {name} does not match its SHA-256")
+            _write_new_file(bin_fd, name, data)
+    finally:
+        os.close(bin_fd)
+
+
 class Config:
     def __init__(self, path: Path) -> None:
         data = _read_root_file(path)
@@ -195,9 +328,26 @@ class Config:
         self.uid: int = uid
         self.gid: int = gid
         self.homebrew = Path(homebrew)
+        self.path = path
         self.state_directory = path.parent
         self.mount_root = self.state_directory / "mnt"
         self.socket_directory = RUN_ROOT / str(uid) / "root-plugins"
+        hosts = data.get("store_hosts", [])
+        self.store_hosts: tuple[str, ...] = tuple(host for host in cast(list[Any], hosts) if isinstance(host, str)) if isinstance(hosts, list) else ()
+
+    def current(self) -> dict[str, Any]:
+        """The config as it is on disk now; the installer changes it during updates."""
+        data = _read_root_file(self.path)
+        return cast(dict[str, Any], data) if isinstance(data, dict) else {}
+
+    def record(self, directory: str, entry: dict[str, Any] | None) -> None:
+        """Add, replace or (with None) remove one approved plugin in state.json."""
+        plugins = dict(self.approved_directories())
+        if entry is None:
+            plugins.pop(directory, None)
+        else:
+            plugins[directory] = entry
+        _write_root_file(self.state_directory / "state.json", {"plugins": plugins})
 
     def approved(self, directory: str) -> dict[str, Any]:
         state = _read_root_file(self.state_directory / "state.json")
@@ -228,6 +378,9 @@ class Host:
         self.stopping = False
         self.children_changed = False
         self.wake_read, self.wake_write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        self.update: subprocess.Popen[bytes] | None = None
+        self.update_version = ""
+        self.failed_updates: set[str] = set()
 
     # Connection handling
 
@@ -305,6 +458,10 @@ class Host:
             return self.list()
         if operation == "start":
             return self.start(request)
+        if operation == "install":
+            return self.install(request)
+        if operation == "uninstall":
+            return self.uninstall(request)
         identifier = request.get("id")
         if not isinstance(identifier, str) or identifier not in self.children:
             raise RootHostError(f"unknown root plugin id: {identifier!r}")
@@ -342,13 +499,167 @@ class Host:
             raise RootHostError("hello was already sent")
         os.environ.update({"DECKY_AUTH_TOKEN": token, "SERVER_HOST": host, "SERVER_PORT": str(port)})
         self.greeted = True
+        updating = self.update_runtime(request.get("loader_version"))
         try:
             from decky_loader.helpers import get_loader_version
 
             version = get_loader_version()
         except Exception:
             version = None
-        return {"ok": True, "op": "hello", "protocol": PROTOCOL, "version": version, "pid": os.getpid()}
+        return {"ok": True, "op": "hello", "protocol": PROTOCOL, "version": version, "pid": os.getpid(), "updating": updating}
+
+    # Runtime updates
+
+    def update_runtime(self, loader_version: Any) -> bool:
+        """Install the root runtime that matches the loader, if they differ.
+
+        The installer downloads the release from GitHub and checks it against
+        its checksum file. It changes only files on disk; this process keeps
+        running and switches at its next start (see `should_restart`).
+        """
+        if self.update is not None:
+            return True
+        if not isinstance(loader_version, str) or not RELEASE_TAG.fullmatch(loader_version):
+            return False
+        if loader_version == self.config.current().get("release_version") or loader_version in self.failed_updates:
+            return False
+        installer = Path(sys.executable).parent / "install.py"
+        if not getattr(sys, "frozen", False) or not installer.is_file():
+            return False
+        self.update_version = loader_version
+        self.update = subprocess.Popen(
+            ["/usr/bin/python3", "-B", str(installer), "update-root-host", "--user", self.config.user,
+             "--homebrew", str(self.config.homebrew), "--tag", loader_version],
+            stdin=subprocess.DEVNULL, cwd="/", close_fds=True,
+        )
+        print(f"DeckyRootHost: installing the root runtime for {loader_version}", file=sys.stderr, flush=True)
+        return True
+
+    def poll_update(self) -> None:
+        if self.update is None or self.update.poll() is None:
+            return
+        if self.update.returncode:
+            self.failed_updates.add(self.update_version)
+            print(f"DeckyRootHost: root runtime update to {self.update_version} failed", file=sys.stderr, flush=True)
+        self.update = None
+
+    def should_restart(self) -> bool:
+        """True when an updated runtime is installed and nothing would be interrupted."""
+        if self.connection is not None or self.children or self.update is not None:
+            return False
+        if not getattr(sys, "frozen", False):
+            return False
+        runtime = self.config.current().get("runtime")
+        return isinstance(runtime, str) and runtime != Path(sys.executable).parent.name
+
+    # Plugin files
+
+    def _plugin_root_fd(self) -> int:
+        """Open <homebrew>/plugins without following links; it must belong to the user.
+
+        This stops a redirected path from making root write into a root-owned
+        `plugins` folder elsewhere on the system.
+        """
+        descriptor = os.open("/", _DIRECTORY_FLAGS)
+        try:
+            for part in (*self.config.homebrew.parts[1:], "plugins"):
+                child = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            if os.fstat(descriptor).st_uid != self.config.uid:
+                raise RootHostError("the plugins folder must belong to the Decky user")
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def install(self, request: dict[str, Any]) -> dict[str, Any]:
+        directory = _directory_name(request.get("directory"))
+        name, sha256, artifact = request.get("name"), request.get("sha256"), request.get("artifact")
+        if not isinstance(name, str) or not name:
+            raise RootHostError("install needs the plugin name")
+        if not isinstance(sha256, str) or not SHA256.fullmatch(sha256):
+            raise RootHostError("install needs the store SHA-256 of the plugin archive")
+        if not isinstance(artifact, str):
+            raise RootHostError("install needs the store download URL")
+        parsed = urllib.parse.urlsplit(artifact)
+        if parsed.scheme != "https" or parsed.hostname not in self.config.store_hosts:
+            raise RootHostError("plugins that need root can only be installed from the Decky store")
+        if any(running == directory for running, _ in self.directories.values()):
+            raise RootHostError(f"{directory} is running; stop it first")
+        archive = _download(artifact, _MAX_ARCHIVE_BYTES)
+        if hashlib.sha256(archive).hexdigest() != sha256:
+            raise RootHostError("the downloaded plugin does not match its store SHA-256")
+
+        plugins_fd = self._plugin_root_fd()
+        stage = f".decky-root-stage-{uuid.uuid4().hex}"
+        try:
+            os.mkdir(stage, 0o700, dir_fd=plugins_fd)
+            stage_fd = os.open(stage, _DIRECTORY_FLAGS, dir_fd=plugins_fd)
+            try:
+                info = os.fstat(stage_fd)
+                if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+                    raise RootHostError("the staging folder was replaced")
+                _extract_plugin_archive(archive, directory, stage_fd)
+                metadata = plugin_metadata(stage_fd)
+                if metadata["name"] != name:
+                    raise RootHostError(f"the archive contains {metadata['name']}, not {name}")
+                if "root" not in metadata["flags"]:
+                    raise RootHostError(f"{name} does not need root; install it as a normal plugin")
+                _download_remote_binaries(stage_fd)
+                os.fchmod(stage_fd, 0o755)
+                tree = plugin_tree_sha256(stage_fd)
+            finally:
+                os.close(stage_fd)
+            self._replace(plugins_fd, stage, directory)
+            stage = ""
+            entry = {"name": name, "version": metadata["version"], "tree_sha256": tree}
+            self.config.record(directory, entry)
+        finally:
+            if stage:
+                shutil.rmtree(stage, dir_fd=plugins_fd, ignore_errors=True)
+            os.close(plugins_fd)
+        return {"ok": True, "op": "installed", "directory": directory, **entry}
+
+    @staticmethod
+    def _replace(plugins_fd: int, stage: str, directory: str) -> None:
+        backup = ""
+        try:
+            os.stat(directory, dir_fd=plugins_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            backup = f".decky-root-backup-{uuid.uuid4().hex}"
+            os.rename(directory, backup, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+        try:
+            os.rename(stage, directory, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+        except BaseException:
+            if backup:
+                os.rename(backup, directory, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+            raise
+        if backup:
+            shutil.rmtree(backup, dir_fd=plugins_fd, ignore_errors=True)
+
+    def uninstall(self, request: dict[str, Any]) -> dict[str, Any]:
+        directory = _directory_name(request.get("directory"))
+        if any(running == directory for running, _ in self.directories.values()):
+            raise RootHostError(f"{directory} is running; stop it first")
+        plugins_fd = self._plugin_root_fd()
+        try:
+            try:
+                info = os.stat(directory, dir_fd=plugins_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                info = None
+            if info is not None:
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
+                    raise RootHostError(f"{directory} is not a root plugin folder")
+                backup = f".decky-root-backup-{uuid.uuid4().hex}"
+                os.rename(directory, backup, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+                shutil.rmtree(backup, dir_fd=plugins_fd)
+        finally:
+            os.close(plugins_fd)
+        self.config.record(directory, None)
+        return {"ok": True, "op": "uninstalled", "directory": directory}
 
     def list(self) -> dict[str, Any]:
         running = {directory for directory, _ in self.directories.values()}
@@ -375,7 +686,11 @@ class Host:
             raise RootHostError(f"{directory} is already running")
         approved = self.config.approved(directory)
         plugin_root = self.config.homebrew / "plugins"
-        directory_fd = self._open_plugin(plugin_root, directory)
+        root_fd = self._plugin_root_fd()
+        try:
+            directory_fd = os.open(directory, _DIRECTORY_FLAGS, dir_fd=root_fd)
+        finally:
+            os.close(root_fd)
         try:
             metadata = plugin_metadata(directory_fd)
             if "root" not in metadata["flags"]:
@@ -423,14 +738,6 @@ class Host:
         self.children[identifier] = launcher._Child(identifier, pid, gate)  # pyright: ignore[reportPrivateUsage]
         self.directories[identifier] = (directory, directory_fd)
         return {"ok": True, "op": "forked", "id": identifier, "pid": pid, "socket": str(socket_path)}
-
-    @staticmethod
-    def _open_plugin(plugin_root: Path, directory: str) -> int:
-        root_fd = os.open(plugin_root, _DIRECTORY_FLAGS)
-        try:
-            return os.open(directory, _DIRECTORY_FLAGS, dir_fd=root_fd)
-        finally:
-            os.close(root_fd)
 
     def stop(self, children: dict[str, launcher._Child]) -> None:  # pyright: ignore[reportPrivateUsage]
         running = {key: child for key, child in children.items() if child.wait_status is None}
@@ -482,7 +789,8 @@ class Host:
                 if self.children_changed:
                     self.children_changed = False
                     launcher._poll_children(self.children)  # pyright: ignore[reportPrivateUsage]
-                busy = self.connection is not None or bool(self.children)
+                self.poll_update()
+                busy = self.connection is not None or bool(self.children) or self.update is not None
                 if busy:
                     idle_since = time.monotonic()
                     timeout = None
@@ -493,7 +801,7 @@ class Host:
                 watched: list[Any] = [self.listener, self.wake_read]
                 if self.connection is not None:
                     watched.append(self.connection)
-                readable, _, _ = select.select(watched, [], [], timeout)
+                readable, _, _ = select.select(watched, [], [], 5.0 if self.update is not None else timeout)
                 if self.wake_read in readable:
                     while True:
                         try:
@@ -504,6 +812,11 @@ class Host:
                 if self.stopping:
                     break
                 if self.listener in readable:
+                    if self.should_restart():
+                        # Leave the waiting connection to the next start, which
+                        # systemd runs from the updated runtime.
+                        print("DeckyRootHost: restarting into the updated root runtime", file=sys.stderr, flush=True)
+                        break
                     self.accept()
                 if self.connection is not None and self.connection in readable:
                     self.read_connection()
