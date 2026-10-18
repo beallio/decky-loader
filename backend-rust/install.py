@@ -5596,6 +5596,9 @@ def _install_root_runtime(bundle: Path, user: pwd.struct_passwd, state: Path, cr
     stage_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         _change_tree_owner(stage_fd, 0, 0, clear_group_other_write=True)
+        # The copy keeps its source's mode; a download unpacks into a 0700 folder.
+        # The user service checks and reads the runtime, so it must be 0755.
+        os.fchmod(stage_fd, 0o755)
     finally:
         os.close(stage_fd)
     _, manifest = _validate_bundle(str(stage), user)
