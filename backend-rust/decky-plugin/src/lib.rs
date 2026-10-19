@@ -287,14 +287,20 @@ impl Plugin {
                 let (methods, context, writer) =
                     (Arc::clone(&methods), context.clone(), Arc::clone(&writer));
                 tokio::spawn(async move {
-                    let result = match methods.get(&name) {
-                        // A separate task turns a panic into an error reply, so the caller is answered.
-                        Some(method) => match tokio::spawn(method(context, args)).await {
-                            Ok(result) => result,
-                            Err(error) => Err(format!("Method {name} failed: {error}")),
-                        },
-                        None => Err(format!("Plugin has no method {name}")),
+                    // The method is called and awaited in its own task, so a panic while it
+                    // builds or runs its future becomes an error reply and the caller is answered.
+                    let call = {
+                        let name = name.clone();
+                        tokio::spawn(async move {
+                            match methods.get(&name) {
+                                Some(method) => method(context, args).await,
+                                None => Err(format!("Plugin has no method {name}")),
+                            }
+                        })
                     };
+                    let result = call
+                        .await
+                        .unwrap_or_else(|error| Err(format!("Method {name} failed: {error}")));
                     let (success, res) = match result {
                         Ok(value) => (true, value),
                         Err(message) => (false, Value::String(message)),
@@ -521,6 +527,12 @@ mod tests {
                 })
                 .method("fail", |_context, _args| async { Err("nope".to_owned()) })
                 .method("panic", |_context, _args| async { panic!("handler bug") })
+                .method(
+                    "panic_early",
+                    |_context, _args| -> std::future::Ready<MethodResult> {
+                        panic!("bad arguments")
+                    },
+                )
                 .on_migration(record("migration"))
                 .on_main(|context| async move {
                     context
@@ -546,6 +558,7 @@ mod tests {
                 ("b", "fail", json!([])),
                 ("c", "gone", json!([])),
                 ("d", "panic", json!([])),
+                ("e", "panic_early", json!([])),
             ] {
                 let call = json!({"type": 0, "method": method, "id": id, "args": args});
                 writer
@@ -563,7 +576,7 @@ mod tests {
                         (&reply["success"], &reply["res"]),
                         (&json!(false), &json!("nope"))
                     ),
-                    "panic" => assert_eq!(
+                    "panic" | "panic_early" => assert_eq!(
                         (
                             &reply["success"],
                             reply["res"].as_str().unwrap().contains("panicked")
