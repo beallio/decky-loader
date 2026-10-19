@@ -2805,14 +2805,16 @@ fn changed_plugin_directory(plugin_root: &Path, source: &Path) -> Option<String>
 }
 
 /// Whether `file` is the native backend named in the plugin's `plugin.json`. This only
-/// selects a reload; the import reads and checks the metadata again.
+/// selects a reload; the import reads and checks the metadata again. The read refuses
+/// links and non-regular files, so a FIFO or device cannot stall the watcher.
 fn is_native_backend_file(plugin: &Path, file: &Path) -> bool {
-    read_json(&plugin.join("plugin.json")).is_ok_and(|metadata| {
-        metadata
-            .get("backend")
-            .and_then(Value::as_str)
-            .is_some_and(|backend| Path::new(backend) == file)
-    })
+    open_plugin_directory_fd(plugin)
+        .and_then(|directory| read_json_at(&directory, OsStr::new("plugin.json")))
+        .is_ok_and(|metadata| {
+            metadata
+                .and_then(|metadata| metadata.get("backend")?.as_str().map(PathBuf::from))
+                .is_some_and(|backend| backend == file)
+        })
 }
 
 /// Directories whose attributes changed, as seen by the plugin root watcher.
@@ -4100,6 +4102,31 @@ mod native_backend_tests {
         assert_eq!(changed("bin/other"), None);
         assert_eq!(changed("backend"), None);
         assert_eq!(changed("main.py").as_deref(), Some("native"));
+    }
+
+    #[test]
+    fn live_reload_selector_refuses_linked_or_special_metadata_without_blocking() {
+        let temporary = TestDirectory::new();
+        let plugin = temporary.0.join("native");
+        write_plugin(&plugin, json!("bin/backend"), &[]);
+        let metadata = plugin.join("plugin.json");
+        let fifo = std::ffi::CString::new(metadata.as_os_str().as_bytes()).unwrap();
+        for make in ["fifo", "link to /dev/zero"] {
+            fs::remove_file(&metadata).unwrap();
+            if make == "fifo" {
+                // SAFETY: `fifo` is a valid NUL-terminated path.
+                assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            } else {
+                symlink("/dev/zero", &metadata).unwrap();
+            }
+            let (root, file) = (temporary.0.clone(), plugin.join("bin/backend"));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || sender.send(changed_plugin_directory(&root, &file)));
+            let selected = receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("plugin.json as a {make} stalled the selector"));
+            assert_eq!(selected, None, "{make}");
+        }
     }
 
     #[test]
