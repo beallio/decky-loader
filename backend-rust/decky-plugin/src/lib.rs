@@ -111,7 +111,17 @@ impl Env {
 #[derive(Clone)]
 pub struct Context {
     env: Arc<Env>,
-    writer: watch::Receiver<Option<Writer>>,
+    link: watch::Receiver<Link>,
+}
+
+/// The plugin's connection to Decky, as `emit` sees it.
+#[derive(Clone)]
+enum Link {
+    /// No connection can come: migration is running or the plugin is stopping.
+    Unavailable,
+    /// The plugin listens and Decky will connect soon.
+    Waiting,
+    Connected(Writer),
 }
 
 impl Context {
@@ -121,16 +131,25 @@ impl Context {
 
     /// Sends an event to the plugin's frontend, like `decky.emit`. Frontend code
     /// receives it with `addEventListener(event, listener)`. If Decky has not
-    /// connected yet, this waits until it does.
+    /// connected yet, this waits until it does. During migration, and after the
+    /// plugin stops before Decky connected, it fails with
+    /// [`io::ErrorKind::NotConnected`] instead of waiting.
     pub async fn emit(&self, event: &str, args: Vec<Value>) -> io::Result<()> {
-        let mut writer = self.writer.clone();
-        let writer = writer
-            .wait_for(Option::is_some)
+        let mut link = self.link.clone();
+        let link = link
+            .wait_for(|link| !matches!(link, Link::Waiting))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "the plugin has stopped"))?
-            .clone()
-            .expect("wait_for returned a connection");
-        write_line(&writer, &json!({"type": 2, "event": event, "args": args})).await
+            .clone();
+        match link {
+            Link::Connected(writer) => {
+                write_line(&writer, &json!({"type": 2, "event": event, "args": args})).await
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Decky is not connected: events cannot be sent during migration or after the plugin stops",
+            )),
+        }
     }
 }
 
@@ -205,7 +224,8 @@ impl Plugin {
 
     /// Starts logging, serves Decky until it stops the plugin, then runs the
     /// unload and uninstall hooks. Decky allows five seconds for this before it
-    /// kills the process.
+    /// kills the process. SIGTERM or SIGINT stops the plugin at any time,
+    /// including during migration.
     pub async fn run(self) -> io::Result<()> {
         if let Err(error) = init_logging() {
             eprintln!("Could not open the plugin log file: {error}");
@@ -216,10 +236,23 @@ impl Plugin {
                 "DECKY_PLUGIN_SOCKET is not set; Decky Loader must start this program",
             )
         })?;
-        self.serve(Env::from_env(), Path::new(&socket)).await
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let stop = async move {
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+        };
+        self.serve(Env::from_env(), Path::new(&socket), stop).await
     }
 
-    async fn serve(self, env: Env, socket: &Path) -> io::Result<()> {
+    async fn serve(
+        self,
+        env: Env,
+        socket: &Path,
+        stop: impl Future<Output = ()>,
+    ) -> io::Result<()> {
         let Self {
             methods,
             migration,
@@ -227,100 +260,121 @@ impl Plugin {
             unload,
             uninstall,
         } = self;
-        let (connected, writer) = watch::channel(None);
+        let mut stop = std::pin::pin!(stop);
+        let (link, link_receiver) = watch::channel(Link::Unavailable);
         let context = Context {
             env: Arc::new(env),
-            writer,
+            link: link_receiver,
         };
-        // Install the handlers first so that an early stop still runs the hooks.
-        let mut terminate = signal(SignalKind::terminate())?;
-        let mut interrupt = signal(SignalKind::interrupt())?;
 
-        if let Some(migration) = migration {
-            migration(context.clone())
-                .await
-                .map_err(|error| io::Error::other(format!("migration failed: {error}")))?;
-        }
-        let main = main.map(|main| {
-            let context = context.clone();
-            tokio::spawn(async move {
-                if let Err(error) = main(context).await {
-                    log::error!("Main task failed: {error}");
-                }
-            })
-        });
+        let migrated = async {
+            match migration {
+                Some(migration) => migration(context.clone())
+                    .await
+                    .map_err(|error| io::Error::other(format!("migration failed: {error}"))),
+                None => Ok(()),
+            }
+        };
+        let stopped_early = tokio::select! {
+            result = migrated => {
+                result?;
+                false
+            }
+            _ = &mut stop => true,
+        };
 
-        let methods = Arc::new(methods);
         let uninstalling = AtomicBool::new(false);
-        let connection = async {
-            let listener = UnixListener::bind(socket)?;
-            let (stream, _) = listener.accept().await?;
-            let (reader, writer) = stream.into_split();
-            let writer = Arc::new(Mutex::new(writer));
-            connected.send_replace(Some(Arc::clone(&writer)));
-            let mut lines = BufReader::new(reader).lines();
-            while let Some(line) = lines.next_line().await? {
-                let message: Value = match serde_json::from_str(&line) {
-                    Ok(message) => message,
-                    Err(error) => {
-                        log::error!("Ignoring a message that is not JSON: {error}");
+        let mut main_task = None;
+        let outcome = if stopped_early {
+            Ok(())
+        } else {
+            link.send_replace(Link::Waiting);
+            main_task = main.map(|main| {
+                let context = context.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = main(context).await {
+                        log::error!("Main task failed: {error}");
+                    }
+                })
+            });
+            let methods = Arc::new(methods);
+            let connection = async {
+                let listener = UnixListener::bind(socket)?;
+                let (stream, _) = listener.accept().await?;
+                let (reader, writer) = stream.into_split();
+                let writer = Arc::new(Mutex::new(writer));
+                link.send_replace(Link::Connected(Arc::clone(&writer)));
+                let mut lines = BufReader::new(reader).lines();
+                while let Some(line) = lines.next_line().await? {
+                    let message: Value = match serde_json::from_str(&line) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            log::error!("Ignoring a message that is not JSON: {error}");
+                            continue;
+                        }
+                    };
+                    if let Some(flag) = message.get("uninstall") {
+                        uninstalling.store(flag.as_bool() == Some(true), Ordering::Release);
                         continue;
                     }
-                };
-                if let Some(flag) = message.get("uninstall") {
-                    uninstalling.store(flag.as_bool() == Some(true), Ordering::Release);
-                    continue;
-                }
-                if message.get("type").and_then(Value::as_u64) != Some(0) {
-                    continue;
-                }
-                let id = message.get("id").cloned().unwrap_or(Value::Null);
-                let name = message
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                let args = match message.get("args") {
-                    Some(Value::Array(args)) => args.clone(),
-                    _ => Vec::new(),
-                };
-                let (methods, context, writer) =
-                    (Arc::clone(&methods), context.clone(), Arc::clone(&writer));
-                tokio::spawn(async move {
-                    // The method is called and awaited in its own task, so a panic while it
-                    // builds or runs its future becomes an error reply and the caller is answered.
-                    let call = {
-                        let name = name.clone();
-                        tokio::spawn(async move {
-                            match methods.get(&name) {
-                                Some(method) => method(context, args).await,
-                                None => Err(format!("Plugin has no method {name}")),
-                            }
-                        })
-                    };
-                    let result = call
-                        .await
-                        .unwrap_or_else(|error| Err(format!("Method {name} failed: {error}")));
-                    let (success, res) = match result {
-                        Ok(value) => (true, value),
-                        Err(message) => (false, Value::String(message)),
-                    };
-                    let reply = json!({"type": 1, "id": id, "success": success, "res": res});
-                    if let Err(error) = write_line(&writer, &reply).await {
-                        log::error!("Could not answer {name}: {error}");
+                    if message.get("type").and_then(Value::as_u64) != Some(0) {
+                        continue;
                     }
-                });
+                    let id = message.get("id").cloned().unwrap_or(Value::Null);
+                    let name = message
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let args = match message.get("args") {
+                        Some(Value::Array(args)) => args.clone(),
+                        _ => Vec::new(),
+                    };
+                    let (methods, context, writer) =
+                        (Arc::clone(&methods), context.clone(), Arc::clone(&writer));
+                    tokio::spawn(async move {
+                        // The method is called and awaited in its own task, so a panic while it
+                        // builds or runs its future becomes an error reply and the caller is answered.
+                        let call = {
+                            let name = name.clone();
+                            tokio::spawn(async move {
+                                match methods.get(&name) {
+                                    Some(method) => method(context, args).await,
+                                    None => Err(format!("Plugin has no method {name}")),
+                                }
+                            })
+                        };
+                        let result = call
+                            .await
+                            .unwrap_or_else(|error| Err(format!("Method {name} failed: {error}")));
+                        let (success, res) = match result {
+                            Ok(value) => (true, value),
+                            Err(message) => (false, Value::String(message)),
+                        };
+                        let reply = json!({"type": 1, "id": id, "success": success, "res": res});
+                        if let Err(error) = write_line(&writer, &reply).await {
+                            log::error!("Could not answer {name}: {error}");
+                        }
+                    });
+                }
+                Ok::<(), io::Error>(())
+            };
+            tokio::select! {
+                outcome = connection => outcome,
+                _ = &mut stop => Ok(()),
             }
-            Ok::<(), io::Error>(())
-        };
-        let outcome = tokio::select! {
-            outcome = connection => outcome,
-            _ = terminate.recv() => Ok(()),
-            _ = interrupt.recv() => Ok(()),
         };
         if let Err(error) = &outcome {
             log::error!("Decky connection failed: {error}");
         }
+        // Decky can no longer connect; release any emit still waiting for it.
+        link.send_if_modified(|link| {
+            let waiting = matches!(link, Link::Waiting);
+            if waiting {
+                *link = Link::Unavailable;
+            }
+            waiting
+        });
 
         log::info!("Unloading {}", context.env.plugin_name);
         if let Some(unload) = unload
@@ -334,7 +388,7 @@ impl Plugin {
         {
             log::error!("Uninstall failed: {error}");
         }
-        if let Some(main) = main {
+        if let Some(main) = main_task {
             main.abort();
         }
         let _ = fs::remove_file(socket);
@@ -544,7 +598,11 @@ mod tests {
                 .on_uninstall(record("uninstall"));
             let server = tokio::spawn({
                 let socket = socket.clone();
-                async move { plugin.serve(Env::default(), &socket).await }
+                async move {
+                    plugin
+                        .serve(Env::default(), &socket, std::future::pending())
+                        .await
+                }
             });
 
             let (reader, mut writer) = connect(&socket).await.into_split();
@@ -612,7 +670,7 @@ mod tests {
         let socket = directory.0.join("p.sock");
         let result = Plugin::new()
             .on_migration(|_context| async { Err("old data is broken".to_owned()) })
-            .serve(Env::default(), &socket)
+            .serve(Env::default(), &socket, std::future::pending())
             .await;
         assert!(
             result
@@ -621,6 +679,87 @@ mod tests {
                 .contains("old data is broken")
         );
         assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn stop_during_migration_skips_listening_and_still_unloads() {
+        let directory = TestDirectory::new();
+        let socket = directory.0.join("p.sock");
+        let unloaded = Arc::new(AtomicBool::new(false));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn({
+            let (socket, unloaded) = (socket.clone(), Arc::clone(&unloaded));
+            async move {
+                Plugin::new()
+                    .on_migration(|_context| std::future::pending())
+                    .on_unload(move |_context| async move {
+                        unloaded.store(true, Ordering::Release);
+                        Ok(())
+                    })
+                    .serve(Env::default(), &socket, async {
+                        let _ = stopped.await;
+                    })
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("a stop during migration must end the plugin")
+            .unwrap()
+            .unwrap();
+        assert!(unloaded.load(Ordering::Acquire));
+        assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn emit_fails_instead_of_waiting_when_decky_cannot_connect() {
+        let directory = TestDirectory::new();
+        let socket = directory.0.join("p.sock");
+        let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let record = |results: &Arc<std::sync::Mutex<Vec<_>>>| {
+            let results = Arc::clone(results);
+            move |context: Context| async move {
+                let kind = context.emit("early", vec![]).await.unwrap_err().kind();
+                results.lock().unwrap().push(kind);
+                Ok(())
+            }
+        };
+        let server = tokio::spawn({
+            let (socket, migration, main) = (socket.clone(), record(&results), record(&results));
+            let finished = Arc::clone(&results);
+            async move {
+                Plugin::new()
+                    .on_migration(migration)
+                    // Decky never connects here, so main's emit waits until the stop.
+                    .on_main(main)
+                    // The main task is aborted after unload; let it record its result first.
+                    .on_unload(move |_context| async move {
+                        while finished.lock().unwrap().len() < 2 {
+                            tokio::task::yield_now().await;
+                        }
+                        Ok(())
+                    })
+                    .serve(Env::default(), &socket, async {
+                        let _ = stopped.await;
+                    })
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("emit during migration must not block the plugin")
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *results.lock().unwrap(),
+            [io::ErrorKind::NotConnected, io::ErrorKind::NotConnected]
+        );
     }
 
     #[test]
