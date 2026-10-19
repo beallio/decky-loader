@@ -107,7 +107,8 @@ def build(output: Path, release_version: str, python_archive: Path | None) -> di
         if python_version != python_config['version']:
             raise ValueError(f'pinned archive reported unexpected Python version: {python_version}')
         worker_python = work / 'worker-env/bin/python'
-        worker_environment = dict(environment, VIRTUAL_ENV=str(work / 'worker-env'),
+        # UV_NO_CONFIG: user and system uv.toml files (for example exclude-newer) must not change the locked install.
+        worker_environment = dict(environment, VIRTUAL_ENV=str(work / 'worker-env'), UV_NO_CONFIG='1',
                                   UV_PROJECT_ENVIRONMENT=str(work / 'worker-env'), UV_PYTHON_DOWNLOADS='never')
         # --locked fails when pyproject.toml and uv.lock disagree; the default group adds PyInstaller.
         run(['uv', 'sync', '--locked', '--python', str(python)], cwd=source / 'backend', env=worker_environment)

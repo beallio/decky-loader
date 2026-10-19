@@ -45,6 +45,7 @@ jobs:
       - name: Install locked SDK dependencies
         working-directory: backend
         env:
+          UV_NO_CONFIG: "1"
           UV_PYTHON_DOWNLOADS: never
         run: uv sync --locked --group typecheck --python "$(command -v python3)"
       - name: Check Python SDK types

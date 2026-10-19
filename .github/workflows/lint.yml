@@ -48,6 +48,7 @@ jobs:
       - name: Install pinned ruff
         env:
           UV_VERSION: ${{ steps.config.outputs.uv }}
+          UV_NO_CONFIG: "1"
           UV_PYTHON_DOWNLOADS: never
         run: |
           python3 -m pip install "uv==$UV_VERSION"

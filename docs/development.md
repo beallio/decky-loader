@@ -49,7 +49,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/runtime -p 'test
 Check the SDK backend types with [ty](https://docs.astral.sh/ty/), pinned in `backend/uv.lock`:
 
 ```sh
-cd backend && uv sync --locked --group typecheck && uv run --no-sync ty check --error-on-warning
+cd backend && UV_NO_CONFIG=1 uv sync --locked --group typecheck && uv run --no-sync ty check --error-on-warning
 ```
 
 Check the Python packages against upstream with `python3 scripts/runtime/python_parity.py`.
@@ -57,8 +57,10 @@ Check the Python packages against upstream with `python3 scripts/runtime/python_
 Lint the fork's own Python with [ruff](https://docs.astral.sh/ruff/), pinned in `backend/uv.lock`, from the repository root. `ruff.toml` lists the files; unchanged and overlaid upstream files are not linted:
 
 ```sh
-uv sync --project backend --locked --only-group lint && uv run --project backend --no-sync ruff check .
+UV_NO_CONFIG=1 uv sync --project backend --locked --only-group lint && uv run --project backend --no-sync ruff check .
 ```
+
+Run every `uv sync` and `uv lock` for this project with `UV_NO_CONFIG=1`. A personal or system `uv.toml` (for example `exclude-newer`) otherwise changes the lock options, and `--locked` fails in CI. The build and CI set it themselves.
 
 The native JSON tests are separate because they require a compiled extension for the selected Python ABI. The complete runtime builder compiles that extension and runs `tests/native-json/` with the pinned CPython before it packages the worker.
 
@@ -187,6 +189,6 @@ To move to a new upstream tag:
 1. Fetch the tag: `git fetch --no-tags https://github.com/SteamDeckHomebrew/decky-loader.git refs/tags/vX.Y.Z:refs/tags/vX.Y.Z`.
 2. Merge the upstream changes into `backend/decky_loader` and `frontend`. For each overlay file, merge by hand, or run `git merge-file` with the old tag as base. Keep the fork changes. For each removed file, check that the change does not matter, then keep it removed. Keep the fork's `backend/pyproject.toml` and `backend/uv.lock`, and do not bring back `backend/poetry.lock`.
 3. In `build-config.json`, set `sdk.tag`, `sdk.commit` (`git rev-parse vX.Y.Z^{commit}`), `sdk.backend_tree` (`git rev-parse vX.Y.Z:backend/decky_loader`), and `sdk.frontend_tree` (`git rev-parse vX.Y.Z:frontend`). Update the base version named in this guide. Remove overlay entries that now equal upstream.
-4. Set `version` in `backend/pyproject.toml` to the new tag without the `v`. For each package that the report lists, match upstream: change the dependency range in `pyproject.toml` if upstream changed it, then `uv lock --upgrade-package NAME==VERSION` in `backend`. `python3 scripts/runtime/python_parity.py` must pass.
+4. Set `version` in `backend/pyproject.toml` to the new tag without the `v`. For each package that the report lists, match upstream: change the dependency range in `pyproject.toml` if upstream changed it, then `UV_NO_CONFIG=1 uv lock --upgrade-package NAME==VERSION` in `backend`. `python3 scripts/runtime/python_parity.py` must pass.
 5. Run the local checks and a complete build.
 6. Release as `vX.Y.Z-rust.N` (use `-rc.N` for a preview). See [Release validation and publication](#release-validation-and-publication).
