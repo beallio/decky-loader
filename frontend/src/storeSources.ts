@@ -73,6 +73,32 @@ export function migrateStoreSettings(oldStore: unknown, oldURL: unknown): StoreS
 }
 
 /**
+ * Ask every store at once. A store that fails or does not finish (headers and body) within
+ * `timeoutMs` counts as failed, so one stalled store cannot hold back the others.
+ */
+export async function loadFromEachStore<T>(
+  sources: StoreSource[],
+  load: (url: string, signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+): Promise<SourceResult<T>[]> {
+  return Promise.all(
+    sources.map(async (source) => {
+      const signal = AbortSignal.timeout(timeoutMs);
+      // The race also ends a load that ignores the signal.
+      const deadline = new Promise<never>((_, reject) =>
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
+      );
+      try {
+        return { source, value: await Promise.race([load(source.url, signal), deadline]) };
+      } catch (e) {
+        console.warn(`Store ${source.url} is unavailable`, e);
+        return { source, value: null };
+      }
+    }),
+  );
+}
+
+/**
  * The highest store that lists a plugin provides it (name, picture, description). Versions
  * that only lower stores have are added after the provider's versions, marked with their store.
  */

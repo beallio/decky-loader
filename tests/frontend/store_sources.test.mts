@@ -7,6 +7,7 @@ import {
   EXTENDED_TESTING_STORE,
   OFFICIAL_STORE,
   OFFICIAL_TESTING_STORE,
+  loadFromEachStore,
   mergePluginLists,
   migrateStoreSettings,
   providerVersion,
@@ -30,6 +31,25 @@ test('a store that did not answer holds back updates from the stores below it', 
     { source: official, value: null },
     { source: testing, value: { 'CSS Loader': ['2.2.0-pr.12', 'h'] as [string, string] } },
   ];
+  assert.equal(providerVersion(results, 'CSS Loader'), null);
+});
+
+test('a stalled store times out without holding back the other stores or its lower-store updates', async () => {
+  const started = Date.now();
+  const results = await loadFromEachStore(
+    [official, testing, { url: EXTENDED_TESTING_STORE, prerelease: true }],
+    // Official never answers and ignores the abort signal; the others answer at once.
+    (url) =>
+      url === OFFICIAL_STORE
+        ? new Promise<never>(() => {})
+        : Promise.resolve({ 'CSS Loader': ['2.2.0-pr.12', 'h'] as [string, string] }),
+    50,
+  );
+  assert.ok(Date.now() - started < 2000);
+  assert.deepEqual(
+    results.map((r) => r.value !== null),
+    [false, true, true],
+  );
   assert.equal(providerVersion(results, 'CSS Loader'), null);
 });
 

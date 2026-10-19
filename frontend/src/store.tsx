@@ -5,6 +5,7 @@ import {
   MergedStorePlugin,
   SourceResult,
   StoreSettings,
+  loadFromEachStore,
   mergePluginLists,
   migrateStoreSettings,
   providerVersion,
@@ -81,7 +82,7 @@ export async function saveStoreSettings(settings: StoreSettings) {
 
 // Fork: store data goes through the backend's authenticated /fetch proxy. A browser fetch
 // with X-Decky-Version needs a CORS preflight, which static hosts such as GitHub Pages refuse.
-async function storeFetch(url: string): Promise<Response> {
+async function storeFetch(url: string, signal: AbortSignal): Promise<Response> {
   const version = await window.DeckyPluginLoader.updateVersion();
   return window.DeckyPluginLoader.fetchNoCors(url, {
     method: 'GET',
@@ -89,25 +90,19 @@ async function storeFetch(url: string): Promise<Response> {
       'X-Decky-Version': version.current,
     },
     excludedHeaders: [],
+    signal,
   });
 }
 
-async function fromEachStore<T>(load: (url: string) => Promise<T>): Promise<SourceResult<T>[]> {
-  const sources = storeSources(await getStoreSettings());
-  return Promise.all(
-    sources.map(async (source) => {
-      try {
-        return { source, value: await load(source.url) };
-      } catch (e) {
-        console.warn(`Store ${source.url} is unavailable`, e);
-        return { source, value: null };
-      }
-    }),
-  );
+// Fork: the most one store may take per list (headers and body); a slower store counts as failed.
+const STORE_TIMEOUT_MS = 20000;
+
+async function fromEachStore<T>(load: (url: string, signal: AbortSignal) => Promise<T>): Promise<SourceResult<T>[]> {
+  return loadFromEachStore(storeSources(await getStoreSettings()), load, STORE_TIMEOUT_MS);
 }
 
-async function fetchPluginList(storeURL: string): Promise<StorePlugin[]> {
-  const response = await storeFetch(storeURL);
+async function fetchPluginList(storeURL: string, signal: AbortSignal): Promise<StorePlugin[]> {
+  const response = await storeFetch(storeURL, signal);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const plugins = await response.json();
   if (!Array.isArray(plugins)) throw new Error('the store did not return a plugin list');
@@ -123,9 +118,9 @@ export async function getPluginList(
   return { plugins: sortStorePlugins(plugins, sort_by, sort_direction), failed };
 }
 
-async function fetchVersionList(storeURL: string): Promise<UpdateEndpointVersions> {
+async function fetchVersionList(storeURL: string, signal: AbortSignal): Promise<UpdateEndpointVersions> {
   try {
-    const response = await storeFetch(storeURL + '/versions');
+    const response = await storeFetch(storeURL + '/versions', signal);
     if (response.ok) {
       const versions = await response.json();
       if (versions && typeof versions === 'object' && !Array.isArray(versions)) return versions;
@@ -135,7 +130,7 @@ async function fetchVersionList(storeURL: string): Promise<UpdateEndpointVersion
   }
   // Fork: a store that cannot answer <store URL>/versions (for example a single
   // plugins.json file) still gets update checks, from its full plugin list.
-  return versionsFromPluginList(await fetchPluginList(storeURL));
+  return versionsFromPluginList(await fetchPluginList(storeURL, signal));
 }
 
 function versionsFromPluginList(plugins: StorePlugin[]): UpdateEndpointVersions {
