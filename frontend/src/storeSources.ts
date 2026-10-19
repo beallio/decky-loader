@@ -37,6 +37,10 @@ export interface MergedStorePlugin extends StorePlugin {
   store: string;
   /** A higher store did not answer, so it may normally provide this plugin. */
   shadowedByFailedStore: boolean;
+  /** GitHub repository of the newest version (by date, from any store) whose download is on GitHub. */
+  repoUrl: string | null;
+  /** Every store whose list has this plugin, highest first (the store filter uses it). */
+  stores: string[];
 }
 
 export function storeLabel(url: string): string {
@@ -45,6 +49,19 @@ export function storeLabel(url: string): string {
     return new URL(url).host || url;
   } catch {
     return url;
+  }
+}
+
+/** The repository page of a GitHub artifact URL (https://github.com/<owner>/<repo>/...), or null. */
+export function githubRepoUrl(artifact: string | null | undefined): string | null {
+  try {
+    const url = new URL(artifact ?? '');
+    const [owner, repo] = url.pathname.split('/').filter(Boolean);
+    return url.protocol === 'https:' && url.hostname === 'github.com' && owner && repo
+      ? `https://github.com/${owner}/${repo}`
+      : null;
+  } catch {
+    return null;
   }
 }
 
@@ -107,6 +124,7 @@ export function mergePluginLists(results: SourceResult<StorePlugin[]>[]): {
   failed: string[];
 } {
   const byName = new Map<string, MergedStorePlugin>();
+  const repos = new Map<string, { url: string; time: number }>();
   const failed: string[] = [];
   for (const { source, value } of results) {
     if (!value) {
@@ -114,6 +132,13 @@ export function mergePluginLists(results: SourceResult<StorePlugin[]>[]): {
       continue;
     }
     for (const plugin of value) {
+      // Before duplicate versions are dropped: a lower store may hold the only GitHub download of a version.
+      for (const version of plugin.versions ?? []) {
+        const url = githubRepoUrl(version.artifact);
+        const time = Date.parse(version.created ?? '') || 0;
+        const best = repos.get(plugin.name);
+        if (url && (!best || time > best.time)) repos.set(plugin.name, { url, time });
+      }
       const versions: StorePluginVersion[] = (plugin.versions ?? []).map((version) => ({
         ...version,
         store: source.url,
@@ -121,14 +146,23 @@ export function mergePluginLists(results: SourceResult<StorePlugin[]>[]): {
       }));
       const provider = byName.get(plugin.name);
       if (!provider) {
-        byName.set(plugin.name, { ...plugin, versions, store: source.url, shadowedByFailedStore: failed.length > 0 });
+        byName.set(plugin.name, {
+          ...plugin,
+          versions,
+          store: source.url,
+          shadowedByFailedStore: failed.length > 0,
+          repoUrl: null,
+          stores: [source.url],
+        });
         continue;
       }
+      if (!provider.stores.includes(source.url)) provider.stores.push(source.url);
       for (const version of versions) {
         if (!provider.versions.some((known) => known.name === version.name)) provider.versions.push(version);
       }
     }
   }
+  for (const [name, plugin] of byName) plugin.repoUrl = repos.get(name)?.url ?? null;
   return { plugins: [...byName.values()], failed };
 }
 
@@ -149,7 +183,7 @@ export function providerVersion(
   return null;
 }
 
-/** Sort the merged list the way the official store sorts its own list ('date' is the creation date). */
+/** Sort the merged list ('date' is the creation date, 'updated' the date of the last update). */
 export function sortStorePlugins<T extends StorePlugin>(
   plugins: T[],
   by: string | null,
@@ -158,9 +192,163 @@ export function sortStorePlugins<T extends StorePlugin>(
   if (!by) return plugins;
   const sign = direction === 'desc' ? -1 : 1;
   const number = (plugin: T) =>
-    by === 'date' ? Date.parse(plugin.created ?? '') || 0 : by === 'downloads' ? plugin.downloads ?? 0 : 0;
+    by === 'date'
+      ? Date.parse(plugin.created ?? '') || 0
+      : by === 'updated'
+        ? Date.parse(plugin.updated ?? '') || 0
+        : by === 'downloads'
+          ? plugin.downloads ?? 0
+          : 0;
   return [...plugins].sort(
     (a, b) =>
       sign * (by === 'name' ? a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }) : number(a) - number(b)),
   );
+}
+
+/** How long a saved store list is used before the store is asked again. */
+export const STORE_CACHE_MS = 6 * 60 * 60 * 1000;
+
+/** One store's saved plugin list. */
+export interface CachedList {
+  fetchedAt: number;
+  plugins: StorePlugin[];
+}
+
+export interface ListCache {
+  get(url: string): CachedList | null;
+  set(url: string, list: CachedList): void;
+}
+
+/**
+ * Each store's list: the saved list while it is younger than `ttlMs` (unless `force`), else the
+ * store's answer, which is then saved. A store that does not answer uses its saved list of any
+ * age and is named in `stale`. `fetchedAt` is the age of the oldest current list in use.
+ */
+export async function loadWithCache(
+  sources: StoreSource[],
+  load: (url: string, signal: AbortSignal) => Promise<StorePlugin[]>,
+  timeoutMs: number,
+  cache: ListCache,
+  now: number,
+  force: boolean,
+  ttlMs = STORE_CACHE_MS,
+): Promise<{
+  results: SourceResult<StorePlugin[]>[];
+  stale: { url: string; fetchedAt: number }[];
+  fetchedAt: number | null;
+}> {
+  const saved = new Map(sources.map((source) => [source.url, cache.get(source.url)]));
+  // A list from the future (the clock went back) counts as expired.
+  const current = (url: string) => {
+    const list = saved.get(url);
+    return !force && list && now >= list.fetchedAt && now - list.fetchedAt < ttlMs ? list : null;
+  };
+  const answers = await loadFromEachStore(
+    sources.filter((source) => !current(source.url)),
+    load,
+    timeoutMs,
+  );
+  const answered = new Map(answers.map(({ source, value }) => [source.url, value]));
+  const stale: { url: string; fetchedAt: number }[] = [];
+  let fetchedAt: number | null = null;
+  const results = sources.map((source) => {
+    let list = current(source.url);
+    if (!list) {
+      const value = answered.get(source.url);
+      if (!value) {
+        const old = saved.get(source.url);
+        if (old) stale.push({ url: source.url, fetchedAt: old.fetchedAt });
+        return { source, value: old?.plugins ?? null };
+      }
+      list = { fetchedAt: now, plugins: value };
+      cache.set(source.url, list);
+    }
+    fetchedAt = Math.min(fetchedAt ?? list.fetchedAt, list.fetchedAt);
+    return { source, value: list.plugins };
+  });
+  return { results, stale, fetchedAt };
+}
+
+/** Tags that differ only in case, spaces or hyphens, or a plural -s/-ies have the same key ("Utilities" = "utility"). */
+export function tagKey(tag: string): string {
+  const key = tag.toLowerCase().replace(/[^a-z0-9]+/g, '');
+  if (key.length > 4 && key.endsWith('ies')) return key.slice(0, -3) + 'y';
+  if (key.length > 3 && /[^su]s$/.test(key)) return key.slice(0, -1);
+  return key;
+}
+
+/**
+ * The tag filter's choices: tag groups used by at least `minPlugins` plugins, most used first,
+ * named by their most used spelling. 'root' is left out; it has its own filter.
+ */
+export function tagGroups(plugins: StorePlugin[], minPlugins = 2): { key: string; label: string; count: number }[] {
+  const groups = new Map<string, { spellings: Map<string, number>; plugins: Set<string> }>();
+  for (const plugin of plugins) {
+    for (const tag of plugin.tags) {
+      const key = tagKey(tag);
+      if (!key || key === 'root') continue;
+      const group = groups.get(key) ?? { spellings: new Map(), plugins: new Set() };
+      const spelling = tag.trim().toLowerCase();
+      group.spellings.set(spelling, (group.spellings.get(spelling) ?? 0) + 1);
+      group.plugins.add(plugin.name);
+      groups.set(key, group);
+    }
+  }
+  return [...groups]
+    .filter(([, group]) => group.plugins.size >= minPlugins)
+    .map(([key, group]) => ({
+      key,
+      label: [...group.spellings].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0][0],
+      count: group.plugins.size,
+    }))
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+}
+
+export interface StoreFilters {
+  store: string;
+  tag: string;
+  installed: '' | 'yes' | 'no';
+  root: '' | 'hide' | 'only';
+  github: '' | 'yes';
+}
+
+export const NO_STORE_FILTERS: StoreFilters = { store: '', tag: '', installed: '', root: '', github: '' };
+
+/** The plugins that match the search text (name, author, description or tag) and every filter. */
+export function filterStorePlugins(
+  plugins: MergedStorePlugin[],
+  search: string,
+  filters: StoreFilters,
+  installed: Set<string>,
+): MergedStorePlugin[] {
+  const text = search.trim().toLowerCase();
+  return plugins.filter(
+    (plugin) =>
+      (!text ||
+        [plugin.name, plugin.author, plugin.description ?? '', ...plugin.tags].some((value) =>
+          value.toLowerCase().includes(text),
+        )) &&
+      (!filters.store || plugin.stores.includes(filters.store)) &&
+      (!filters.tag || plugin.tags.some((tag) => tagKey(tag) === filters.tag)) &&
+      (!filters.installed || installed.has(plugin.name) === (filters.installed === 'yes')) &&
+      (!filters.root || plugin.tags.includes('root') === (filters.root === 'only')) &&
+      (!filters.github || plugin.repoUrl !== null),
+  );
+}
+
+/** Saved sort and filters from an earlier visit; anything unknown or malformed becomes the default. */
+export function restoreStoreView(saved: unknown, sorts: string[]): { sort: string; filters: StoreFilters } {
+  const value = saved && typeof saved === 'object' ? (saved as Record<string, unknown>) : {};
+  const pick = <T extends string>(item: unknown, allowed: readonly T[]): T =>
+    allowed.includes(item as T) ? (item as T) : allowed[0];
+  return {
+    sort: pick(value.sort, sorts),
+    filters: {
+      store: typeof value.store === 'string' ? value.store : '',
+      tag: typeof value.tag === 'string' ? value.tag : '',
+      installed: pick(value.installed, ['', 'yes', 'no'] as const),
+      root: pick(value.root, ['', 'hide', 'only'] as const),
+      github: pick(value.github, ['', 'yes'] as const),
+    },
+  };
 }

@@ -3,19 +3,30 @@ import {
   Dropdown,
   Focusable,
   NavEntryPositionPreferences,
+  Navigation,
   PanelSectionRow,
   SingleDropdownOption,
   SuspensefulImage,
+  showModal,
 } from '@decky/ui';
 import { compare, validate } from 'compare-versions';
 import { CSSProperties, FC, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { FaArrowDown, FaArrowUp, FaCheck, FaDownload, FaRecycle } from 'react-icons/fa';
+import {
+  FaArrowDown,
+  FaArrowUp,
+  FaCheck,
+  FaDownload,
+  FaExclamationTriangle,
+  FaGithub,
+  FaInfoCircle,
+  FaRecycle,
+} from 'react-icons/fa';
 
 import { DisabledPlugin, InstallType, Plugin } from '../../plugin';
 import { requestPluginInstall } from '../../store';
 import { MergedStorePlugin, storeLabel } from '../../storeSources';
-import ExternalLink from '../ExternalLink';
+import RootInfoModal from '../modals/RootInfoModal';
 
 interface PluginCardProps {
   storePlugin: MergedStorePlugin;
@@ -43,6 +54,8 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
             : InstallType.DOWNGRADE;
 
   const root = storePlugin.tags.some((tag) => tag === 'root');
+  // Stores may omit 'updated' or send a bad value; show no date then.
+  const updated = new Date(storePlugin.updated ?? '');
 
   const { t } = useTranslation();
 
@@ -109,9 +122,18 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
             }}
           >
             {storePlugin.author}
-            <span style={{ marginLeft: '8px', fontSize: '12px', color: '#969696' }}>
+            <span style={{ marginLeft: '8px', fontSize: '12px', color: '#969696', whiteSpace: 'nowrap' }}>
               {storeLabel(storePlugin.store)}
             </span>
+            {!isNaN(updated.getTime()) && (
+              <span style={{ marginLeft: '8px', fontSize: '12px', color: '#1a9fff', whiteSpace: 'nowrap' }}>
+                {/* React escapes the text; i18next escaping would show "/" in some date formats as "&#x2F;". */}
+                {t('PluginCard.plugin_updated', {
+                  date: updated.toLocaleDateString(undefined, { dateStyle: 'medium' }),
+                  interpolation: { escapeValue: false },
+                })}
+              </span>
+            )}
           </span>
           <span
             className="deckyStoreCardDescription"
@@ -133,27 +155,32 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
             )}
           </span>
           {root && (
-            <div
+            <Focusable
               className="deckyStoreCardDescription deckyStoreCardDescriptionRoot"
               style={{
-                fontSize: '13px',
-                color: '#fee75c',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
                 marginTop: 'auto',
+                padding: '4px 4px 4px 10px',
+                fontSize: '13px',
+                fontWeight: 'bold',
+                color: '#fee75c',
+                background: 'rgba(254, 231, 92, 0.12)',
+                border: '1px solid rgba(254, 231, 92, 0.5)',
+                borderRadius: '4px',
               }}
             >
-              <i>{t('PluginCard.plugin_full_access')}</i>{' '}
-              <ExternalLink
-                className="deckyStoreCardDescriptionRootLink"
-                href="https://deckbrew.xyz/root"
-                target="_blank"
-                style={{
-                  color: '#fee75c',
-                  textDecoration: 'none',
-                }}
+              <FaExclamationTriangle style={{ flexShrink: 0 }} />
+              <span style={{ flexGrow: 1 }}>{t('PluginCard.plugin_full_access')}</span>
+              <DialogButton
+                aria-label={t('PluginCard.plugin_full_access_info')}
+                style={{ width: 'auto', minWidth: 0, height: '26px', padding: '0 10px', color: '#fee75c' }}
+                onClick={() => showModal(<RootInfoModal />)}
               >
-                deckbrew.xyz/root
-              </ExternalLink>
-            </div>
+                <FaInfoCircle style={{ display: 'block' }} />
+              </DialogButton>
+            </Focusable>
           )}
           {storePlugin.shadowedByFailedStore && (
             <div
@@ -215,6 +242,15 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
                   </span>
                 </DialogButton>
               </div>
+              {storePlugin.repoUrl && (
+                <DialogButton
+                  aria-label={t('PluginCard.plugin_source')}
+                  style={{ width: 'auto', minWidth: 0, flexShrink: 0, padding: '0 14px' }}
+                  onClick={() => Navigation.NavigateToExternalWeb(storePlugin.repoUrl!)}
+                >
+                  <FaGithub style={{ display: 'block' }} />
+                </DialogButton>
+              )}
               <div className="deckyStoreCardVersionContainer" style={{ minWidth: '130px' }}>
                 <Dropdown
                   rgOptions={

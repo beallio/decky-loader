@@ -2,14 +2,15 @@ import { compare, validate } from 'compare-versions';
 
 import { DisabledPlugin, InstallType, Plugin, installPlugin, installPlugins } from './plugin';
 import {
+  ListCache,
   MergedStorePlugin,
   SourceResult,
   StoreSettings,
   loadFromEachStore,
+  loadWithCache,
   mergePluginLists,
   migrateStoreSettings,
   providerVersion,
-  sortStorePlugins,
   storeSources,
 } from './storeSources';
 import { getSetting, setSetting } from './utils/settings';
@@ -17,6 +18,7 @@ import { getSetting, setSetting } from './utils/settings';
 export enum SortOptions {
   name = 'name',
   date = 'date',
+  updated = 'updated',
   downloads = 'downloads',
 }
 
@@ -32,6 +34,7 @@ export interface StorePluginVersion {
   // Fork: the store that lists this version, and whether it is a pre-release store.
   store?: string;
   prerelease?: boolean;
+  created?: string;
 }
 
 export type UpdateEndpointVersions = { [name: string]: [version: string, hash: string, artifact?: string] };
@@ -45,6 +48,7 @@ export interface StorePlugin {
   tags: string[];
   image_url: string;
   created?: string;
+  updated?: string;
   downloads?: number;
 }
 
@@ -109,13 +113,54 @@ async function fetchPluginList(storeURL: string, signal: AbortSignal): Promise<S
   return plugins;
 }
 
-export async function getPluginList(
-  sort_by: SortOptions | null = null,
-  sort_direction: SortDirections | null = null,
-): Promise<{ plugins: MergedStorePlugin[]; failed: string[] }> {
-  // Each store sorts only its own list, so the merged list is sorted here.
-  const { plugins, failed } = mergePluginLists(await fromEachStore(fetchPluginList));
-  return { plugins: sortStorePlugins(plugins, sort_by, sort_direction), failed };
+// Fork: each store's plugin list is saved in localStorage for 6 hours (update checks stay live).
+const CACHE_PREFIX = 'decky-store-cache:';
+
+const savedLists: ListCache = {
+  get(url) {
+    try {
+      const list = JSON.parse(localStorage.getItem(CACHE_PREFIX + url) ?? 'null');
+      return list && typeof list.fetchedAt === 'number' && Array.isArray(list.plugins) ? list : null;
+    } catch {
+      return null;
+    }
+  },
+  set(url, list) {
+    try {
+      localStorage.setItem(CACHE_PREFIX + url, JSON.stringify(list));
+    } catch (e) {
+      console.warn(`Could not save the plugin list of ${url}`, e);
+    }
+  },
+};
+
+/** The merged plugin list of all stores. `force` asks every store again instead of using saved lists. */
+export async function getPluginList(force = false): Promise<{
+  plugins: MergedStorePlugin[];
+  failed: string[];
+  stale: { url: string; fetchedAt: number }[];
+  fetchedAt: number | null;
+}> {
+  const sources = storeSources(await getStoreSettings());
+  // Forget lists of stores that were removed from the settings. Storage errors only cost the clean-up.
+  try {
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith(CACHE_PREFIX) && !sources.some((source) => CACHE_PREFIX + source.url === key)) {
+        localStorage.removeItem(key);
+      }
+    }
+  } catch (e) {
+    console.warn('Could not clean the saved plugin lists', e);
+  }
+  const { results, stale, fetchedAt } = await loadWithCache(
+    sources,
+    fetchPluginList,
+    STORE_TIMEOUT_MS,
+    savedLists,
+    Date.now(),
+    force,
+  );
+  return { ...mergePluginLists(results), stale, fetchedAt };
 }
 
 async function fetchVersionList(storeURL: string, signal: AbortSignal): Promise<UpdateEndpointVersions> {

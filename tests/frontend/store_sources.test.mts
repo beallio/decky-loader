@@ -5,12 +5,19 @@ import { test } from 'node:test';
 import {
   EXTENDED_STORE,
   EXTENDED_TESTING_STORE,
+  NO_STORE_FILTERS,
   OFFICIAL_STORE,
   OFFICIAL_TESTING_STORE,
+  STORE_CACHE_MS,
+  filterStorePlugins,
+  githubRepoUrl,
   loadFromEachStore,
+  loadWithCache,
   mergePluginLists,
   migrateStoreSettings,
   providerVersion,
+  restoreStoreView,
+  tagGroups,
 } from '../../frontend/src/storeSources.ts';
 
 const official = { url: OFFICIAL_STORE, prerelease: false };
@@ -95,6 +102,38 @@ test('the merged list keeps the provider and adds lower-store versions after its
   assert.equal(plugins.find((p) => p.name === 'Only')!.store, OFFICIAL_TESTING_STORE);
 });
 
+const release = (name: string, created: string, artifact: string | null) => ({ name, hash: name, created, artifact });
+const pluginWith = (name: string, ...versions: ReturnType<typeof release>[]) => ({ ...plugin(name), versions });
+const zip = (repo: string) => `https://github.com/${repo}/releases/download/v1/p.zip`;
+
+test('the GitHub link comes from the newest GitHub download in any store', () => {
+  const { plugins } = mergePluginLists([
+    { source: official, value: [pluginWith('P', release('1.0.0', '2026-01-01T00:00:00Z', zip('old/p')))] },
+    { source: testing, value: [pluginWith('P', release('1.1.0', '2026-03-01T00:00:00Z', zip('new/p')))] },
+  ]);
+  assert.equal(plugins[0].store, OFFICIAL_STORE);
+  assert.equal(plugins[0].repoUrl, 'https://github.com/new/p');
+});
+
+test('a GitHub download on a lower-store copy of a provider version still gives a link', () => {
+  const { plugins } = mergePluginLists([
+    { source: official, value: [pluginWith('P', release('1.0.0', '2026-01-01T00:00:00Z', null))] },
+    { source: testing, value: [pluginWith('P', release('1.0.0', '2026-01-01T00:00:00Z', zip('o/p')))] },
+  ]);
+  assert.deepEqual(
+    plugins[0].versions.map((v) => [v.name, v.store, v.artifact]),
+    [['1.0.0', OFFICIAL_STORE, null]],
+  );
+  assert.equal(plugins[0].repoUrl, 'https://github.com/o/p');
+});
+
+test('only https github.com downloads with an owner and repository give a link', () => {
+  for (const bad of [null, '', 'not a url', 'http://github.com/o/p/x.zip', 'https://evil.example/github.com/o/p', 'https://github.com/o']) {
+    assert.equal(githubRepoUrl(bad), null, String(bad));
+  }
+  assert.equal(githubRepoUrl(zip('o/p')), 'https://github.com/o/p');
+});
+
 test('plugins below a failed store are marked, plugins above it are not', () => {
   const { plugins, failed } = mergePluginLists([
     { source: { url: EXTENDED_STORE, prerelease: false }, value: [plugin('Top', '1.0.0')] },
@@ -122,4 +161,111 @@ test('old single-store settings keep their store', () => {
   const testingCustom = migrateStoreSettings(2, EXTENDED_TESTING_STORE);
   assert.deepEqual([testingCustom.stores, testingCustom.includePrereleases], [defaults, true]);
   assert.deepEqual(migrateStoreSettings(1, 'https://example.com/plugins').stores, defaults);
+});
+
+const memoryCache = (entries: [string, { fetchedAt: number; plugins: ReturnType<typeof plugin>[] }][]) => {
+  const saved = new Map(entries);
+  return { saved, get: (url: string) => saved.get(url) ?? null, set: (url: string, list: any) => void saved.set(url, list) };
+};
+
+test('saved lists are used for 6 hours, then the store is asked again and the answer is saved', async () => {
+  const now = 10 * STORE_CACHE_MS;
+  const cache = memoryCache([
+    [OFFICIAL_STORE, { fetchedAt: now - STORE_CACHE_MS + 1, plugins: [plugin('Saved', '1.0.0')] }],
+    [OFFICIAL_TESTING_STORE, { fetchedAt: now - STORE_CACHE_MS, plugins: [plugin('Old', '1.0.0')] }],
+  ]);
+  const asked: string[] = [];
+  const load = async (url: string) => (asked.push(url), [plugin('New', '2.0.0')]);
+  const { results, stale, fetchedAt } = await loadWithCache([official, testing], load, 1000, cache, now, false);
+  assert.deepEqual(asked, [OFFICIAL_TESTING_STORE]);
+  assert.deepEqual(
+    results.map((r) => r.value![0].name),
+    ['Saved', 'New'],
+  );
+  assert.equal(cache.saved.get(OFFICIAL_TESTING_STORE)!.fetchedAt, now);
+  assert.deepEqual([stale, fetchedAt], [[], now - STORE_CACHE_MS + 1]);
+});
+
+test('Refresh asks every store even when its saved list is current', async () => {
+  const cache = memoryCache([[OFFICIAL_STORE, { fetchedAt: 100, plugins: [plugin('Saved', '1.0.0')] }]]);
+  const { results } = await loadWithCache([official], async () => [plugin('New', '2.0.0')], 1000, cache, 200, true);
+  assert.equal(results[0].value![0].name, 'New');
+});
+
+test('a store that does not answer uses its saved list of any age and is named as stale', async () => {
+  const cache = memoryCache([[OFFICIAL_STORE, { fetchedAt: 1, plugins: [plugin('Saved', '1.0.0')] }]]);
+  const fail = async () => {
+    throw new Error('offline');
+  };
+  const { results, stale, fetchedAt } = await loadWithCache(
+    [official, testing],
+    fail,
+    1000,
+    cache,
+    10 * STORE_CACHE_MS,
+    false,
+  );
+  assert.deepEqual(
+    results.map((r) => r.value?.[0].name ?? null),
+    ['Saved', null],
+  );
+  assert.deepEqual(stale, [{ url: OFFICIAL_STORE, fetchedAt: 1 }]);
+  assert.equal(fetchedAt, null);
+  // The saved list is not a failure, so plugins below it are not marked.
+  assert.deepEqual(mergePluginLists(results).failed, [OFFICIAL_TESTING_STORE]);
+});
+
+test('a saved list from the future (clock went back) is not trusted', async () => {
+  const cache = memoryCache([[OFFICIAL_STORE, { fetchedAt: 5000, plugins: [plugin('Saved', '1.0.0')] }]]);
+  const { results } = await loadWithCache([official], async () => [plugin('New', '2.0.0')], 1000, cache, 1000, false);
+  assert.equal(results[0].value![0].name, 'New');
+});
+
+const tagged = (name: string, ...tags: string[]) => ({ ...plugin(name, '1.0.0'), tags });
+
+test('tag spellings that differ in case, spaces, hyphens or plural form are one group', () => {
+  const groups = tagGroups([
+    tagged('A', 'utility', 'Steam Deck', 'root'),
+    tagged('B', 'utility', 'steam-deck', 'root'),
+    tagged('C', 'Utilities', 'Screenshots'),
+    tagged('D', 'screenshot', 'glass'),
+    tagged('E', 'chaos', 'Steam Deck'),
+  ]);
+  // Equal counts list by name; 'glass' and 'chaos' have one plugin each, 'root' has its own filter.
+  assert.deepEqual(groups, [
+    { key: 'steamdeck', label: 'steam deck', count: 3 },
+    { key: 'utility', label: 'utility', count: 3 },
+    { key: 'screenshot', label: 'screenshot', count: 2 },
+  ]);
+});
+
+test('filters combine, and a store matches every plugin in its list, even one with only the same versions', () => {
+  const { plugins } = mergePluginLists([
+    { source: official, value: [tagged('Root', 'root', 'Tools'), tagged('Plain', 'tool'), tagged('Both', 'misc')] },
+    { source: testing, value: [plugin('Plain', '1.0.0'), plugin('Both', '2.0.0'), plugin('Lower', '1.0.0')] },
+  ]);
+  const names = (filters: Partial<typeof NO_STORE_FILTERS>, search = '', installed = new Set<string>()) =>
+    filterStorePlugins(plugins, search, { ...NO_STORE_FILTERS, ...filters }, installed).map((p) => p.name);
+  assert.deepEqual(names({ store: OFFICIAL_TESTING_STORE }), ['Plain', 'Both', 'Lower']);
+  assert.deepEqual(names({ store: OFFICIAL_STORE }), ['Root', 'Plain', 'Both']);
+  assert.deepEqual(names({ tag: 'tool' }), ['Root', 'Plain']);
+  assert.deepEqual(names({ tag: 'tool', root: 'hide' }), ['Plain']);
+  assert.deepEqual(names({ root: 'only' }), ['Root']);
+  assert.deepEqual(names({ installed: 'yes' }, '', new Set(['Plain'])), ['Plain']);
+  assert.deepEqual(names({ installed: 'no' }, 'p', new Set(['Plain'])), []);
+  assert.deepEqual(names({ github: 'yes' }), []);
+});
+
+test('a saved store view keeps only known values', () => {
+  const sorts = ['name:asc', 'updated:desc'];
+  const saved = { sort: 'updated:desc', store: 'x', tag: 'y', installed: 'no', root: 'only', github: 'yes' };
+  assert.deepEqual(restoreStoreView(saved, sorts), {
+    sort: 'updated:desc',
+    filters: { store: 'x', tag: 'y', installed: 'no', root: 'only', github: 'yes' },
+  });
+  assert.deepEqual(restoreStoreView({ sort: 'bad', store: 3, installed: 'maybe', root: null }, sorts), {
+    sort: 'name:asc',
+    filters: NO_STORE_FILTERS,
+  });
+  assert.deepEqual(restoreStoreView('garbage', sorts).filters, NO_STORE_FILTERS);
 });

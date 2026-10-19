@@ -80,13 +80,16 @@
     "PluginCard": {
         "plugin_downgrade": "Downgrade",
         "plugin_full_access": "This plugin has full access to your Steam Deck.",
+        "plugin_full_access_info": "What root access means",
         "plugin_install": "Install",
         "plugin_no_desc": "No description provided.",
         "plugin_overwrite": "Overwrite",
         "plugin_prerelease": "pre-release",
         "plugin_reinstall": "Reinstall",
+        "plugin_source": "Open the plugin's GitHub page",
         "plugin_store_shadowed": "A store higher in your list did not answer. This plugin may normally come from there.",
         "plugin_update": "Update",
+        "plugin_updated": "Updated {{date}}",
         "plugin_version_label": "Plugin Version"
     },
     "PluginInstallModal": {
@@ -185,6 +188,13 @@
             "label": "Allow Remote CEF Debugging"
         }
     },
+    "RootInfoModal": {
+        "button_close": "Close",
+        "desc_definition": "Root is the highest permission level on your Steam Deck. A plugin with root access can read and change every file and setting, run any command, and make permanent changes to the system.",
+        "desc_review": "Install root plugins only from authors and stores you trust. You are responsible for the security of your device.",
+        "desc_usage": "Some plugins need root to do their job. For example, a plugin that tunes the Steam Deck's hardware cannot change those settings with normal user permissions.",
+        "title": "What root access means"
+    },
     "RootPluginConfirm": {
         "acknowledge": "I understand that {{name}} gets full control of this device",
         "button_cancel": "Cancel",
@@ -267,15 +277,39 @@
             "start": "Initializing",
             "uninstalling_previous": "Uninstalling previous copy"
         },
+        "store_cache": {
+            "age": "Store list updated {{when}}",
+            "next": "automatic refresh {{when}}"
+        },
         "store_contrib": {
             "desc": "If you would like to contribute to the Decky Plugin Store, check the SteamDeckHomebrew/decky-plugin-template repository on GitHub. Information on development and distribution is available in the README.",
             "label": "Contributing"
         },
+        "store_count_filtered_one": "Showing {{shown}} of {{count}} plugin",
+        "store_count_filtered_other": "Showing {{shown}} of {{count}} plugins",
+        "store_count_one": "1 plugin",
+        "store_count_other": "{{count}} plugins",
         "store_filter": {
-            "label": "Filter",
-            "label_def": "All"
+            "all_plugins": "All plugins",
+            "all_stores": "All stores",
+            "all_tags": "All tags",
+            "clear_all": "Clear all filters",
+            "github": "Source code",
+            "github_yes": "Has GitHub link",
+            "installed": "Installed",
+            "installed_no": "Not installed",
+            "installed_yes": "Installed",
+            "root": "Root access",
+            "root_hide": "Hide root plugins",
+            "root_only": "Root plugins only",
+            "store": "Store",
+            "tag": "Tag"
         },
+        "store_no_match": "No plugins match these filters.",
+        "store_refresh": "Refresh",
+        "store_refreshing": "Refreshing…",
         "store_search": {
+            "clear": "Clear search",
             "label": "Search"
         },
         "store_sort": {
@@ -286,6 +320,7 @@
             "desc": "All plugin source code is available on SteamDeckHomebrew/decky-plugin-database repository on GitHub.",
             "label": "Source Code"
         },
+        "store_stale": "Could not reach {{url}}. Showing its saved list from {{when}}.",
         "store_tabs": {
             "about": "About",
             "alph_asce": "Alphabetical (Z to A)",
@@ -294,7 +329,9 @@
             "date_desc": "Newest First",
             "downloads_asce": "Least Downloaded First",
             "downloads_desc": "Most Downloaded First",
-            "title": "Browse"
+            "title": "Browse",
+            "updated_asce": "Least Recently Updated",
+            "updated_desc": "Recently Updated"
         },
         "store_testing_cta": "Please consider testing new plugins to help the Decky Loader team!",
         "store_testing_warning": {
