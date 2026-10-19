@@ -53,7 +53,7 @@ class ExtractTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_unpacks_the_plugin_folder_with_installer_modes(self) -> None:
-        root_host._extract_plugin_archive(archive(PLUGIN), "Tools", self.stage_fd)  # pyright: ignore[reportPrivateUsage]
+        root_host._extract_plugin_archive(archive(PLUGIN), "Tools", self.stage_fd)
         self.assertEqual((self.stage / "main.py").read_bytes(), PLUGIN["Tools/main.py"])
         self.assertEqual((self.stage / "bin" / "backend").stat().st_mode & 0o777, 0o755)
 
@@ -70,11 +70,13 @@ class ExtractTest(unittest.TestCase):
                 self.tearDown()
                 self.setUp()
                 with self.assertRaises(root_host.RootHostError):
-                    root_host._extract_plugin_archive(archive(members, links), "Tools", self.stage_fd)  # pyright: ignore[reportPrivateUsage]
+                    root_host._extract_plugin_archive(archive(members, links), "Tools", self.stage_fd)
 
 
 class FakeConfig:
-    store_hosts = ("cdn.tzatzikiweeb.moe",)
+    user = "deck"
+    uid = 1000
+    gid = 1000
 
     def __init__(self) -> None:
         self.homebrew = Path("/nonexistent")
@@ -104,7 +106,7 @@ class InstallRequestTest(unittest.TestCase):
             old_plugin.mkdir(parents=True)
             (old_plugin / "sentinel").write_text("old plugin")
             plugins_fd = os.open(plugins, os.O_RDONLY | os.O_DIRECTORY)
-            config = FailingRecordConfig()
+            config: Any = FailingRecordConfig()
             config.homebrew = Path(temporary)
             real_fstat = os.fstat
 
@@ -126,6 +128,7 @@ class InstallRequestTest(unittest.TestCase):
             }
 
             with mock.patch.object(host, "_plugin_root_fd", return_value=plugins_fd), \
+                    mock.patch.object(root_host, "_check_password"), \
                     mock.patch.object(root_host, "_download", return_value=payload), \
                     mock.patch.object(root_host.os, "fstat", side_effect=root_owned), \
                     mock.patch.object(root_host, "_extract_plugin_archive"), \
@@ -140,53 +143,83 @@ class InstallRequestTest(unittest.TestCase):
             self.assertEqual((old_plugin / "sentinel").read_text(), "old plugin")
             self.assertEqual(sorted(path.name for path in plugins.iterdir()), ["Tools"])
 
-    def test_install_accepts_only_store_downloads_with_a_hash(self) -> None:
+    def test_install_refuses_requests_without_https_download_hash_or_folder(self) -> None:
         good = {"op": "install", "directory": "Tools", "name": "Tools", "sha256": "a" * 64,
-                "artifact": "https://cdn.tzatzikiweeb.moe/file/steam-deck-homebrew/versions/x.zip"}
+                "artifact": "https://example.com/x.zip", "password": "secret"}
         cases = {
-            "other host": {**good, "artifact": "https://example.com/x.zip"},
-            "plain http": {**good, "artifact": "http://cdn.tzatzikiweeb.moe/x.zip"},
+            "plain http": {**good, "artifact": "http://example.com/x.zip"},
             "local file": {**good, "artifact": "file:///home/deck/x.zip"},
             "no hash": {**good, "sha256": ""},
             "path in folder name": {**good, "directory": "../Tools"},
         }
-        for label, request in cases.items():
-            with self.subTest(label):
-                response = self.host().handle_line(json.dumps(request).encode())
-                self.assertFalse(response["ok"], response)
-
-    def test_install_from_the_set_store_needs_its_exact_listing(self) -> None:
-        store = "https://store.example/plugins.json"
-        artifact = "https://github.com/author/tools/releases/download/v1/Tools.zip"
-        listing = [
-            {"name": "Other", "versions": [{"name": "1", "hash": "a" * 64, "artifact": artifact}]},
-            {"name": "Tools", "versions": [
-                {"name": "2", "hash": "b" * 64, "artifact": artifact.replace("v1", "v2")},
-                {"name": "1", "hash": "a" * 64, "artifact": artifact},
-            ]},
-        ]
-        good = {"op": "install", "directory": "Tools", "name": "Tools", "sha256": "a" * 64,
-                "artifact": artifact, "store_url": store}
-
-        def download(url: str, limit: int) -> bytes:
-            if url == store:
-                return json.dumps(listing).encode()
-            raise root_host.RootHostError(f"fetched plugin {url}")
-
-        cases = {
-            "listed": (good, "fetched plugin"),
-            "other hash": ({**good, "sha256": "c" * 64}, "only be installed"),
-            "other plugin's entry": ({**good, "name": "Tools2"}, "only be installed"),
-            "other download": ({**good, "artifact": artifact + "?x"}, "only be installed"),
-            "no store": ({k: v for k, v in good.items() if k != "store_url"}, "only be installed"),
-            "plain http store": ({**good, "store_url": "http://store.example/plugins.json"}, "only be installed"),
-        }
-        with mock.patch.object(root_host, "_download", side_effect=download):
-            for label, (request, expected) in cases.items():
+        with mock.patch.object(root_host, "_check_password") as check, \
+                mock.patch.object(root_host, "_download") as download:
+            for label, request in cases.items():
                 with self.subTest(label):
                     response = self.host().handle_line(json.dumps(request).encode())
                     self.assertFalse(response["ok"], response)
-                    self.assertIn(expected, response["error"])
+            check.assert_not_called()
+            download.assert_not_called()
+
+    @staticmethod
+    def sudo(password: str, passwordless: bool = False) -> tuple[Any, list[tuple[list[str], dict[str, Any]]]]:
+        """A fake sudo that knows `password`, and the list of its calls."""
+        calls: list[tuple[list[str], dict[str, Any]]] = []
+
+        def run(command: list[str], **options: Any) -> Any:
+            calls.append((command, options))
+            if "-n" in command:
+                return SimpleNamespace(returncode=0 if passwordless else 1)
+            return SimpleNamespace(returncode=0 if options["input"] == password.encode() + b"\n" else 1)
+        return run, calls
+
+    def test_install_downloads_any_https_plugin_only_with_the_sudo_password(self) -> None:
+        request = {"op": "install", "directory": "Tools", "name": "Tools", "sha256": "a" * 64,
+                   "artifact": "https://github.com/author/tools/releases/download/v1/Tools.zip"}
+        cases = {
+            "no password": ({}, "needs your sudo password", False),
+            "empty password": ({"password": ""}, "needs your sudo password", False),
+            "two lines": ({"password": "secret\nsecret"}, "needs your sudo password", False),
+            "wrong password": ({"password": "guess"}, "wrong sudo password", False),
+            "right password": ({"password": "secret"}, "fetched plugin", False),
+            "sudo without password": ({"password": "secret"}, "NOPASSWD", True),
+        }
+        for label, (extra, expected, passwordless) in cases.items():
+            with self.subTest(label):
+                run, calls = self.sudo("secret", passwordless)
+                with mock.patch.object(root_host.subprocess, "run", side_effect=run), \
+                        mock.patch.object(root_host.os, "getgrouplist", return_value=[1000, 998]), \
+                        mock.patch.object(root_host, "_download",
+                                          side_effect=root_host.RootHostError("fetched plugin")) as download:
+                    response = self.host().handle_line(json.dumps({**request, **extra}).encode())
+                self.assertFalse(response["ok"], response)
+                self.assertIn(expected, response["error"])
+                self.assertEqual(download.called, label == "right password")
+                for command, options in calls:
+                    # sudo runs as the user with the user's groups and never reuses cached credentials.
+                    self.assertEqual((command[0], command[-2:]), (root_host.SUDO, ["--", root_host.TRUE]))
+                    self.assertIn("-k", command)
+                    self.assertEqual((options["user"], options["group"], options["extra_groups"]), (1000, 1000, [1000, 998]))
+
+    def test_wrong_password_blocks_the_next_attempt_for_a_while(self) -> None:
+        host = self.host()
+        request = {"op": "install", "directory": "Tools", "name": "Tools", "sha256": "a" * 64,
+                   "artifact": "https://example.com/Tools.zip", "password": "guess"}
+        run, calls = self.sudo("secret")
+        with mock.patch.object(root_host.subprocess, "run", side_effect=run), \
+                mock.patch.object(root_host.os, "getgrouplist", return_value=[1000]), \
+                mock.patch.object(root_host.time, "monotonic", return_value=100.0):
+            self.assertIn("wrong sudo password", host.handle_line(json.dumps(request).encode())["error"])
+            attempts = len(calls)
+            response = host.handle_line(json.dumps({**request, "password": "secret"}).encode())
+        self.assertIn("wait 5 seconds", response["error"])
+        self.assertEqual(len(calls), attempts, "a blocked attempt must not reach sudo")
+        with mock.patch.object(root_host.subprocess, "run", side_effect=run), \
+                mock.patch.object(root_host.os, "getgrouplist", return_value=[1000]), \
+                mock.patch.object(root_host.time, "monotonic", return_value=105.5), \
+                mock.patch.object(root_host, "_download", side_effect=root_host.RootHostError("fetched plugin")):
+            response = host.handle_line(json.dumps({**request, "password": "secret"}).encode())
+        self.assertIn("fetched plugin", response["error"])
 
     def test_runtime_updates_only_follow_release_tags(self) -> None:
         host = self.host()
@@ -200,11 +233,11 @@ class InstallRequestTest(unittest.TestCase):
         newer = ["v3.2.10-rust.8", "v3.2.10-rust.8-rc.10", "v3.2.10-rust.9-rc.1", "v3.3.0-rust.1-rc.1"]
         not_newer = ["v3.2.10-rust.8-rc.9", "v3.2.10-rust.8-rc.8", "v3.2.10-rust.7", "v3.2.9-rust.9"]
         for version in newer:
-            self.assertTrue(root_host._newer_release(version, current), version)  # pyright: ignore[reportPrivateUsage]
+            self.assertTrue(root_host._newer_release(version, current), version)
         for version in not_newer:
-            self.assertFalse(root_host._newer_release(version, current), version)  # pyright: ignore[reportPrivateUsage]
+            self.assertFalse(root_host._newer_release(version, current), version)
         # A development runtime is always replaced by a release.
-        self.assertTrue(root_host._newer_release("v3.2.10-rust.8-rc.1", "dev"))  # pyright: ignore[reportPrivateUsage]
+        self.assertTrue(root_host._newer_release("v3.2.10-rust.8-rc.1", "dev"))
 
 
 if __name__ == "__main__":

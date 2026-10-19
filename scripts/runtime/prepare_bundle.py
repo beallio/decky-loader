@@ -40,6 +40,13 @@ SDK_OVERLAYS = (
     'frontend/src/store.tsx',
     'frontend/src/components/settings/pages/general/Updater.tsx',
     'frontend/src/components/modals/RootPluginConfirmModal.tsx',
+    'frontend/src/wsrouter.ts',
+    'backend/decky_loader/localplatform/localplatform.py',
+    'backend/decky_loader/localplatform/localplatformlinux.py',
+    'backend/decky_loader/localplatform/localsocket.py',
+    'backend/decky_loader/main.py',
+    'backend/decky_loader/utilities.py',
+    'backend/decky_loader/wsrouter.py',
 )
 SDK_REMOVALS = (
     'frontend/src/steamfixes/README.md',

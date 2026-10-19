@@ -1051,14 +1051,17 @@ mod tests {
         );
         let (registry, backend) = test_backend(&directory).await;
         // Without a waiting install the plugin manager must answer, not "route not found".
-        for route in [
-            "utilities/confirm_root_plugin_install",
-            "utilities/cancel_root_plugin_install",
+        for (route, args) in [
+            (
+                "utilities/confirm_root_plugin_install",
+                vec![json!("no-such-prompt"), json!("password")],
+            ),
+            (
+                "utilities/cancel_root_plugin_install",
+                vec![json!("no-such-prompt")],
+            ),
         ] {
-            let error = backend
-                .dispatch(route, vec![json!("no-such-prompt")])
-                .await
-                .unwrap_err();
+            let error = backend.dispatch(route, args).await.unwrap_err();
             let error = format!("{error:?}");
             assert!(
                 error.contains("Unknown root plugin prompt"),

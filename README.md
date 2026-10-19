@@ -73,12 +73,12 @@ bash install-to-deck.sh --enable-root-plugins
 
 This installs the current version, asks for your `sudo` password once, and lists the installed plugins that need root. Answer `y` to allow them. Only plugins that need root run as root, in a separate background service. Decky itself and all other plugins still run as `deck`.
 
-After this, you install, update and remove plugins that need root in the Decky store as usual. You do not need to run the command again. When Decky updates itself, the root service updates itself to the same version.
+After this, you install, update and remove plugins that need root in Decky as usual: from the store, from a custom store, or from an `https://` URL in the developer settings. You do not need to run the command again. When Decky updates itself, the root service updates itself to the same version.
 
-Before each install or update of a plugin that needs root, Decky shows a warning. You must wait 10 seconds and switch on "I understand" before the plugin is installed.
+Before each install or update of a plugin that needs root, Decky shows a warning. You must wait 10 seconds, switch on "I understand", and type your `sudo` password. The root service checks the password with `sudo` itself. A wrong password stops the install, and after a wrong password you must wait 5 seconds before the next try. If your account can use `sudo` without a password, Decky cannot install plugins that need root.
 
 - **Cost:** while at least one root plugin is on, one extra background process uses about 25 MB of memory. With no root plugins, nothing extra runs. It uses no CPU while idle.
-- **Risk:** a plugin that runs as root can change anything on your Deck. Install only plugins you trust. Plugins that need root can only come from the Decky store, or from the custom store that is set in Decky's settings, not from a URL or a ZIP file. If you use a custom store, you trust it as much as the official one. As in the official Decky, a root plugin keeps its settings in your normal Decky folders.
+- **Risk:** a plugin that runs as root can change anything on your Deck. Install only plugins you trust. Your password is the only check: Decky installs any plugin that you confirm with it, from any place. Plugins that need root cannot come from a local ZIP file. As in the official Decky, a root plugin keeps its settings in your normal Decky folders.
 
 To turn root plugin support off, run `bash install-to-deck.sh --disable-root-plugins`. Root plugins then stop. Their files, and the settings, data and logs they saved in your `homebrew` folder, become owned by `deck` again. A root plugin's own home folder is `/root`, so anything it saved there stays with root.
 

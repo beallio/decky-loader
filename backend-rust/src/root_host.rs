@@ -182,21 +182,20 @@ impl RootHost {
         wait_status(&response)
     }
 
-    /// Has the host download a plugin that needs root, check it against its store
-    /// SHA-256, and put it in `directory`. The host accepts official store URLs and
-    /// downloads that `store_url`, the store set in Decky, lists for this plugin.
+    /// Has the host check the user's sudo password, download a plugin that needs
+    /// root, check it against `sha256`, and put it in `directory`.
     pub(crate) async fn install(
         &self,
         directory: &str,
         name: &str,
         sha256: &str,
         artifact: &str,
-        store_url: &str,
+        password: &str,
     ) -> Result<()> {
         self.request(
             json!({
                 "op": "install", "directory": directory, "name": name,
-                "sha256": sha256, "artifact": artifact, "store_url": store_url,
+                "sha256": sha256, "artifact": artifact, "password": password,
             }),
             "installed",
             INSTALL_TIMEOUT,

@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import io
 import json
+import math
 import os
 import posixpath
 import pwd
@@ -48,8 +49,10 @@ _MAX_JSON_BYTES = 1 << 20
 _MAX_REQUEST_BYTES = 1 << 16
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _MAX_ARCHIVE_BYTES = 512 << 20
-_MAX_STORE_LIST_BYTES = 64 << 20
-NOT_FROM_STORE = "plugins that need root can only be installed from the Decky store or the store set in Decky"
+SUDO = "/usr/bin/sudo"
+TRUE = "/usr/bin/true"
+# Wait after a wrong password, so a process of the user cannot guess quickly.
+_PASSWORD_RETRY_SECONDS = 5.0
 RELEASE_TAG = re.compile(r"v\d+\.\d+\.\d+-rust\.\d+(-rc\.\d+)?")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 
@@ -260,7 +263,7 @@ def _download(url: str, limit: int) -> bytes:
     import ssl
 
     try:
-        import certifi  # pyright: ignore[reportMissingImports]
+        import certifi
 
         where: Callable[[], str] = getattr(certifi, "where")
         context = ssl.create_default_context(cafile=where())
@@ -274,32 +277,41 @@ def _download(url: str, limit: int) -> bytes:
     return data
 
 
-def _listed_in_store(store_url: object, name: str, sha256: str, artifact: str) -> bool:
-    """True when the store set in Decky lists this download and SHA-256 for the plugin.
+def _check_password(config: Config, password: object) -> None:
+    """Raise unless `password` is the user's sudo password, as sudo itself checks it.
 
-    The user chose to trust that store for plugins that need root. Checking its list
-    here means the Decky account can only install what the store itself publishes.
+    sudo runs as the user, with the user's groups, so its policy, PAM stack and
+    lockout apply unchanged. `-k` ignores cached sudo credentials and does not
+    update them, so a check never leaves the user with passwordless sudo.
     """
-    if not isinstance(store_url, str) or urllib.parse.urlsplit(store_url).scheme != "https":
-        return False
-    try:
-        plugins = json.loads(_download(store_url, _MAX_STORE_LIST_BYTES))
-    except (OSError, ValueError) as error:
-        raise RootHostError(f"could not read the plugin store list {store_url}: {error}") from error
-    if not isinstance(plugins, list):
-        return False
-    for plugin in cast(list[Any], plugins):
-        if not isinstance(plugin, dict) or cast(dict[str, Any], plugin).get("name") != name:
-            continue
-        versions = cast(dict[str, Any], plugin).get("versions")
-        if isinstance(versions, list) and any(
-            isinstance(version, dict)
-            and cast(dict[str, Any], version).get("hash") == sha256
-            and cast(dict[str, Any], version).get("artifact") == artifact
-            for version in cast(list[Any], versions)
-        ):
-            return True
-    return False
+    if not isinstance(password, str) or not password or "\n" in password or "\x00" in password:
+        raise RootHostError("installing a plugin that needs root needs your sudo password")
+
+    def sudo(arguments: list[str], password_input: bytes | None) -> int:
+        try:
+            return subprocess.run(
+                [SUDO, *arguments, "--", TRUE],
+                input=password_input,
+                stdin=subprocess.DEVNULL if password_input is None else None,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                user=config.uid,
+                group=config.gid,
+                extra_groups=os.getgrouplist(config.user, config.gid),
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+                cwd="/",
+                timeout=60,
+            ).returncode
+        except subprocess.TimeoutExpired as error:
+            raise RootHostError("sudo did not answer the password check") from error
+
+    if sudo(["-n", "-k"], None) == 0:
+        raise RootHostError(
+            f"{config.user} can use sudo without a password, so a password cannot protect plugins that need root; "
+            "remove that NOPASSWD sudo rule first"
+        )
+    if sudo(["-S", "-k", "-p", ""], password.encode() + b"\n") != 0:
+        raise RootHostError("wrong sudo password")
 
 
 def _write_new_file(directory_fd: int, name: str, data: bytes) -> None:
@@ -413,8 +425,6 @@ class Config:
         self.state_directory = path.parent
         self.mount_root = self.state_directory / "mnt"
         self.socket_directory = RUN_ROOT / str(uid) / "root-plugins"
-        hosts = data.get("store_hosts", [])
-        self.store_hosts: tuple[str, ...] = tuple(host for host in cast(list[Any], hosts) if isinstance(host, str)) if isinstance(hosts, list) else ()
 
     def current(self) -> dict[str, Any]:
         """The config as it is on disk now; the installer changes it during updates."""
@@ -454,7 +464,7 @@ class Host:
         self.connection: socket.socket | None = None
         self.buffer = b""
         self.greeted = False
-        self.children: dict[str, launcher._Child] = {}  # pyright: ignore[reportPrivateUsage]
+        self.children: dict[str, launcher._Child] = {}
         self.directories: dict[str, tuple[str, int]] = {}
         self.stopping = False
         self.children_changed = False
@@ -463,6 +473,7 @@ class Host:
         self.update_version = ""
         self.failed_updates: set[str] = set()
         self.root_pythonpaths: list[str] | None = None
+        self.password_retry_at = 0.0
 
     # Connection handling
 
@@ -537,7 +548,7 @@ class Host:
         if not self.greeted:
             raise RootHostError("the first request must be hello")
         if operation == "list":
-            return self.list()
+            return self.list_plugins()
         if operation == "start":
             return self.start(request)
         if operation == "install":
@@ -556,7 +567,7 @@ class Host:
             child.gate_fd = None
             return {"ok": True, "op": "released", "id": identifier}
         if operation == "status":
-            launcher._poll_children({identifier: child})  # pyright: ignore[reportPrivateUsage]
+            launcher._poll_children({identifier: child})
             if child.wait_status is None:
                 return {"ok": True, "op": "status", "id": identifier, "running": True}
             return {"ok": True, "op": "status", "id": identifier, "running": False, "wait_status": child.wait_status}
@@ -566,7 +577,7 @@ class Host:
                 raise RootHostError(f"root plugin {identifier} did not exit")
             return {"ok": True, "op": "stopped", "id": identifier, "wait_status": child.wait_status}
         if operation == "forget":
-            launcher._poll_children({identifier: child})  # pyright: ignore[reportPrivateUsage]
+            launcher._poll_children({identifier: child})
             if child.wait_status is None:
                 raise RootHostError(f"root plugin {identifier} is still running")
             self.forget(identifier)
@@ -672,44 +683,49 @@ class Host:
         if not isinstance(name, str) or not name:
             raise RootHostError("install needs the plugin name")
         if not isinstance(sha256, str) or not SHA256.fullmatch(sha256):
-            raise RootHostError("install needs the store SHA-256 of the plugin archive")
-        if not isinstance(artifact, str):
-            raise RootHostError("install needs the store download URL")
-        parsed = urllib.parse.urlsplit(artifact)
-        if parsed.scheme != "https":
-            raise RootHostError(NOT_FROM_STORE)
-        if parsed.hostname not in self.config.store_hosts and not _listed_in_store(
-            request.get("store_url"), name, sha256, artifact
-        ):
-            raise RootHostError(NOT_FROM_STORE)
+            raise RootHostError("install needs the plugin's SHA-256")
+        if not isinstance(artifact, str) or urllib.parse.urlsplit(artifact).scheme != "https":
+            raise RootHostError("install needs an https:// download URL")
         if any(running == directory for running, _ in self.directories.values()):
             raise RootHostError(f"{directory} is running; stop it first")
+        # The password is the only approval: any download with its SHA-256 may be installed.
+        wait = self.password_retry_at - time.monotonic()
+        if wait > 0:
+            raise RootHostError(f"wait {math.ceil(wait)} seconds after a wrong sudo password")
+        try:
+            _check_password(self.config, request.get("password"))
+        except RootHostError:
+            self.password_retry_at = time.monotonic() + _PASSWORD_RETRY_SECONDS
+            raise
         archive = _download(artifact, _MAX_ARCHIVE_BYTES)
         if hashlib.sha256(archive).hexdigest() != sha256:
-            raise RootHostError("the downloaded plugin does not match its store SHA-256")
+            raise RootHostError("the downloaded plugin does not match its SHA-256")
 
         plugins_fd = self._plugin_root_fd()
         stage = f".decky-root-stage-{uuid.uuid4().hex}"
         try:
-            os.mkdir(stage, 0o700, dir_fd=plugins_fd)
-            stage_fd = os.open(stage, _DIRECTORY_FLAGS, dir_fd=plugins_fd)
             try:
-                info = os.fstat(stage_fd)
-                if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
-                    raise RootHostError("the staging folder was replaced")
-                _extract_plugin_archive(archive, directory, stage_fd)
-                metadata = plugin_metadata(stage_fd)
-                if metadata["name"] != name:
-                    raise RootHostError(f"the archive contains {metadata['name']}, not {name}")
-                if "root" not in metadata["flags"]:
-                    raise RootHostError(f"{name} does not need root; install it as a normal plugin")
-                _download_remote_binaries(stage_fd)
-                os.fchmod(stage_fd, 0o755)
-                tree = plugin_tree_sha256(stage_fd)
-            finally:
-                os.close(stage_fd)
-            backup = self._replace(plugins_fd, stage, directory)
-            stage = ""
+                os.mkdir(stage, 0o700, dir_fd=plugins_fd)
+                stage_fd = os.open(stage, _DIRECTORY_FLAGS, dir_fd=plugins_fd)
+                try:
+                    info = os.fstat(stage_fd)
+                    if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+                        raise RootHostError("the staging folder was replaced")
+                    _extract_plugin_archive(archive, directory, stage_fd)
+                    metadata = plugin_metadata(stage_fd)
+                    if metadata["name"] != name:
+                        raise RootHostError(f"the archive contains {metadata['name']}, not {name}")
+                    if "root" not in metadata["flags"]:
+                        raise RootHostError(f"{name} does not need root; install it as a normal plugin")
+                    _download_remote_binaries(stage_fd)
+                    os.fchmod(stage_fd, 0o755)
+                    tree = plugin_tree_sha256(stage_fd)
+                finally:
+                    os.close(stage_fd)
+                backup = self._replace(plugins_fd, stage, directory)
+            except BaseException:
+                shutil.rmtree(stage, dir_fd=plugins_fd, ignore_errors=True)
+                raise
             entry = {"name": name, "version": metadata["version"], "tree_sha256": tree}
             try:
                 self.config.record(directory, entry)
@@ -721,8 +737,6 @@ class Host:
             if backup:
                 shutil.rmtree(backup, dir_fd=plugins_fd, ignore_errors=True)
         finally:
-            if stage:
-                shutil.rmtree(stage, dir_fd=plugins_fd, ignore_errors=True)
             os.close(plugins_fd)
         return {"ok": True, "op": "installed", "directory": directory, **entry}
 
@@ -766,7 +780,7 @@ class Host:
         self.config.record(directory, None)
         return {"ok": True, "op": "uninstalled", "directory": directory}
 
-    def list(self) -> dict[str, Any]:
+    def list_plugins(self) -> dict[str, Any]:
         running = {directory for directory, _ in self.directories.values()}
         plugins = [
             {
@@ -840,22 +854,22 @@ class Host:
         except BaseException:
             os.close(directory_fd)
             raise
-        self.children[identifier] = launcher._Child(identifier, pid, gate)  # pyright: ignore[reportPrivateUsage]
+        self.children[identifier] = launcher._Child(identifier, pid, gate)
         self.directories[identifier] = (directory, directory_fd)
         return {"ok": True, "op": "forked", "id": identifier, "pid": pid, "socket": str(socket_path)}
 
-    def stop(self, children: dict[str, launcher._Child]) -> None:  # pyright: ignore[reportPrivateUsage]
+    def stop(self, children: dict[str, launcher._Child]) -> None:
         running = {key: child for key, child in children.items() if child.wait_status is None}
         for child in running.values():
-            launcher._signal_group(child.pid, signal.SIGTERM)  # pyright: ignore[reportPrivateUsage]
+            launcher._signal_group(child.pid, signal.SIGTERM)
         for sig in (None, signal.SIGKILL):
             if sig is not None:
                 for child in running.values():
                     if child.wait_status is None:
-                        launcher._signal_group(child.pid, sig)  # pyright: ignore[reportPrivateUsage]
+                        launcher._signal_group(child.pid, sig)
             deadline = time.monotonic() + _STOP_TIMEOUT
             while time.monotonic() < deadline:
-                launcher._poll_children(running)  # pyright: ignore[reportPrivateUsage]
+                launcher._poll_children(running)
                 if all(child.wait_status is not None for child in running.values()):
                     return
                 time.sleep(0.05)
@@ -893,7 +907,7 @@ class Host:
             while not self.stopping:
                 if self.children_changed:
                     self.children_changed = False
-                    launcher._poll_children(self.children)  # pyright: ignore[reportPrivateUsage]
+                    launcher._poll_children(self.children)
                 self.poll_update()
                 busy = self.connection is not None or bool(self.children) or self.update is not None
                 if busy:
@@ -992,7 +1006,7 @@ def main(argv: list[str]) -> int:
             "CHOWN_PLUGIN_PATH": "0",
         })
         worker.prepare_runtime("lean")
-        launcher._assert_fork_safe()  # pyright: ignore[reportPrivateUsage]
+        launcher._assert_fork_safe()
         return Host(config, listener).run()
     except (RootHostError, OSError, ValueError, KeyError) as error:
         print(f"DeckyRootHost: {error}", file=sys.stderr, flush=True)

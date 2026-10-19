@@ -217,7 +217,9 @@ export class WSRouter extends Logger {
     const resolver = this.createPromiseResolver<Return>({ type: MessageType.CALL, route, args, id });
     this.runningCalls.set(id, resolver);
 
-    this.debug(`[${id}] Calling PY method ${route} with args`, args);
+    // Fork: never log the sudo password of a root plugin install.
+    const logged = route === 'utilities/confirm_root_plugin_install' ? '[hidden]' : args;
+    this.debug(`[${id}] Calling PY method ${route} with args`, logged);
     this.write(resolver.message);
 
     return resolver.promise;

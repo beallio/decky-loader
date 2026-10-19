@@ -230,9 +230,10 @@ struct PluginCandidate {
 /// How long a root install waits for the user to answer the confirmation box.
 const ROOT_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Root installs and updates that wait for the user to confirm them in the UI.
+/// Root installs and updates that wait for the user to confirm them in the UI
+/// with the sudo password.
 struct RootPrompts {
-    waiting: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    waiting: Mutex<HashMap<String, oneshot::Sender<Option<String>>>>,
 }
 
 impl RootPrompts {
@@ -242,19 +243,19 @@ impl RootPrompts {
         }
     }
 
-    /// Registers a prompt, lets `show` display it, and waits for the answer.
-    /// No answer within `limit` counts as a refusal.
-    async fn ask(&self, limit: std::time::Duration, show: impl FnOnce(&str)) -> bool {
+    /// Registers a prompt, lets `show` display it, and waits for the password.
+    /// A refusal, or no answer within `limit`, gives `None`.
+    async fn ask(&self, limit: std::time::Duration, show: impl FnOnce(&str)) -> Option<String> {
         let id = Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
         self.waiting.lock().await.insert(id.clone(), sender);
         show(&id);
         let answer = tokio::time::timeout(limit, receiver).await;
         self.waiting.lock().await.remove(&id);
-        matches!(answer, Ok(Ok(true)))
+        answer.ok().and_then(Result::ok).flatten()
     }
 
-    async fn answer(&self, id: &str, confirmed: bool) -> Result<(), RpcError> {
+    async fn answer(&self, id: &str, password: Option<String>) -> Result<(), RpcError> {
         let sender = self
             .waiting
             .lock()
@@ -262,7 +263,7 @@ impl RootPrompts {
             .remove(id)
             .ok_or_else(|| RpcError::invalid(format!("Unknown root plugin prompt {id}")))?;
         // The install may have given up already; then there is nobody to tell.
-        let _ = sender.send(confirmed);
+        let _ = sender.send(password);
         Ok(())
     }
 }
@@ -413,9 +414,15 @@ impl PluginManager {
     }
 
     async fn answer_root_prompt(&self, args: &[Value], confirmed: bool) -> Result<Value, RpcError> {
-        exact(args, 1)?;
+        // Confirm sends the prompt id and the sudo password; cancel sends only the id.
+        exact(args, if confirmed { 2 } else { 1 })?;
+        let password = if confirmed {
+            Some(string(args, 1)?.to_owned())
+        } else {
+            None
+        };
         self.root_prompts
-            .answer(string(args, 0)?, confirmed)
+            .answer(string(args, 0)?, password)
             .await
             .map(|_| Value::Null)
     }
@@ -514,13 +521,14 @@ impl PluginManager {
         if candidate.requires_root && platform::effective_user_ids().0 != 0 {
             // Root plugin files must come from root, not from this account's download.
             drop(stage);
-            let store_url = store_base_url(backend).await;
+            // The root host downloads the archive again and must get these same bytes.
+            let sha256 = format!("{:x}", Sha256::digest(&archive));
             let artifact_host = reqwest::Url::parse(&request.artifact)
                 .ok()
                 .and_then(|url| url.host_str().map(str::to_owned))
                 .unwrap_or_default();
-            // Every root install or update needs an explicit yes in the UI.
-            let confirmed = self
+            // Every root install or update needs the sudo password in the UI.
+            let password = self
                 .root_prompts
                 .ask(ROOT_CONFIRM_TIMEOUT, |id| {
                     backend.emit(
@@ -531,24 +539,24 @@ impl PluginManager {
                             Value::String(id.to_owned()),
                             Value::from(request.install_type),
                             Value::String(artifact_host),
-                            Value::String(store_url.clone()),
                             // The box closes itself before the install gives up waiting.
                             Value::from(ROOT_CONFIRM_TIMEOUT.as_secs()),
                         ],
                     );
                 })
-                .await;
-            if !confirmed {
-                return Err(RpcError::failure(format!(
-                    "Installation of {installed_name} was cancelled: it needs root and was not confirmed"
-                )));
-            }
+                .await
+                .ok_or_else(|| {
+                    RpcError::failure(format!(
+                        "Installation of {installed_name} was cancelled: it needs root and was not confirmed"
+                    ))
+                })?;
             self.install_root_plugin(
                 backend,
                 request,
                 &archive_directory,
                 &installed_name,
-                &store_url,
+                &sha256,
+                &password,
             )
             .await?;
             return Ok(installed_name);
@@ -567,28 +575,21 @@ impl PluginManager {
     }
 
     /// Installs or updates a plugin that needs root through the root plugin host.
-    /// The host downloads the archive itself and accepts only official store URLs
-    /// or downloads the store set in Decky lists, with the store's SHA-256.
+    /// The host checks the sudo password, downloads the archive itself and checks
+    /// it against `sha256`.
     async fn install_root_plugin(
         &self,
         backend: &Backend,
         request: &InstallRequest,
         directory: &str,
         name: &str,
-        store_url: &str,
+        sha256: &str,
+        password: &str,
     ) -> Result<(), RpcError> {
-        let store_only = || {
-            RpcError::failure(
-                "Plugins that need root can only be installed from the Decky store or the store set in Decky",
-            )
-        };
-        let sha256 = request
-            .hash
-            .as_str()
-            .filter(|hash| !hash.is_empty())
-            .ok_or_else(store_only)?;
         if !request.artifact.starts_with("https://") {
-            return Err(store_only());
+            return Err(RpcError::failure(
+                "Plugins that need root can only be installed from an https:// download",
+            ));
         }
         let host = backend.registry.root_host().await.map_err(worker_error)?;
         let _transaction = backend
@@ -641,7 +642,7 @@ impl PluginManager {
             "Store.download_progress_info.installing_plugin",
         );
         if let Err(error) = host
-            .install(directory, name, sha256, &request.artifact, store_url)
+            .install(directory, name, sha256, &request.artifact, password)
             .await
         {
             let restore_error = if was_registered {
@@ -1744,10 +1745,10 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn root_install_continues_only_after_an_explicit_yes() {
+    async fn root_install_continues_only_with_a_password() {
         let prompts = std::sync::Arc::new(RootPrompts::new());
         let long = std::time::Duration::from_secs(30);
-        for (answer, expected) in [(true, true), (false, false)] {
+        for answer in [Some("secret".to_owned()), None] {
             let (shown_sender, shown) = oneshot::channel::<String>();
             let waiter = {
                 let prompts = prompts.clone();
@@ -1758,16 +1759,16 @@ mod tests {
                 })
             };
             let id = shown.await.unwrap();
-            prompts.answer(&id, answer).await.unwrap();
-            assert_eq!(waiter.await.unwrap(), expected, "answer {answer}");
+            prompts.answer(&id, answer.clone()).await.unwrap();
+            assert_eq!(waiter.await.unwrap(), answer);
             // A prompt can be answered only once.
-            assert!(prompts.answer(&id, true).await.is_err());
+            assert!(prompts.answer(&id, Some("again".to_owned())).await.is_err());
         }
 
         let unanswered = prompts
             .ask(std::time::Duration::from_millis(20), |_| {})
             .await;
-        assert!(!unanswered, "no answer must count as a refusal");
+        assert!(unanswered.is_none(), "no answer must count as a refusal");
         assert!(prompts.waiting.lock().await.is_empty());
     }
 

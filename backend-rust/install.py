@@ -51,7 +51,6 @@ ROOT_HOST_STATE = Path('/home/.decky-loader-runtime/root-host')
 ROOT_HOST_RUN = Path('/run/decky-loader-runtime')
 ROOT_HOST_UNIT_DIRECTORY = Path('/etc/systemd/system')
 ROOT_HOST_PROTOCOL = 1
-ROOT_HOST_STORE_HOSTS = ('plugins.deckbrew.xyz', 'cdn.tzatzikiweeb.moe')
 SYSTEMCTL_CANDIDATES = (Path('/usr/bin/systemctl'), Path('/bin/systemctl'))
 DEFAULT_LISTEN = '127.0.0.1:1337'
 DEFAULT_CEF_URL = 'http://127.0.0.1:8080'
@@ -5781,7 +5780,6 @@ def _write_root_host_files(user: pwd.struct_passwd, homebrew: Path, state: Path,
     _write_json(config, {
         'protocol': ROOT_HOST_PROTOCOL, 'user': user.pw_name, 'uid': user.pw_uid, 'gid': user.pw_gid,
         'homebrew': str(homebrew), 'runtime': runtime.name, 'release_version': manifest.get('release_version'),
-        'store_hosts': list(ROOT_HOST_STORE_HOSTS),
         'release_repository': previous.get('release_repository') or DEFAULT_RELEASE_REPOSITORY,
     }, 0o644)
     for name, text in _root_host_units(user, group, runtime, config).items():

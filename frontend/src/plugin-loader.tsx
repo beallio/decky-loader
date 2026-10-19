@@ -336,7 +336,6 @@ class PluginLoader extends Logger {
     request_id: string,
     install_type: InstallType,
     artifact_host: string,
-    store_url: string,
     valid_seconds: number,
   ) {
     showModal(
@@ -345,13 +344,11 @@ class PluginLoader extends Logger {
         version={version}
         installType={install_type}
         artifactHost={artifact_host}
-        storeUrl={store_url}
         validSeconds={valid_seconds}
-        onAnswer={(confirmed) =>
-          DeckyBackend.call<[string]>(
-            confirmed ? 'utilities/confirm_root_plugin_install' : 'utilities/cancel_root_plugin_install',
-            request_id,
-          )
+        onAnswer={(password) =>
+          password === null
+            ? DeckyBackend.call<[string]>('utilities/cancel_root_plugin_install', request_id)
+            : DeckyBackend.call<[string, string]>('utilities/confirm_root_plugin_install', request_id, password)
         }
       />,
     );
