@@ -238,7 +238,8 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
             border: '2px solid rgba(255, 0, 0, 0.467)',
           }}
         >
-          {t('Store.store_unavailable', { url })}
+          {/* React escapes the text; i18next escaping would show "/" as "&#x2F;". */}
+          {t('Store.store_unavailable', { url, interpolation: { escapeValue: false } })}
         </div>
       ))}
       <div>
