@@ -77,17 +77,30 @@ version = "1.1.0"
 
 
 class ParityTest(unittest.TestCase):
-    def test_same_runtime_packages_on_every_platform_pass(self):
-        # Dev-only packages may differ; marker-limited runtime packages still count.
+    def test_same_runtime_packages_on_the_target_pass(self):
+        # Dev-only packages may differ; async-timeout is Python 3.10 only in both locks.
         self.assertEqual(python_parity.differences(POETRY, uv_lock(), {}), [])
+        self.assertEqual(python_parity.differences(POETRY.replace(ASYNC_TIMEOUT, ""), uv_lock(), {}), [])
 
     def test_version_and_package_differences_are_reported(self):
         self.assertEqual(python_parity.differences(POETRY, uv_lock(aiohttp="3.15.0"), {}),
                          ["aiohttp: upstream 3.14.3, fork 3.15.0"])
         self.assertEqual(python_parity.differences(POETRY, uv_lock(project_extra=', extra = ["speedups"]'), {}),
                          ["brotli: upstream absent, fork 1.1.0"])
-        self.assertEqual(python_parity.differences(POETRY.replace(ASYNC_TIMEOUT, ""), uv_lock(), {}),
-                         ["async-timeout: upstream absent, fork 5.0.1"])
+
+    def test_markers_are_evaluated_for_the_shipped_target(self):
+        windows_only = uv_lock().replace("python_full_version < '3.13'", "sys_platform == 'win32'")
+        self.assertEqual(python_parity.differences(POETRY, windows_only, {}),
+                         ["typing-extensions: upstream 4.16.0, fork absent"])
+        upstream_on_311 = POETRY.replace('python_version == "3.10"', 'python_version < "3.12"')
+        self.assertEqual(python_parity.differences(upstream_on_311, uv_lock(), {}),
+                         ["async-timeout: upstream 5.0.1, fork absent"])
+
+    def test_unknown_marker_syntax_fails_closed(self):
+        for marker in ("platform_release == '6.1'", "python_version ~= '3.11'", "sys_platform < 'linux'",
+                       "(sys_platform == 'linux'", "sys_platform == 'linux' xor os_name == 'posix'"):
+            with self.subTest(marker), self.assertRaises(ValueError):
+                python_parity.marker_applies(marker)
 
     def test_a_package_locked_in_two_versions_never_matches(self):
         split = uv_lock().replace(
