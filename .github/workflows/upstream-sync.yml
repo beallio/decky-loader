@@ -29,6 +29,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Read pinned Python
+        id: config
+        run: printf 'python=%s\n' "$(jq -r .python.version backend-rust/build-config.json)" >> "$GITHUB_OUTPUT"
+
+      # The check needs tomllib (Python 3.11+); the runner's system Python is 3.10.
+      - name: Set up pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ steps.config.outputs.python }}
+
       - name: Compare the pinned SDK with the newest upstream release
         id: check
         run: |
