@@ -1,13 +1,17 @@
 import { compare, validate } from 'compare-versions';
 
 import { DisabledPlugin, InstallType, Plugin, installPlugin, installPlugins } from './plugin';
+import {
+  MergedStorePlugin,
+  SourceResult,
+  StoreSettings,
+  mergePluginLists,
+  migrateStoreSettings,
+  providerVersion,
+  sortStorePlugins,
+  storeSources,
+} from './storeSources';
 import { getSetting, setSetting } from './utils/settings';
-
-export enum Store {
-  Default,
-  Testing,
-  Custom,
-}
 
 export enum SortOptions {
   name = 'name',
@@ -24,6 +28,9 @@ export interface StorePluginVersion {
   name: string;
   hash: string;
   artifact: string | undefined | null;
+  // Fork: the store that lists this version, and whether it is a pre-release store.
+  store?: string;
+  prerelease?: boolean;
 }
 
 export type UpdateEndpointVersions = { [name: string]: [version: string, hash: string, artifact?: string] };
@@ -36,6 +43,8 @@ export interface StorePlugin {
   description: string;
   tags: string[];
   image_url: string;
+  created?: string;
+  downloads?: number;
 }
 
 export interface PluginInstallRequest {
@@ -47,35 +56,27 @@ export interface PluginInstallRequest {
 // name: version
 export type PluginUpdateMapping = Map<string, StorePluginVersion>;
 
-export async function getStore(): Promise<Store> {
-  return await getSetting<Store>('store', Store.Default);
+// Fork: an ordered list of stores replaces the single 'store' / 'store-url' choice. Those old
+// settings stay untouched, so going back to official Decky keeps the user's old store.
+export async function getStoreSettings(): Promise<StoreSettings> {
+  const stores = await getSetting<string[] | null>('store_urls', null);
+  if (Array.isArray(stores)) {
+    return {
+      stores,
+      prereleaseStores: await getSetting<string[]>('prerelease_store_urls', []),
+      includePrereleases: await getSetting<boolean>('include_prereleases', false),
+    };
+  }
+  const settings = migrateStoreSettings(await getSetting('store', null), await getSetting('store-url', null));
+  await saveStoreSettings(settings);
+  return settings;
 }
 
-export async function getStoreBaseURL(): Promise<string> {
-  let store = await getSetting<Store | null>('store', null);
-  let customURL = await getSetting<string>('store-url', 'https://plugins.deckbrew.xyz/plugins');
-  let storeURL;
-  if (store === null) {
-    console.log('Could not get store, using Default.');
-    await setSetting('store', Store.Default);
-    store = Store.Default;
-  }
-  switch (+store) {
-    case Store.Default:
-      storeURL = 'https://plugins.deckbrew.xyz/plugins';
-      break;
-    case Store.Testing:
-      storeURL = 'https://testing.deckbrew.xyz/plugins';
-      break;
-    case Store.Custom:
-      storeURL = customURL;
-      break;
-    default:
-      console.error('Somehow you ended up without a standard URL, using the default URL.');
-      storeURL = 'https://plugins.deckbrew.xyz/plugins';
-      break;
-  }
-  return storeURL;
+export async function saveStoreSettings(settings: StoreSettings) {
+  // store_urls last: it marks the migration as done.
+  await setSetting('prerelease_store_urls', settings.prereleaseStores);
+  await setSetting('include_prereleases', settings.includePrereleases);
+  await setSetting('store_urls', settings.stores);
 }
 
 // Fork: store data goes through the backend's authenticated /fetch proxy. A browser fetch
@@ -91,23 +92,38 @@ async function storeFetch(url: string): Promise<Response> {
   });
 }
 
+async function fromEachStore<T>(load: (url: string) => Promise<T>): Promise<SourceResult<T>[]> {
+  const sources = storeSources(await getStoreSettings());
+  return Promise.all(
+    sources.map(async (source) => {
+      try {
+        return { source, value: await load(source.url) };
+      } catch (e) {
+        console.warn(`Store ${source.url} is unavailable`, e);
+        return { source, value: null };
+      }
+    }),
+  );
+}
+
+async function fetchPluginList(storeURL: string): Promise<StorePlugin[]> {
+  const response = await storeFetch(storeURL);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const plugins = await response.json();
+  if (!Array.isArray(plugins)) throw new Error('the store did not return a plugin list');
+  return plugins;
+}
+
 export async function getPluginList(
   sort_by: SortOptions | null = null,
   sort_direction: SortDirections | null = null,
-): Promise<StorePlugin[]> {
-  let query: URLSearchParams | string = new URLSearchParams();
-  sort_by && query.set('sort_by', sort_by);
-  sort_direction && query.set('sort_direction', sort_direction);
-  query = '?' + String(query);
-
-  const storeURL = await getStoreBaseURL();
-
-  return storeFetch(storeURL + query).then((r) => r.json());
+): Promise<{ plugins: MergedStorePlugin[]; failed: string[] }> {
+  // Each store sorts only its own list, so the merged list is sorted here.
+  const { plugins, failed } = mergePluginLists(await fromEachStore(fetchPluginList));
+  return { plugins: sortStorePlugins(plugins, sort_by, sort_direction), failed };
 }
 
-export async function getVersionList(): Promise<UpdateEndpointVersions> {
-  const storeURL = await getStoreBaseURL();
-
+async function fetchVersionList(storeURL: string): Promise<UpdateEndpointVersions> {
   try {
     const response = await storeFetch(storeURL + '/versions');
     if (response.ok) {
@@ -115,11 +131,11 @@ export async function getVersionList(): Promise<UpdateEndpointVersions> {
       if (versions && typeof versions === 'object' && !Array.isArray(versions)) return versions;
     }
   } catch (e) {
-    console.debug('Store version list unavailable, using the plugin list', e);
+    console.debug(`Store version list of ${storeURL} unavailable, using the plugin list`, e);
   }
   // Fork: a store that cannot answer <store URL>/versions (for example a single
   // plugins.json file) still gets update checks, from its full plugin list.
-  return versionsFromPluginList(await getPluginList());
+  return versionsFromPluginList(await fetchPluginList(storeURL));
 }
 
 function versionsFromPluginList(plugins: StorePlugin[]): UpdateEndpointVersions {
@@ -139,7 +155,7 @@ export async function installFromURL(url: string) {
 
 export async function requestPluginInstall(plugin: string, selectedVer: StorePluginVersion, installType: InstallType) {
   const artifactUrl = selectedVer.artifact ?? pluginUrl(selectedVer.hash);
-  await installPlugin(artifactUrl, plugin, selectedVer.name, selectedVer.hash, installType);
+  await installPlugin(artifactUrl, plugin, selectedVer.name, selectedVer.hash, installType, selectedVer.store);
 }
 
 export async function requestMultiplePluginInstalls(requests: PluginInstallRequest[]) {
@@ -150,31 +166,29 @@ export async function requestMultiplePluginInstalls(requests: PluginInstallReque
       version: selectedVer.name,
       hash: selectedVer.hash,
       install_type: installType,
+      store_url: selectedVer.store,
     })),
   );
 }
 
 export async function checkForPluginUpdates(plugins: (Plugin | DisabledPlugin)[]): Promise<PluginUpdateMapping> {
-  const serverData = await getVersionList();
+  const serverData = await fromEachStore(fetchVersionList);
   const updateMap = new Map<string, StorePluginVersion>();
   for (let plugin of plugins) {
-    const remotePlugin = serverData?.[plugin.name];
+    // Fork: only the store that provides the plugin offers updates for it.
+    const remotePlugin = providerVersion(serverData, plugin.name);
     //FIXME: Ugly hack since plugin.version might be null during evaluation,
     //so this will set the older version possible
     const curVer = plugin.version ? plugin.version : '0.0.0';
 
     if (
       remotePlugin &&
-      plugin.version != remotePlugin[0] &&
-      validate(remotePlugin[0]) &&
+      plugin.version != remotePlugin.name &&
+      validate(remotePlugin.name) &&
       validate(curVer) &&
-      compare(remotePlugin[0], curVer, '>')
+      compare(remotePlugin.name, curVer, '>')
     ) {
-      updateMap.set(plugin.name, {
-        name: remotePlugin[0],
-        hash: remotePlugin[1],
-        artifact: remotePlugin[2],
-      });
+      updateMap.set(plugin.name, remotePlugin);
     }
   }
   return updateMap;

@@ -63,6 +63,16 @@ bash install-to-deck.sh --forget-legacy
 
 After this, `--restore-legacy` cannot work.
 
+## Plugin stores
+
+The plugin store shows plugins from several stores at the same time. By default these are [Decky Extended](https://decky-extended-plugins.beallio.com/) and the official store. To change them, open Decky's settings, then **General**:
+
+- **Add store** adds another store by its web address.
+- Press **X** on the list to change the order, move a store with up and down, then press **X** again to save. When two stores have the same plugin, the higher store provides it, and only that store sends you update notices for it. Versions that only a lower store has still show in the plugin's version list.
+- **Include pre-releases** adds the test stores (official testing and Decky Extended testing). Their versions show after the normal ones. Plugins that exist only in a test store also appear.
+
+If a store does not answer, the store page shows the other stores and a message. Until that store answers again, Decky does not offer updates from the stores below it.
+
 ## Plugins that need administrator access
 
 Some plugins, for example PowerTools, need administrator (root) access. By default they do not run, and Decky shows a message for them. To let them run:

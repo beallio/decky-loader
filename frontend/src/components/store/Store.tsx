@@ -13,7 +13,8 @@ import { useTranslation } from 'react-i18next';
 
 import logo from '../../../assets/plugin_store.png';
 import Logger from '../../logger';
-import { SortDirections, SortOptions, Store, StorePlugin, getPluginList, getStore } from '../../store';
+import { SortDirections, SortOptions, getPluginList, getStoreSettings } from '../../store';
+import { MergedStorePlugin } from '../../storeSources';
 import { useDeckyState } from '../DeckyState';
 import ExternalLink from '../ExternalLink';
 import PluginCard from './PluginCard';
@@ -85,23 +86,25 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
   const [selectedSort, setSort] = useState<[SortOptions, SortDirections]>(dropdownSortOptions[0].data);
   // const [selectedFilter, setFilter] = useState<number>(filterOptions[0].data);
   const [searchFieldValue, setSearchValue] = useState<string>('');
-  const [pluginList, setPluginList] = useState<StorePlugin[] | null>(null);
+  const [pluginList, setPluginList] = useState<MergedStorePlugin[] | null>(null);
+  const [failedStores, setFailedStores] = useState<string[]>([]);
   const [isTesting, setIsTesting] = useState<boolean>(false);
 
   useEffect(() => {
     (async () => {
-      const res = await getPluginList(selectedSort[0], selectedSort[1]);
-      logger.debug('got data!', res);
-      setPluginList(res);
-      setPluginCount(res.length);
+      const { plugins, failed } = await getPluginList(selectedSort[0], selectedSort[1]);
+      logger.debug('got data!', plugins, failed);
+      setPluginList(plugins);
+      setFailedStores(failed);
+      setPluginCount(plugins.length);
     })();
   }, [selectedSort]);
 
   useEffect(() => {
     (async () => {
-      const storeRes = await getStore();
-      logger.debug(`store is ${storeRes}, isTesting is ${storeRes === Store.Testing}`);
-      setIsTesting(storeRes === Store.Testing);
+      const { includePrereleases } = await getStoreSettings();
+      logger.debug(`includePrereleases is ${includePrereleases}`);
+      setIsTesting(includePrereleases);
     })();
   }, []);
 
@@ -223,6 +226,21 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
           </span>
         </div>
       )}
+      {failedStores.map((url) => (
+        <div
+          key={url}
+          style={{
+            marginLeft: '20px',
+            marginRight: '20px',
+            marginBottom: '20px',
+            padding: '8px 12px',
+            background: 'rgba(255, 0, 0, 0.067)',
+            border: '2px solid rgba(255, 0, 0, 0.467)',
+          }}
+        >
+          {t('Store.store_unavailable', { url })}
+        </div>
+      ))}
       <div>
         {!pluginList ? (
           <div style={{ height: '100%' }}>
@@ -230,7 +248,7 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
           </div>
         ) : (
           pluginList
-            .filter((plugin: StorePlugin) => {
+            .filter((plugin: MergedStorePlugin) => {
               return (
                 plugin.name.toLowerCase().includes(searchFieldValue.toLowerCase()) ||
                 plugin.description.toLowerCase().includes(searchFieldValue.toLowerCase()) ||
@@ -238,7 +256,7 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
                 plugin.tags.some((tag: string) => tag.toLowerCase().includes(searchFieldValue.toLowerCase()))
               );
             })
-            .map((plugin: StorePlugin) => (
+            .map((plugin: MergedStorePlugin) => (
               <PluginCard
                 key={`${plugin.id}_${plugin.name}`}
                 storePlugin={plugin}

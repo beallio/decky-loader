@@ -41,6 +41,7 @@ type installPluginArgs = [
   version?: string,
   hash?: string | boolean,
   installType?: InstallType,
+  storeURL?: string, // fork: the store that gets the install count
 ];
 
 export let installPlugin = DeckyBackend.callable<installPluginArgs>('utilities/install_plugin');
@@ -52,6 +53,7 @@ type installPluginsArgs = [
     version?: string;
     hash?: string | boolean;
     installType?: InstallType;
+    store_url?: string; // fork: the store that gets the install count
   }[],
 ];
 

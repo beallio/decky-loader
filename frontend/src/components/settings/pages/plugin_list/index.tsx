@@ -28,8 +28,8 @@ import { useDeckyState } from '../../../DeckyState';
 import PluginListLabel from './PluginListLabel';
 
 async function reinstallPlugin(pluginName: string, currentVersion?: string) {
-  const serverData = await getPluginList();
-  const remotePlugin = serverData?.find((x) => x.name == pluginName);
+  const { plugins } = await getPluginList();
+  const remotePlugin = plugins.find((x) => x.name == pluginName);
   if (remotePlugin && remotePlugin.versions?.length > 0) {
     const currentVersionData = remotePlugin.versions.find((version) => version.name == currentVersion);
     if (currentVersionData) requestPluginInstall(pluginName, currentVersionData, InstallType.REINSTALL);

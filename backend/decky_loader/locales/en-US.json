@@ -83,7 +83,9 @@
         "plugin_install": "Install",
         "plugin_no_desc": "No description provided.",
         "plugin_overwrite": "Overwrite",
+        "plugin_prerelease": "pre-release",
         "plugin_reinstall": "Reinstall",
+        "plugin_store_shadowed": "A store higher in your list did not answer. This plugin may normally come from there.",
         "plugin_update": "Update",
         "plugin_version_label": "Plugin Version"
     },
@@ -298,19 +300,25 @@
         "store_testing_warning": {
             "desc": "You can use this store channel to test bleeding-edge plugin versions. Be sure to leave feedback on GitHub so the plugin can be updated for all users.",
             "label": "Welcome to the Testing Store Channel"
-        }
+        },
+        "store_unavailable": "Could not reach {{url}}. Showing plugins from the other stores."
     },
     "StoreSelect": {
-        "custom_store": {
-            "label": "Custom Store",
-            "url_label": "URL"
+        "add_store": "Add store",
+        "edit_store": "Edit store",
+        "prerelease_stores": {
+            "desc": "Their versions show after the stable versions. Press X to change the order.",
+            "label": "Pre-release stores"
         },
-        "store_channel": {
-            "custom": "Custom",
-            "default": "Default",
-            "label": "Store Channel",
-            "testing": "Testing"
-        }
+        "prereleases": {
+            "desc": "Also show pre-release versions and plugins from the pre-release stores.",
+            "label": "Include pre-releases"
+        },
+        "stores": {
+            "desc": "When two stores have the same plugin, the higher store provides it. Press X to change the order.",
+            "label": "Plugin stores"
+        },
+        "url_label": "Store URL"
     },
     "Testing": {
         "download": "Download",

@@ -35,6 +35,8 @@ struct InstallRequest {
     version: String,
     hash: Value,
     install_type: u64,
+    /// The store that lists this plugin; it gets the install count. None for URL or file installs.
+    store_url: Option<String>,
 }
 
 impl InstallRequest {
@@ -314,9 +316,9 @@ impl PluginManager {
     }
 
     async fn request_single(&self, backend: &Backend, args: &[Value]) -> Result<(), RpcError> {
-        if args.len() > 5 {
+        if args.len() > 6 {
             return Err(RpcError::invalid(format!(
-                "expected at most 5 arguments, received {}",
+                "expected at most 6 arguments, received {}",
                 args.len()
             )));
         }
@@ -329,6 +331,16 @@ impl PluginManager {
                 .cloned()
                 .unwrap_or_else(|| Value::String(String::new())),
             install_type: optional_install_type(args, 4, 0)?,
+            store_url: args
+                .get(5)
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| RpcError::invalid("argument 5 must be a string"))
+                })
+                .transpose()?,
         };
         let request_id = Uuid::new_v4().to_string();
         self.install_requests
@@ -491,7 +503,7 @@ impl PluginManager {
                 ))
             })?;
             download_info(backend, 70, "Store.download_progress_info.increment_count");
-            increment_install_count(backend, request, already_installed_by_request_name).await;
+            increment_install_count(backend, request, already_installed_by_request_name);
             bytes
         };
 
@@ -1090,6 +1102,15 @@ fn parse_batch_request(value: &Value) -> Result<InstallRequest, RpcError> {
         version: required_string("version")?,
         hash,
         install_type,
+        store_url: object
+            .get("store_url")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    RpcError::invalid("plugin install request store_url must be a string")
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -1100,28 +1121,12 @@ fn download_info(backend: &Backend, percent: u64, translation: &str) {
     );
 }
 
-/// The store Decky is set to: official, testing, or the custom URL.
-async fn store_base_url(backend: &Backend) -> String {
-    match backend
-        .setting("store", json!(0))
-        .await
-        .as_u64()
-        .unwrap_or(0)
-    {
-        1 => "https://testing.deckbrew.xyz/plugins".to_owned(),
-        2 => backend
-            .setting("store-url", json!("https://plugins.deckbrew.xyz/plugins"))
-            .await
-            .as_str()
-            .unwrap_or("https://plugins.deckbrew.xyz/plugins")
-            .to_owned(),
-        _ => "https://plugins.deckbrew.xyz/plugins".to_owned(),
-    }
-}
-
 /// Starts the store install-count POST in the background; the install does not wait for it.
-async fn increment_install_count(backend: &Backend, request: &InstallRequest, is_update: bool) {
-    let store_url = store_base_url(backend).await;
+fn increment_install_count(backend: &Backend, request: &InstallRequest, is_update: bool) {
+    // Fork: several stores can be set, so only the store that listed the plugin is counted.
+    let Some(store_url) = &request.store_url else {
+        return;
+    };
     let url = format!(
         "{}/{}/versions/{}/increment?isUpdate={}",
         store_url.trim_end_matches('/'),

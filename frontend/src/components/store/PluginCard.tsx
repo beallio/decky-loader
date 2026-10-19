@@ -7,32 +7,40 @@ import {
   SingleDropdownOption,
   SuspensefulImage,
 } from '@decky/ui';
+import { compare, validate } from 'compare-versions';
 import { CSSProperties, FC, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { FaArrowDown, FaArrowUp, FaCheck, FaDownload, FaRecycle } from 'react-icons/fa';
 
 import { DisabledPlugin, InstallType, Plugin } from '../../plugin';
-import { StorePlugin, requestPluginInstall } from '../../store';
+import { requestPluginInstall } from '../../store';
+import { MergedStorePlugin, storeLabel } from '../../storeSources';
 import ExternalLink from '../ExternalLink';
 
 interface PluginCardProps {
-  storePlugin: StorePlugin;
+  storePlugin: MergedStorePlugin;
   installedPlugin: Plugin | DisabledPlugin | undefined;
 }
 
 const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
   const [selectedOption, setSelectedOption] = useState<number>(0);
   const installedVersionIndex = storePlugin.versions.findIndex((version) => version.name === installedPlugin?.version);
-  const installType = // This assumes index in options is inverse to update order (i.e. newer updates are first)
-    installedPlugin && selectedOption < installedVersionIndex
-      ? InstallType.UPDATE
-      : installedPlugin && selectedOption === installedVersionIndex
-        ? InstallType.REINSTALL
-        : installedPlugin && selectedOption > installedVersionIndex
-          ? InstallType.DOWNGRADE
-          : installedPlugin // can happen if installed version is not in store
-            ? InstallType.OVERWRITE
-            : InstallType.INSTALL;
+  // Fork: versions from several stores are not in one newest-first order, so compare them when possible.
+  const installedVersion = installedPlugin?.version;
+  const selectedVersion = storePlugin.versions[selectedOption]?.name;
+  const installType = !installedPlugin
+    ? InstallType.INSTALL
+    : selectedVersion === installedVersion
+      ? InstallType.REINSTALL
+      : installedVersion && validate(installedVersion) && validate(selectedVersion)
+        ? compare(selectedVersion, installedVersion, '>')
+          ? InstallType.UPDATE
+          : InstallType.DOWNGRADE
+        : installedVersionIndex < 0 // can happen if installed version is not in store
+          ? InstallType.OVERWRITE
+          : selectedOption < installedVersionIndex // index order is newest first
+            ? InstallType.UPDATE
+            : InstallType.DOWNGRADE;
 
   const root = storePlugin.tags.some((tag) => tag === 'root');
 
@@ -101,6 +109,9 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
             }}
           >
             {storePlugin.author}
+            <span style={{ marginLeft: '8px', fontSize: '12px', color: '#969696' }}>
+              {storeLabel(storePlugin.store)}
+            </span>
           </span>
           <span
             className="deckyStoreCardDescription"
@@ -142,6 +153,14 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
               >
                 deckbrew.xyz/root
               </ExternalLink>
+            </div>
+          )}
+          {storePlugin.shadowedByFailedStore && (
+            <div
+              className="deckyStoreCardDescription"
+              style={{ fontSize: '13px', color: '#e5a50a', marginTop: 'auto' }}
+            >
+              <i>{t('PluginCard.plugin_store_shadowed')}</i>
             </div>
           )}
         </div>
@@ -204,6 +223,11 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
                       label: (
                         <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
                           {version.name}
+                          {version.store !== storePlugin.store && version.store && (
+                            <span style={{ fontSize: '11px', color: '#969696' }}>
+                              {version.prerelease ? t('PluginCard.plugin_prerelease') : storeLabel(version.store)}
+                            </span>
+                          )}
                           {installedPlugin && installedVersionIndex === index ? <FaCheck /> : null}
                         </div>
                       ),

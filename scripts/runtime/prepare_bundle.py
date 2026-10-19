@@ -47,6 +47,12 @@ SDK_OVERLAYS = (
     'backend/decky_loader/main.py',
     'backend/decky_loader/utilities.py',
     'backend/decky_loader/wsrouter.py',
+    'frontend/src/storeSources.ts',
+    'frontend/src/plugin.ts',
+    'frontend/src/components/settings/pages/general/StoreSelect.tsx',
+    'frontend/src/components/settings/pages/plugin_list/index.tsx',
+    'frontend/src/components/store/PluginCard.tsx',
+    'frontend/src/components/store/Store.tsx',
 )
 SDK_REMOVALS = (
     'frontend/src/steamfixes/README.md',
