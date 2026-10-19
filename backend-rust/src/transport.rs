@@ -17,7 +17,7 @@ use axum::{
     },
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT},
+        header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, USER_AGENT},
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -204,6 +204,10 @@ pub async fn serve(
         .layer(cors)
         .layer(middleware::from_fn(expose_response_headers))
         .layer(middleware::from_fn_with_state(token, csrf_middleware))
+        .layer(middleware::from_fn_with_state(
+            LocalClients::new(address),
+            local_client_guard,
+        ))
         .with_state(state.clone());
 
     let result = serve_http(listener, app, state.sockets.clone(), shutdown).await;
@@ -291,6 +295,71 @@ async fn legacy_utility(
     };
     let kwargs = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
     Json(state.backend.legacy_utility(&method, kwargs).await).into_response()
+}
+
+/// The Host and Origin values that local clients of this listener send.
+#[derive(Clone)]
+struct LocalClients {
+    hosts: Arc<[String]>,
+    origins: Arc<[String]>,
+}
+
+impl LocalClients {
+    fn new(address: std::net::SocketAddr) -> Self {
+        let port = address.port();
+        let mut hosts = vec![
+            format!("127.0.0.1:{port}"),
+            format!("localhost:{port}"),
+            format!("[::1]:{port}"),
+        ];
+        if !hosts.contains(&address.to_string()) {
+            hosts.push(address.to_string());
+        }
+        let mut origins: Vec<String> = hosts.iter().map(|host| format!("http://{host}")).collect();
+        origins.push("https://steamloopback.host".to_owned());
+        Self {
+            hosts: hosts.into(),
+            origins: origins.into(),
+        }
+    }
+}
+
+/// Refuses requests addressed to another host name (a web page whose name was
+/// pointed at loopback) or sent by a web page other than Steam's and Decky's own.
+/// Requests without Origin, from plugins, tools and Decky itself, only need the Host.
+async fn local_client_guard(
+    State(clients): State<LocalClients>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let host = request
+        .headers()
+        .get(HOST)
+        .and_then(|value| value.to_str().ok());
+    let origin = request.headers().get(ORIGIN);
+    let host_allowed = host.is_some_and(|host| {
+        clients
+            .hosts
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(host))
+    });
+    let origin_allowed = origin.is_none_or(|origin| {
+        clients
+            .origins
+            .iter()
+            .any(|allowed| allowed.as_bytes() == origin.as_bytes())
+    });
+    if host_allowed && origin_allowed {
+        return next.run(request).await;
+    }
+    eprintln!(
+        "Refused {} {} for Host {:?} and Origin {:?}: not a local Decky client",
+        request.method(),
+        request.uri().path(),
+        host,
+        origin
+    );
+    (StatusCode::FORBIDDEN, "Forbidden").into_response()
 }
 
 async fn csrf_middleware(
@@ -997,6 +1066,70 @@ mod tests {
             "bounded shutdown should complete cleanly"
         );
         drop(pending_response);
+    }
+
+    #[tokio::test]
+    async fn only_local_hosts_and_known_pages_reach_the_api() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/auth/token", get(|| async { "token" }))
+            .layer(middleware::from_fn_with_state(
+                LocalClients::new(address),
+                local_client_guard,
+            ));
+        let sockets = Arc::new(Mutex::new(SocketRegistry::default()));
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn(serve_http(listener, app, sockets, shutdown_receiver));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let port = address.port();
+        let cases: [(&str, Option<&str>, StatusCode); 9] = [
+            // Plugins, tools and Decky's own pages.
+            (&format!("127.0.0.1:{port}"), None, StatusCode::OK),
+            (&format!("LocalHost:{port}"), None, StatusCode::OK),
+            (
+                &format!("127.0.0.1:{port}"),
+                Some("https://steamloopback.host"),
+                StatusCode::OK,
+            ),
+            (
+                &format!("localhost:{port}"),
+                Some(&format!("http://localhost:{port}")),
+                StatusCode::OK,
+            ),
+            // A site under another name that resolves to loopback.
+            ("other-site.example", None, StatusCode::FORBIDDEN),
+            (
+                &format!("other-site.example:{port}"),
+                Some(&format!("http://other-site.example:{port}")),
+                StatusCode::FORBIDDEN,
+            ),
+            // Another port on this machine is another site.
+            ("127.0.0.1:1", None, StatusCode::FORBIDDEN),
+            // A page from another site sending to the real address.
+            (
+                &format!("127.0.0.1:{port}"),
+                Some("https://other-site.example"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &format!("127.0.0.1:{port}"),
+                Some("null"),
+                StatusCode::FORBIDDEN,
+            ),
+        ];
+        for (host, origin, expected) in cases {
+            let mut request = client
+                .get(format!("http://{address}/auth/token"))
+                .header(HOST, host);
+            if let Some(origin) = origin {
+                request = request.header(ORIGIN, origin);
+            }
+            let status = request.send().await.unwrap().status();
+            assert_eq!(status, expected, "Host {host}, Origin {origin:?}");
+        }
+        shutdown_sender.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     async fn test_backend(
