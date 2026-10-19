@@ -28,7 +28,7 @@ jobs:
           from pathlib import Path
           config = json.loads(Path('backend-rust/build-config.json').read_text())
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              for name in ('node', 'pnpm', 'poetry', 'poetry_dynamic_versioning'):
+              for name in ('node', 'pnpm', 'poetry', 'poetry_dynamic_versioning', 'ty'):
                   print(f'{name}={config[name]}', file=output)
               print(f'python={config["python"]["version"]}', file=output)
               print(f'sdk_version={config["sdk"]["tag"].removeprefix("v")}', file=output)
@@ -43,7 +43,8 @@ jobs:
         env:
           POETRY_VERSION: ${{ steps.config.outputs.poetry }}
           VERSIONING_VERSION: ${{ steps.config.outputs.poetry_dynamic_versioning }}
-        run: python3 -m pip install "poetry==$POETRY_VERSION" "poetry-dynamic-versioning==$VERSIONING_VERSION"
+          TY_VERSION: ${{ steps.config.outputs.ty }}
+        run: python3 -m pip install "poetry==$POETRY_VERSION" "poetry-dynamic-versioning==$VERSIONING_VERSION" "ty==$TY_VERSION"
       - name: Install locked SDK dependencies
         working-directory: backend
         env:
@@ -52,7 +53,7 @@ jobs:
         run: poetry sync --no-interaction
       - name: Check Python SDK types
         working-directory: backend
-        run: poetry run pyright --pythonversion 3.11
+        run: ty check --python .venv --error-on-warning
       - name: Install locked frontend dependencies
         env:
           PNPM_VERSION: ${{ steps.config.outputs.pnpm }}

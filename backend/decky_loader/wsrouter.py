@@ -5,7 +5,7 @@ from aiohttp import WSCloseCode, WSMsgType, WSMessage
 from aiohttp.web import Application, WebSocketResponse, Request, Response, get
 
 from enum import IntEnum
-from typing import Callable, Coroutine, Dict, Any, cast
+from typing import Callable, Coroutine, Dict, Any
 from traceback import format_exc
 
 from .helpers import get_csrf_token
@@ -23,12 +23,6 @@ class MessageType(IntEnum):
     FULL_SYNC = 4
     # Pub/Sub, Backend -> Frontend
     EVENT = 5
-
-# WSMessage with slightly better typings
-class WSMessageExtra(WSMessage):
-    # TODO message typings here too
-    data: Any # pyright: ignore [reportIncompatibleVariableOverride]
-    type: WSMsgType # pyright: ignore [reportIncompatibleVariableOverride]
 
 # see wsrouter.ts for typings
 
@@ -65,7 +59,7 @@ class WSRouter:
     def remove_route(self, name: str):
         del self.routes[name]
 
-    async def _call_route(self, route: str, args: ..., call_id: int):
+    async def _call_route(self, route: str, args: list[Any], call_id: int):
         try:
             res = await self.routes[route](*args)
             message = {"type": MessageType.REPLY.value, "id": call_id, "result": res}
@@ -97,8 +91,6 @@ class WSRouter:
         
         try:
             async for msg in ws:
-                msg = cast(WSMessageExtra, msg)
-
                 if msg.type == WSMsgType.TEXT:
                     if msg.data == 'close':
                         # TODO DO NOT RELY ON THIS!

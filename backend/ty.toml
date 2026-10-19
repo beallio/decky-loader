@@ -1,0 +1,5 @@
+# Type checking for the SDK backend; CI runs `ty check --error-on-warning` here.
+
+[environment]
+python-version = "3.11"
+python-platform = "linux"

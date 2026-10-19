@@ -354,8 +354,8 @@ class Utilities:
         # Filter logic
         if filter_for is not None:
             try:
-                if re.compile(filter_for):
-                    files = list(filter(lambda file: re.search(filter_for, file["file"].name) != None, files))
+                re.compile(filter_for)
+                files = list(filter(lambda file: re.search(filter_for, file["file"].name) != None, files))
             except re.error:
                 files = list(filter(lambda file: file["file"].name.find(filter_for) != -1, files))
         

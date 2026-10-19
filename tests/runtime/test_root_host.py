@@ -118,7 +118,7 @@ class ProtocolTest(unittest.TestCase):
         # hello hands the token to the SDK helpers module. The real one needs aiohttp and
         # certifi; plugins only read its csrf_token global, so a stand-in module is enough.
         self.helpers = types.ModuleType("decky_loader.helpers")
-        self.helpers.csrf_token = "random"  # type: ignore[attr-defined]
+        setattr(self.helpers, "csrf_token", "random")
         for patcher in (mock.patch.dict(sys.modules, {"decky_loader.helpers": self.helpers}),
                         mock.patch.object(decky_loader, "helpers", self.helpers, create=True)):
             patcher.start()
@@ -171,7 +171,7 @@ class ProtocolTest(unittest.TestCase):
 
     def test_hello_updates_the_csrf_token_used_by_helpers(self) -> None:
         self.greeted({})
-        self.assertEqual(self.helpers.csrf_token, "t")  # type: ignore[attr-defined]
+        self.assertEqual(getattr(self.helpers, "csrf_token"), "t")
 
     def start(self, host: root_host.Host, directory: str) -> dict[str, Any]:
         return host.handle_line(json.dumps({"op": "start", "id": "a", "directory": directory}).encode())

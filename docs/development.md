@@ -44,6 +44,12 @@ Run the runtime Python regressions from the repository root:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/runtime -p 'test_*.py'
 ```
 
+Check the SDK backend types with the pinned [ty](https://docs.astral.sh/ty/) version from `backend-rust/build-config.json`, against the locked dependencies (`poetry sync` in `backend` with `POETRY_VIRTUALENVS_IN_PROJECT=true`):
+
+```sh
+cd backend && uvx ty@0.0.86 check --python .venv --error-on-warning
+```
+
 The native JSON tests are separate because they require a compiled extension for the selected Python ABI. The complete runtime builder compiles that extension and runs `tests/native-json/` with the pinned CPython before it packages the worker.
 
 Rust workspace tests also need a Python installation with its shared library and development files. If automatic detection selects an interpreter without `libpython`, set `PYO3_PYTHON` to a suitable installation before running Cargo.
@@ -107,7 +113,7 @@ Plugin startup binds selected plugin information and loader-managed imports to t
 
 The installed backend is a `systemd --user` unit for the selected account, `deck` by default. It has no `User=` line and is wanted by `default.target`. `KillMode=mixed` stops the main process first, then any remaining helpers in the unit. The installer keeps its state in `homebrew/services/.decky-user-installer/` and its offline recovery kit in `homebrew/services/.decky-user-deploy/`. It records the user unit directory that the user manager reports and reuses it for later status, update, and rollback commands.
 
-Plugins with the `root` flag are refused with a clear error. Normal install, update, status, and rollback never use sudo. Only the explicit `migrate-legacy-system` and `restore-legacy-system` commands run as root. They keep a protected copy of the old system unit, drop-ins, binary, and restore helper in `/var/lib/decky-loader-runtime/legacy-migrations/<uid>/<unit>/`.
+Plugins with the `root` flag run only after root plugin support is enabled; see [Root plugin host](root-plugin-host.md). Normal install, update, status, and rollback never use sudo. Only the explicit `enable-root-plugins`, `disable-root-plugins`, `migrate-legacy-system` and `restore-legacy-system` commands run as root. The legacy commands keep a protected copy of the old system unit, drop-ins, binary, and restore helper in `/var/lib/decky-loader-runtime/legacy-migrations/<uid>/<unit>/`.
 
 ### Native JSON for plugins
 

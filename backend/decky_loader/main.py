@@ -6,7 +6,7 @@ from .localplatform.localplatform import (chmod, chown, service_stop, service_st
                             get_server_port, get_server_host, get_chown_plugin_path,
                             get_privileged_path, restart_webhelper)
 if hasattr(sys, '_MEIPASS'):
-    chmod(sys._MEIPASS, 755) # type: ignore
+    chmod(sys._MEIPASS, 755)
     
 # Full imports
 import multiprocessing

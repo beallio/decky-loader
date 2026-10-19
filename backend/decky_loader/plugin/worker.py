@@ -385,8 +385,10 @@ def _helper_source_description() -> dict[str, Any]:
     from decky_loader import helpers
 
     source = Path(helpers.__file__).read_bytes()
-    loader = helpers.__loader__
-    code = loader.get_code(helpers.__name__)
+    get_code = cast("Callable[[str], object] | None", getattr(helpers.__loader__, "get_code", None))
+    if get_code is None:
+        raise WorkerError("the helpers module loader cannot return its code")
+    code = get_code(helpers.__name__)
     compiled = compile(source, helpers.__file__, "exec", dont_inherit=True, optimize=0)
     if not isinstance(code, CodeType) or _normalize_code(code) != _normalize_code(compiled):
         raise WorkerError("packaged helper source differs from its loaded Python code")
@@ -722,15 +724,16 @@ class BackendLossListener:
 
     on_backend_closed: Callable[[], object] | None = None
 
+    # The SDK's LocalSocket comes after this mixin in the class order; it is imported only at launch.
     async def _read_single_line(self, reader: asyncio.StreamReader) -> str:
-        line = cast(str, await super()._read_single_line(reader))  # type: ignore[misc]
+        line = cast(str, await cast(Any, super())._read_single_line(reader))
         if not line and reader.at_eof():
             raise _BackendClosed
         return line
 
     async def _listen_for_method_call(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            await super()._listen_for_method_call(reader, writer)  # type: ignore[misc]
+            await cast(Any, super())._listen_for_method_call(reader, writer)
         except _BackendClosed:
             writer.close()
             if self.on_backend_closed is not None:

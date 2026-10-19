@@ -111,7 +111,7 @@ class SandboxedPlugin:
                 }))
             # copy the docstring over so we don't have to duplicate it
             emit.__doc__ = decky.emit.__doc__
-            decky.emit = emit
+            setattr(decky, "emit", emit)
             sys.modules["decky"] = decky
             # provided for compatibility
             sys.modules["decky_plugin"] = decky

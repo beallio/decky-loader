@@ -1,8 +1,6 @@
-import asyncio, time
+import asyncio, sys, time
 from typing import Any, Callable, Coroutine
 import random
-
-from .localplatform import ON_WINDOWS
 
 BUFFER_LIMIT = 2 ** 20  # 1 MiB
 
@@ -89,7 +87,8 @@ class UnixSocket:
             try:
                 line.extend(await reader.readuntil())
             except asyncio.LimitOverrunError:
-                line.extend(await reader.read(reader._limit)) # pyright: ignore [reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
+                # Every reader and server here is opened with BUFFER_LIMIT.
+                line.extend(await reader.read(BUFFER_LIMIT))
                 continue
             except asyncio.IncompleteReadError as err:
                 line.extend(err.partial)
@@ -158,8 +157,8 @@ class PortSocket (UnixSocket):
         else:
             return True
 
-if ON_WINDOWS:
-    class LocalSocket (PortSocket):  # type: ignore
+if sys.platform == "win32":
+    class LocalSocket (PortSocket):
         pass
 else:
     class LocalSocket (UnixSocket):
