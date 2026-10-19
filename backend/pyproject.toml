@@ -24,6 +24,8 @@ decky-loader = "decky_loader.main:main"
 [dependency-groups]
 dev = ["pyinstaller>=6.8.0,<7"]
 typecheck = ["ty==0.0.86"]
+# Run from the repository root; ruff.toml there selects the files.
+lint = ["ruff==0.17.0"]
 
 [build-system]
 requires = ["uv_build==0.12.24"]

@@ -6220,7 +6220,7 @@ def main() -> int:
             _require_root()
             user = pwd.getpwnam(args.user)
             homebrew = _homebrew_path(args.homebrew)
-            directory = _legacy_migration_directory(
+            _legacy_migration_directory(
                 homebrew,
                 args.service_name,
                 create=args.command == 'migrate-legacy-system',

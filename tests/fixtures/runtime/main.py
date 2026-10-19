@@ -10,7 +10,7 @@ import multidict._multidict
 import decky
 import decky_plugin
 import helpers
-import settings
+import settings  # noqa: F401 - the legacy top-level module must import
 
 _STATE = Path(decky.DECKY_PLUGIN_RUNTIME_DIR) / 'state.json'
 _LIFECYCLE = Path(decky.DECKY_PLUGIN_RUNTIME_DIR) / 'lifecycle.json'

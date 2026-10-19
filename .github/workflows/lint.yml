@@ -12,7 +12,7 @@ env:
 
 jobs:
   lint:
-    name: Check frontend formatting
+    name: Check frontend formatting and Python lint
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -28,8 +28,9 @@ jobs:
           from pathlib import Path
           config = json.loads(Path('backend-rust/build-config.json').read_text())
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              for name in ('node', 'pnpm'):
+              for name in ('node', 'pnpm', 'uv'):
                   print(f'{name}={config[name]}', file=output)
+              print(f'python={config["python"]["version"]}', file=output)
           PY
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
@@ -41,3 +42,15 @@ jobs:
           npm install --global "pnpm@$PNPM_VERSION"
           pnpm --dir frontend install --frozen-lockfile
       - run: pnpm --dir frontend run lint
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ steps.config.outputs.python }}
+      - name: Install pinned ruff
+        env:
+          UV_VERSION: ${{ steps.config.outputs.uv }}
+          UV_PYTHON_DOWNLOADS: never
+        run: |
+          python3 -m pip install "uv==$UV_VERSION"
+          uv sync --project backend --locked --only-group lint --python "$(command -v python3)"
+      - name: Lint fork-owned Python
+        run: uv run --project backend --no-sync ruff check .

@@ -54,6 +54,12 @@ cd backend && uv sync --locked --group typecheck && uv run --no-sync ty check --
 
 Check the Python packages against upstream with `python3 scripts/runtime/python_parity.py`.
 
+Lint the fork's own Python with [ruff](https://docs.astral.sh/ruff/), pinned in `backend/uv.lock`, from the repository root. `ruff.toml` lists the files; unchanged and overlaid upstream files are not linted:
+
+```sh
+uv sync --project backend --locked --only-group lint && uv run --project backend --no-sync ruff check .
+```
+
 The native JSON tests are separate because they require a compiled extension for the selected Python ABI. The complete runtime builder compiles that extension and runs `tests/native-json/` with the pinned CPython before it packages the worker.
 
 Rust workspace tests also need a Python installation with its shared library and development files. If automatic detection selects an interpreter without `libpython`, set `PYO3_PYTHON` to a suitable installation before running Cargo.
