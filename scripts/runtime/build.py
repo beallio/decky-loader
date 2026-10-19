@@ -79,9 +79,11 @@ def build(output: Path, release_version: str, python_archive: Path | None) -> di
     cargo_version = capture(['cargo', '--version'], env=tool_environment)
     node_version = capture(['node', '--version']).removeprefix('v')
     pnpm_version = capture(['pnpm', '--version'])
+    uv_version = capture(['uv', '--version']).split()[1]
     if (rust_version.split()[1] != CONFIG['rust'] or cargo_version.split()[1] != CONFIG['rust']
-            or node_version != CONFIG['node'] or pnpm_version != CONFIG['pnpm']):
-        raise RuntimeError(f'tool versions differ from build-config.json: {rust_version}; {cargo_version}; Node {node_version}; pnpm {pnpm_version}')
+            or node_version != CONFIG['node'] or pnpm_version != CONFIG['pnpm'] or uv_version != CONFIG['uv']):
+        raise RuntimeError(f'tool versions differ from build-config.json: {rust_version}; {cargo_version}; Node {node_version}; pnpm {pnpm_version}; uv {uv_version}')
+    run([sys.executable, str(HERE / 'python_parity.py')])
     temporary_root = Path(os.environ.get('TMPDIR') or '/var/tmp/omp-1000')
     temporary_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     base_commit = capture(['git', 'rev-parse', 'HEAD'])
@@ -104,17 +106,11 @@ def build(output: Path, release_version: str, python_archive: Path | None) -> di
         python_version = capture([str(python), '-c', 'import platform; print(platform.python_version())'], env=environment)
         if python_version != python_config['version']:
             raise ValueError(f'pinned archive reported unexpected Python version: {python_version}')
-        for name in ('tools', 'worker-env'):
-            run([str(python), '-m', 'venv', str(work / name)], env=environment)
-        tools_python = work / 'tools/bin/python'
         worker_python = work / 'worker-env/bin/python'
-        run([str(tools_python), '-m', 'pip', 'install', '--disable-pip-version-check',
-             f'poetry=={CONFIG["poetry"]}', f'poetry-dynamic-versioning=={CONFIG["poetry_dynamic_versioning"]}'], env=environment)
         worker_environment = dict(environment, VIRTUAL_ENV=str(work / 'worker-env'),
-                                  POETRY_VIRTUALENVS_CREATE='false',
-                                  POETRY_DYNAMIC_VERSIONING_BYPASS=CONFIG['sdk']['tag'].removeprefix('v'))
-        run([str(work / 'tools/bin/poetry'), 'sync', '--no-interaction'],
-            cwd=source / 'backend', env=worker_environment)
+                                  UV_PROJECT_ENVIRONMENT=str(work / 'worker-env'), UV_PYTHON_DOWNLOADS='never')
+        # --locked fails when pyproject.toml and uv.lock disagree; the default group adds PyInstaller.
+        run(['uv', 'sync', '--locked', '--python', str(python)], cwd=source / 'backend', env=worker_environment)
         pyinstaller_version = capture([str(worker_python), '-m', 'PyInstaller', '--version'], env=worker_environment)
         if pyinstaller_version != CONFIG['pyinstaller']:
             raise ValueError(f'locked PyInstaller version differs from build configuration: {pyinstaller_version}')
@@ -143,9 +139,10 @@ def build(output: Path, release_version: str, python_archive: Path | None) -> di
             'base_commit': base_commit,
             'source_sha256': source_hashes,
             'build_config': CONFIG,
-            'tools': {'rustc': rust_version, 'cargo': cargo_version, 'node': node_version, 'pnpm': pnpm_version, 'pyinstaller': pyinstaller_version},
-            'python_packages': json.loads(capture([str(worker_python), '-m', 'pip', 'list', '--format=json'], env=worker_environment)),
-            'tool_packages': json.loads(capture([str(tools_python), '-m', 'pip', 'list', '--format=json'], env=worker_environment)),
+            'tools': {'rustc': rust_version, 'cargo': cargo_version, 'node': node_version, 'pnpm': pnpm_version,
+                      'uv': uv_version, 'pyinstaller': pyinstaller_version},
+            'python_packages': json.loads(capture(['uv', 'pip', 'list', '--format=json', '--python', str(worker_python)],
+                                                  env=worker_environment)),
             'native_json': {'module': '_decky_native_json', 'sha256': digest(native_module),
                             'abi_suffix': extension_suffix, 'system_unwind_library': 'libgcc_s.so.1'},
         }

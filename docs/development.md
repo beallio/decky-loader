@@ -32,7 +32,9 @@ The frontend build writes application assets to `backend/decky_loader/static/` a
 
 ## Tools and editor support
 
-Use the exact Rust, Node.js, pnpm, CPython, Poetry, and PyInstaller versions in [build-config.json](../backend-rust/build-config.json) for a complete runtime build. The builder rejects a different Rust, Node.js, or pnpm version. It uses the committed Cargo, Poetry, and pnpm lockfiles.
+Use the exact Rust, Node.js, pnpm, uv, CPython, and PyInstaller versions in [build-config.json](../backend-rust/build-config.json) for a complete runtime build. The builder rejects a different Rust, Node.js, pnpm, or uv version. It uses the committed Cargo, uv (`backend/uv.lock`), and pnpm lockfiles.
+
+The Python project files `backend/pyproject.toml` and `backend/uv.lock` belong to the fork; upstream uses Poetry. The runtime packages must still have the same versions as upstream's `backend/poetry.lock` at the pinned SDK tag, so plugins see the same libraries as on official Decky. `scripts/runtime/python_parity.py` checks this before every build; list a deliberate difference with its reason under `python_divergence` in `build-config.json`.
 
 For Rust work in OMP, install `rust-analyzer` and the standard-library source for the pinned Rust toolchain, then configure the local editor to use `backend-rust`. Agent configuration and state, including `.omp/`, `.codex/`, and `.agents/`, are local files rather than project source. Add these directories to `.git/info/exclude` in each checkout; Git exclude rules are not shared between clones. Run Cargo checks explicitly before submitting changes.
 
@@ -44,11 +46,13 @@ Run the runtime Python regressions from the repository root:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/runtime -p 'test_*.py'
 ```
 
-Check the SDK backend types with the pinned [ty](https://docs.astral.sh/ty/) version from `backend-rust/build-config.json`, against the locked dependencies (`poetry sync` in `backend` with `POETRY_VIRTUALENVS_IN_PROJECT=true`):
+Check the SDK backend types with [ty](https://docs.astral.sh/ty/), pinned in `backend/uv.lock`:
 
 ```sh
-cd backend && uvx ty@0.0.86 check --python .venv --error-on-warning
+cd backend && uv sync --locked --group typecheck && uv run --no-sync ty check --error-on-warning
 ```
+
+Check the Python packages against upstream with `python3 scripts/runtime/python_parity.py`.
 
 The native JSON tests are separate because they require a compiled extension for the selected Python ABI. The complete runtime builder compiles that extension and runs `tests/native-json/` with the pinned CPython before it packages the worker.
 
@@ -163,18 +167,20 @@ The [Deck installer](../scripts/install-to-deck.sh) downloads the latest stable 
 
 The `Upstream Sync` workflow runs every week and can be started by hand. It runs `scripts/runtime/upstream_check.py`, which compares the pinned SDK tag in [build-config.json](../backend-rust/build-config.json) with the newest upstream tag. Stable tags `vX.Y.Z` always count, and a stable release ranks above its prereleases. Prerelease tags `vX.Y.Z-preN` count only while the pin is itself a prerelease. When a newer tag exists, the workflow opens one issue, `Upstream vX.Y.Z is available`, with the `upstream-sync` label. It updates that issue on later runs. When the fork is up to date, it does nothing.
 
-The report has three parts:
+The report has four parts:
 
 - Each fork overlay file gets a three-way merge: base is the pinned tag, ours is the fork `HEAD`, theirs is the new tag. The result is `clean`, `conflict`, `unchanged-upstream`, or `deleted-upstream`.
 - Each removed file shows whether upstream changed it.
 - Other changes in `backend/decky_loader` and `frontend` come into the fork as they are.
+- Each runtime Python package whose version in the new tag's `poetry.lock` differs from `backend/uv.lock`.
 
 To run the check yourself, use `python3 scripts/runtime/upstream_check.py`. It prints JSON. Give a Git remote or path as an argument to use another source.
 
 To move to a new upstream tag:
 
 1. Fetch the tag: `git fetch --no-tags https://github.com/SteamDeckHomebrew/decky-loader.git refs/tags/vX.Y.Z:refs/tags/vX.Y.Z`.
-2. Merge the upstream changes into `backend/decky_loader` and `frontend`. For each overlay file, merge by hand, or run `git merge-file` with the old tag as base. Keep the fork changes. For each removed file, check that the change does not matter, then keep it removed.
+2. Merge the upstream changes into `backend/decky_loader` and `frontend`. For each overlay file, merge by hand, or run `git merge-file` with the old tag as base. Keep the fork changes. For each removed file, check that the change does not matter, then keep it removed. Keep the fork's `backend/pyproject.toml` and `backend/uv.lock`, and do not bring back `backend/poetry.lock`.
 3. In `build-config.json`, set `sdk.tag`, `sdk.commit` (`git rev-parse vX.Y.Z^{commit}`), `sdk.backend_tree` (`git rev-parse vX.Y.Z:backend/decky_loader`), and `sdk.frontend_tree` (`git rev-parse vX.Y.Z:frontend`). Update the base version named in this guide. Remove overlay entries that now equal upstream.
-4. Run the local checks and a complete build.
-5. Release as `vX.Y.Z-rust.N` (use `-rc.N` for a preview). See [Release validation and publication](#release-validation-and-publication).
+4. Set `version` in `backend/pyproject.toml` to the new tag without the `v`. For each package that the report lists, match upstream: change the dependency range in `pyproject.toml` if upstream changed it, then `uv lock --upgrade-package NAME==VERSION` in `backend`. `python3 scripts/runtime/python_parity.py` must pass.
+5. Run the local checks and a complete build.
+6. Release as `vX.Y.Z-rust.N` (use `-rc.N` for a preview). See [Release validation and publication](#release-validation-and-publication).

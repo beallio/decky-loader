@@ -28,10 +28,9 @@ jobs:
           from pathlib import Path
           config = json.loads(Path('backend-rust/build-config.json').read_text())
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              for name in ('node', 'pnpm', 'poetry', 'poetry_dynamic_versioning', 'ty'):
+              for name in ('node', 'pnpm', 'uv'):
                   print(f'{name}={config[name]}', file=output)
               print(f'python={config["python"]["version"]}', file=output)
-              print(f'sdk_version={config["sdk"]["tag"].removeprefix("v")}', file=output)
           PY
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
@@ -39,21 +38,18 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: ${{ steps.config.outputs.python }}
-      - name: Install pinned Python tools
+      - name: Install pinned uv
         env:
-          POETRY_VERSION: ${{ steps.config.outputs.poetry }}
-          VERSIONING_VERSION: ${{ steps.config.outputs.poetry_dynamic_versioning }}
-          TY_VERSION: ${{ steps.config.outputs.ty }}
-        run: python3 -m pip install "poetry==$POETRY_VERSION" "poetry-dynamic-versioning==$VERSIONING_VERSION" "ty==$TY_VERSION"
+          UV_VERSION: ${{ steps.config.outputs.uv }}
+        run: python3 -m pip install "uv==$UV_VERSION"
       - name: Install locked SDK dependencies
         working-directory: backend
         env:
-          POETRY_VIRTUALENVS_IN_PROJECT: "true"
-          POETRY_DYNAMIC_VERSIONING_BYPASS: ${{ steps.config.outputs.sdk_version }}
-        run: poetry sync --no-interaction
+          UV_PYTHON_DOWNLOADS: never
+        run: uv sync --locked --group typecheck --python "$(command -v python3)"
       - name: Check Python SDK types
         working-directory: backend
-        run: ty check --python .venv --error-on-warning
+        run: uv run --no-sync ty check --error-on-warning
       - name: Install locked frontend dependencies
         env:
           PNPM_VERSION: ${{ steps.config.outputs.pnpm }}

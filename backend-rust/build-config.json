@@ -9,10 +9,8 @@
   "rust": "1.98.1",
   "node": "24.18.0",
   "pnpm": "10.33.0",
-  "poetry": "2.2.1",
-  "poetry_dynamic_versioning": "1.9.1",
+  "uv": "0.12.24",
   "pyinstaller": "6.22.3",
-  "ty": "0.0.86",
   "sdk": {
     "tag": "v3.3.0",
     "commit": "67196adfa9b299f20dfb0cc932e88a169417b7d5",

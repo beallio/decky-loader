@@ -22,6 +22,7 @@ import sys
 import tempfile
 
 from prepare_bundle import BUILD_CONFIG, REPO, SDK_OVERLAYS, SDK_REMOVALS
+from python_parity import differences
 
 DEFAULT_REMOTE = 'https://github.com/SteamDeckHomebrew/decky-loader.git'
 RELEASE_TAG = re.compile(r'v(\d+)\.(\d+)\.(\d+)(?:-pre(\d+))?')
@@ -134,6 +135,10 @@ def check(fork: Path, remote: str, pinned_tag: str, pinned_commit: str,
              if blob_id(upstream, pinned_tag, path) == blob_id(upstream, latest, path) else 'changed-upstream'}
             for path in removals]
         report['other_changes'] = other_changes(upstream, pinned_tag, latest, (*overlays, *removals))
+        upstream_lock, fork_lock = blob(upstream, latest, 'backend/poetry.lock'), blob(fork, 'HEAD', 'backend/uv.lock')
+        report['python_packages'] = (
+            differences(upstream_lock.decode(), fork_lock.decode(), BUILD_CONFIG.get('python_divergence', {}))
+            if upstream_lock and fork_lock else ['cannot compare: backend/poetry.lock upstream or backend/uv.lock in the fork is missing'])
     return report
 
 
@@ -159,6 +164,9 @@ def markdown(report: dict) -> str:
     lines += [f"- `{item['status']}` `{item['path']}`" for item in changes[:MARKDOWN_LIST_LIMIT]]
     if len(changes) > MARKDOWN_LIST_LIMIT:
         lines.append(f'- and {len(changes) - MARKDOWN_LIST_LIMIT} more')
+    packages = report['python_packages']
+    lines += ['', f'### Python packages that differ from {report["latest"]} ({len(packages)})', '']
+    lines += [f'- {item}' for item in packages] or ['None.']
     return '\n'.join(lines) + '\n'
 
 
