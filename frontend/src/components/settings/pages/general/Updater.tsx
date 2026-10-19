@@ -50,7 +50,9 @@ function PatchNotesModal({ versionInfo, closeModal }: { versionInfo: VerInfo | n
       <Focusable onCancelButton={closeModal}>
         <Carousel
           fnItemRenderer={(id: number) => (
+            // Fork: B closes from the focused page too, not only from the outer wrapper.
             <Focusable
+              onCancelButton={closeModal}
               style={{
                 marginTop: '40px',
                 height: 'calc( 100% - 40px )',
@@ -114,15 +116,17 @@ export default function UpdaterSettings() {
     };
   }, []);
 
+  // Fork: an empty carousel has nothing to focus, so B cannot reach the close handler.
+  const hasPatchNotes = (versionInfo?.all?.length ?? 0) > 0;
   const showPatchNotes = useCallback(() => {
-    showModal(<PatchNotesModal versionInfo={versionInfo} />);
-  }, [versionInfo]);
+    if (hasPatchNotes) showModal(<PatchNotesModal versionInfo={versionInfo} />);
+  }, [versionInfo, hasPatchNotes]);
 
   return (
     <>
       <Field
-        onOptionsActionDescription={versionInfo?.all ? t('Updater.patch_notes_desc') : undefined}
-        onOptionsButton={versionInfo?.all ? showPatchNotes : undefined}
+        onOptionsActionDescription={hasPatchNotes ? t('Updater.patch_notes_desc') : undefined}
+        onOptionsButton={hasPatchNotes ? showPatchNotes : undefined}
         label={t('Updater.updates.label')}
         description={
           checkingForUpdates || versionInfo?.remote?.tag_name != versionInfo?.current || !versionInfo?.remote ? (
