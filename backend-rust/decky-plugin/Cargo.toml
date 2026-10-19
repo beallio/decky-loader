@@ -1,0 +1,16 @@
+[package]
+name = "decky-plugin"
+version = "0.1.0"
+edition = "2024"
+license = "0BSD"
+description = "Write Decky Loader plugin backends in Rust"
+publish = false
+
+[dependencies]
+libc = "0.2"
+log = { version = "0.4", features = ["std"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "signal", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }

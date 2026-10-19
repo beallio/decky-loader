@@ -6,7 +6,7 @@ use std::{
     os::fd::{AsFd, AsRawFd, OwnedFd},
     os::unix::{
         ffi::OsStrExt,
-        fs::PermissionsExt,
+        fs::{FileExt, PermissionsExt},
         process::{CommandExt, ExitStatusExt},
     },
     path::{Component, Path, PathBuf},
@@ -22,7 +22,7 @@ use nix::{
     dir::Dir,
     errno::Errno,
     fcntl::{AtFlags, OFlag, open, openat},
-    sys::stat::{Mode, SFlag, fchmod, fstat, fstatat},
+    sys::stat::{Mode, SFlag, fchmod, fstat, fstatat, mkdirat},
     unistd::{self, Gid, Uid},
 };
 
@@ -81,6 +81,8 @@ struct PluginMetadata {
     version: Option<String>,
     load_type: u8,
     passive: bool,
+    /// Relative path of the plugin's own executable that replaces `main.py`.
+    native_backend: Option<String>,
     disabled: bool,
     requires_root: bool,
     debug: bool,
@@ -199,6 +201,8 @@ struct WorkerLaunchConfig<'a> {
     plugin_root: &'a Path,
     homebrew: &'a Path,
     user: &'a str,
+    user_ids: (u32, u32),
+    loader_version: &'a str,
     auth_token: &'a str,
     server_host: &'a str,
     server_port: u16,
@@ -453,7 +457,9 @@ impl PluginRegistry {
                         }
                     }
                     Ok(()) => {
-                        let fork_launcher = if registry.worker_mode == WorkerMode::Fork {
+                        let fork_launcher = if registry.worker_mode == WorkerMode::Fork
+                            && entry.metadata.native_backend.is_none()
+                        {
                             match registry.ensure_fork_launcher(&mut shutdown).await {
                                 Ok(launcher) => Some(launcher),
                                 Err(WorkerError::Error(error)) => {
@@ -635,6 +641,12 @@ impl PluginRegistry {
                 "This plugin is passive (aka does not implement main.py)".to_owned(),
             ));
         }
+        if legacy && entry.metadata.native_backend.is_some() {
+            return Err(WorkerError::Error(format!(
+                "Plugin {} has a native backend, which does not accept legacy method calls",
+                display_name(&entry.metadata)
+            )));
+        }
         if entry.disabled.load(Ordering::Acquire) {
             return Err(WorkerError::Error("This plugin is disabled".to_owned()));
         }
@@ -811,11 +823,12 @@ impl PluginRegistry {
         if self.uses_root_host(metadata) {
             return self.launch_root_worker(metadata, shutdown).await.map(Some);
         }
-        let fork_launcher = if self.worker_mode == WorkerMode::Fork {
-            Some(self.ensure_fork_launcher(shutdown).await?)
-        } else {
-            None
-        };
+        let fork_launcher =
+            if self.worker_mode == WorkerMode::Fork && metadata.native_backend.is_none() {
+                Some(self.ensure_fork_launcher(shutdown).await?)
+            } else {
+                None
+            };
         let config = self.launch_config(fork_launcher.as_ref(), None);
         match launch_worker(&config, metadata, self.events.clone(), shutdown).await {
             Ok(worker) => Ok(Some(worker)),
@@ -1309,6 +1322,8 @@ impl PluginRegistry {
             plugin_root: &self.plugin_root,
             homebrew: &self.homebrew,
             user: &self.user,
+            user_ids: self.user_ids,
+            loader_version: &self.loader_version,
             auth_token: &self.auth_token,
             server_host: &self.server_host,
             server_port: self.server_port,
@@ -1579,6 +1594,24 @@ fn read_plugin_metadata_from_fd(
         })?,
         None => 0,
     };
+    let native_backend = match metadata_json.get("backend") {
+        None => None,
+        Some(Value::String(backend)) if native_backend_components(backend).is_some() => {
+            Some(backend.clone())
+        }
+        Some(_) => {
+            return Err(WorkerError::Error(format!(
+                "Plugin metadata backend must be a relative path inside the plugin: {}",
+                directory_path.join("plugin.json").display()
+            )));
+        }
+    };
+    if native_backend.is_some() && requires_root {
+        return Err(WorkerError::Error(format!(
+            "Native plugin backends do not support the root flag yet: {}",
+            directory_path.join("plugin.json").display()
+        )));
+    }
 
     let package =
         read_json_at(approved_directory.as_ref(), OsStr::new("package.json")).map_err(|error| {
@@ -1606,14 +1639,20 @@ fn read_plugin_metadata_from_fd(
         }
         None => (None, 0),
     };
-    let passive = !is_regular_file_at(approved_directory.as_ref(), OsStr::new("main.py")).map_err(
-        |error| {
+    let has_main_py = is_regular_file_at(approved_directory.as_ref(), OsStr::new("main.py"))
+        .map_err(|error| {
             WorkerError::Error(format!(
                 "Could not inspect plugin entry point {}: {error}",
                 directory_path.join("main.py").display()
             ))
-        },
-    )?;
+        })?;
+    if has_main_py && native_backend.is_some() {
+        return Err(WorkerError::Error(format!(
+            "Plugin has both main.py and a native backend; remove one: {}",
+            directory_path.display()
+        )));
+    }
+    let passive = !has_main_py && native_backend.is_none();
 
     Ok(PluginMetadata {
         name: name.to_owned(),
@@ -1626,6 +1665,7 @@ fn read_plugin_metadata_from_fd(
         version,
         load_type,
         passive,
+        native_backend,
         disabled: disabled_plugins.iter().any(|disabled| disabled == name),
         approved_directory,
         directory_device: directory_stat.st_dev as u64,
@@ -1774,7 +1814,7 @@ fn open_regular_file_at(parent: &impl AsFd, name: &OsStr) -> io::Result<Option<O
     if SFlag::from_bits_truncate(metadata.st_mode) != SFlag::S_IFREG {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "plugin metadata file is not a regular file",
+            "not a regular file",
         ));
     }
     Ok(Some(fd))
@@ -3037,6 +3077,160 @@ async fn start_root_worker(
     Ok((supervisor, socket_path))
 }
 
+/// Starts a plugin's own executable instead of the Python worker. The supervisor
+/// does what the Python worker does before it imports `main.py`: it prepares the
+/// storage folders, sets the SDK environment and runs the plugin as the host user.
+fn spawn_native_backend(
+    config: &WorkerLaunchConfig<'_>,
+    plugin: &PluginMetadata,
+    backend: &str,
+    socket_path: &Path,
+) -> std::result::Result<WorkerSupervisor, WorkerLaunchError> {
+    let failed = |detail: String| {
+        WorkerLaunchError::Failed(format!(
+            "Could not start the native backend of {}: {detail}",
+            display_name(plugin)
+        ))
+    };
+    let executable = open_native_backend(&plugin.approved_directory, backend)
+        .map_err(|error| failed(format!("{backend}: {error}")))?;
+    let account = unistd::User::from_name(config.user)
+        .map_err(|error| failed(format!("could not look up user {}: {error}", config.user)))?
+        .ok_or_else(|| failed(format!("user {} does not exist", config.user)))?;
+    prepare_plugin_storage(config.homebrew, &plugin.directory, config.user_ids)
+        .map_err(|error| failed(format!("could not prepare the plugin folders: {error}")))?;
+
+    let plugin_directory = config.plugin_root.join(&plugin.directory);
+    let storage = |root: &str| config.homebrew.join(root).join(&plugin.directory);
+    // Running the opened descriptor runs exactly the file that was checked above.
+    let mut command = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()));
+    command
+        .arg0(plugin_directory.join(backend))
+        .env("HOME", &account.dir)
+        .env("USER", config.user)
+        .env("DECKY_VERSION", config.loader_version)
+        .env("DECKY_USER", config.user)
+        .env("DECKY_USER_HOME", &account.dir)
+        .env("DECKY_HOME", config.homebrew)
+        .env("DECKY_PLUGIN_SETTINGS_DIR", storage("settings"))
+        .env("DECKY_PLUGIN_RUNTIME_DIR", storage("data"))
+        .env("DECKY_PLUGIN_LOG_DIR", storage("logs"))
+        .env("DECKY_PLUGIN_DIR", &plugin_directory)
+        .env("DECKY_PLUGIN_NAME", &plugin.name)
+        .env("DECKY_PLUGIN_AUTHOR", &plugin.author)
+        .env("DECKY_PLUGIN_SOCKET", socket_path)
+        .env("DECKY_AUTH_TOKEN", config.auth_token)
+        .env("SERVER_HOST", config.server_host)
+        .env("SERVER_PORT", config.server_port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(version) = plugin
+        .version
+        .as_deref()
+        .filter(|version| !version.is_empty())
+    {
+        command.env("DECKY_PLUGIN_VERSION", version);
+    }
+    if platform::effective_user_ids().0 == 0 {
+        // The standard library also drops supplementary groups when it leaves root.
+        command.uid(config.user_ids.0).gid(config.user_ids.1);
+    }
+    command.as_std_mut().process_group(0);
+    command.kill_on_drop(true);
+    let child = command.spawn().map_err(|error| failed(error.to_string()))?;
+    drop(executable);
+    let pid = child.id().expect("a spawned worker has a process ID");
+    Ok(WorkerSupervisor::Direct {
+        child,
+        pid,
+        group: ProcessGroupGuard { pid },
+    })
+}
+
+/// Splits a `plugin.json` backend path into plain names; anything else is refused.
+fn native_backend_components(backend: &str) -> Option<Vec<&OsStr>> {
+    let components = Path::new(backend)
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!components.is_empty()).then_some(components)
+}
+
+/// Opens a native backend below the approved plugin directory. No path component
+/// may be a symbolic link, and the file must be an ELF executable.
+fn open_native_backend(directory: &OwnedFd, backend: &str) -> io::Result<File> {
+    let mut components = native_backend_components(backend).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a relative path inside the plugin",
+        )
+    })?;
+    let name = components.pop().expect("a backend path has a file name");
+    let mut parent = open_directory_at(directory, OsStr::new("."))?;
+    for component in components {
+        parent = open_directory_at(&parent, component)?;
+    }
+    let file = File::from(
+        open_regular_file_at(&parent, name)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file is missing"))?,
+    );
+    let mut magic = [0_u8; 4];
+    match file.read_exact_at(&mut magic, 0) {
+        Ok(()) if magic == *b"\x7fELF" => Ok(file),
+        Ok(()) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not an ELF executable",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not an ELF executable",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+/// Creates `settings`, `data` and `logs` folders for the plugin, as the Python worker does.
+fn prepare_plugin_storage(homebrew: &Path, directory: &str, owner: (u32, u32)) -> io::Result<()> {
+    if matches!(directory, "" | "." | "..") || directory.contains('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid plugin folder name {directory:?}"),
+        ));
+    }
+    let homebrew = open_plugin_directory_fd(homebrew)?;
+    for root in ["settings", "data", "logs"] {
+        let root = open_or_create_directory_at(&homebrew, OsStr::new(root))?;
+        secure_storage_directory(&root, owner, 0o755)?;
+        let storage = open_or_create_directory_at(&root, OsStr::new(directory))?;
+        secure_storage_directory(&storage, owner, 0o700)?;
+    }
+    Ok(())
+}
+
+fn open_or_create_directory_at(parent: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
+    match mkdirat(parent, name, Mode::from_bits_truncate(0o700)) {
+        Ok(()) | Err(Errno::EEXIST) => {}
+        Err(error) => return Err(error.into()),
+    }
+    open_directory_at(parent, name)
+}
+
+fn secure_storage_directory(directory: &OwnedFd, owner: (u32, u32), mode: u32) -> io::Result<()> {
+    if platform::effective_user_ids().0 == 0 {
+        chown_descriptor(directory, owner)?;
+    } else if fstat(directory).map_err(io::Error::from)?.st_uid != owner.0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "folder is not owned by the plugin user",
+        ));
+    }
+    fchmod(directory, Mode::from_bits_truncate(mode)).map_err(io::Error::from)
+}
+
 async fn launch_worker(
     config: &WorkerLaunchConfig<'_>,
     plugin: &PluginMetadata,
@@ -3052,6 +3246,8 @@ async fn launch_worker(
         plugin_root,
         homebrew,
         user,
+        user_ids: _,
+        loader_version: _,
         auth_token,
         server_host,
         server_port,
@@ -3080,8 +3276,9 @@ async fn launch_worker(
         }
         let approved_launch = approved_launch_json(plugin);
 
-        let supervisor = match worker_mode {
-            WorkerMode::Exec => {
+        let supervisor = match (worker_mode, &plugin.native_backend) {
+            (_, Some(backend)) => spawn_native_backend(config, plugin, backend, &socket_path)?,
+            (WorkerMode::Exec, None) => {
                 let mut command = Command::new(worker_executable);
                 let approved_launch_argument =
                     serde_json::to_string(&approved_launch).map_err(|error| {
@@ -3130,7 +3327,7 @@ async fn launch_worker(
                     group: ProcessGroupGuard { pid },
                 }
             }
-            WorkerMode::Fork => {
+            (WorkerMode::Fork, None) => {
                 let Some(launcher) = fork_launcher else {
                     return Err(WorkerLaunchError::Failed(
                         "Fork worker mode has no shared launcher".to_owned(),
@@ -3807,6 +4004,161 @@ mod launcher_failure_tests {
         completed.unwrap().unwrap();
         assert!(registry.shutting_down.load(Ordering::Acquire));
         assert!(!socket_directory.exists());
+    }
+}
+
+#[cfg(test)]
+mod native_backend_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("decky-native-{}", Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_plugin(directory: &Path, backend: Value, flags: &[&str]) {
+        fs::create_dir_all(directory.join("bin")).unwrap();
+        let metadata =
+            json!({"name": "Native", "author": "Unit Test", "flags": flags, "backend": backend});
+        fs::write(directory.join("plugin.json"), metadata.to_string()).unwrap();
+        fs::write(directory.join("bin/backend"), b"\x7fELF-not-run-here").unwrap();
+    }
+
+    fn metadata_error(directory: &Path) -> String {
+        match read_plugin_metadata(directory, &[]) {
+            Ok(_) => panic!("metadata for {} was accepted", directory.display()),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn backend_metadata_replaces_main_py_and_refuses_unsupported_plugins() {
+        let temporary = TestDirectory::new();
+        let plugin = temporary.0.join("native");
+        write_plugin(&plugin, json!("bin/backend"), &[]);
+        let metadata = read_plugin_metadata(&plugin, &[]).unwrap();
+        assert_eq!(metadata.native_backend.as_deref(), Some("bin/backend"));
+        assert!(!metadata.passive);
+
+        fs::write(plugin.join("main.py"), b"pass\n").unwrap();
+        assert!(metadata_error(&plugin).contains("both main.py and a native backend"));
+        fs::remove_file(plugin.join("main.py")).unwrap();
+
+        write_plugin(&plugin, json!("bin/backend"), &["root"]);
+        assert!(metadata_error(&plugin).contains("root flag"));
+
+        for backend in [
+            json!("../outside"),
+            json!("/usr/bin/true"),
+            json!(""),
+            json!("./bin/backend"),
+            json!("bin/../bin/backend"),
+            json!(5),
+        ] {
+            write_plugin(&plugin, backend.clone(), &[]);
+            assert!(
+                metadata_error(&plugin).contains("relative path inside the plugin"),
+                "{backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_is_opened_without_symlinks_and_must_be_elf() {
+        let temporary = TestDirectory::new();
+        let plugin = temporary.0.join("native");
+        write_plugin(&plugin, json!("bin/backend"), &[]);
+        let directory = open_plugin_directory_fd(&plugin).unwrap();
+        open_native_backend(&directory, "bin/backend").unwrap();
+
+        let outside = temporary.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("backend"), b"\x7fELF-outside").unwrap();
+        symlink(&outside, plugin.join("linked")).unwrap();
+        symlink(outside.join("backend"), plugin.join("bin/linked")).unwrap();
+        for (backend, contents, expected) in [
+            ("linked/backend", None, io::ErrorKind::NotADirectory),
+            (
+                "bin/linked",
+                None,
+                io::Error::from_raw_os_error(libc::ELOOP).kind(),
+            ),
+            (
+                "bin/script",
+                Some(&b"#!/bin/sh\n"[..]),
+                io::ErrorKind::InvalidData,
+            ),
+            ("bin/short", Some(&b"\x7fE"[..]), io::ErrorKind::InvalidData),
+        ] {
+            if let Some(contents) = contents {
+                fs::write(plugin.join(backend), contents).unwrap();
+            }
+            let error = open_native_backend(&directory, backend).unwrap_err();
+            assert_eq!(error.kind(), expected, "{backend}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_plugins_skip_the_python_launcher_and_refuse_legacy_calls() {
+        let homebrew = TestDirectory::new();
+        let plugin_root = homebrew.0.join("plugins");
+        let plugin = plugin_root.join("native");
+        write_plugin(&plugin, json!("bin/backend"), &[]);
+        fs::write(plugin.join("bin/backend"), b"#!/bin/sh\n").unwrap();
+        let (events, _) = broadcast::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        // The test binary is not a launcher; starting one would fail the registry.
+        let registry = PluginRegistry::start(
+            WorkerConfiguration {
+                executable: std::env::current_exe().unwrap(),
+                mode: WorkerMode::Fork,
+                bootstrap: WorkerBootstrap::Lean,
+                auth_token: "native-regression".into(),
+                server_host: "127.0.0.1".into(),
+                server_port: 1339,
+                chown_plugin_path: false,
+                loader_version: "dev".into(),
+            },
+            plugin_root,
+            homebrew.0.clone(),
+            std::env::var("USER").expect("test account USER"),
+            platform::effective_user_ids(),
+            events,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+        assert!(registry.fork_launcher.lock().await.is_none());
+
+        let legacy = registry
+            .call("Native", "echo", "{}", true)
+            .await
+            .unwrap_err();
+        assert!(
+            legacy.to_string().contains("legacy method calls"),
+            "{legacy}"
+        );
+        let start = registry
+            .call("Native", "echo", "[]", false)
+            .await
+            .unwrap_err();
+        assert!(
+            start.to_string().contains("not an ELF executable"),
+            "{start}"
+        );
+        registry.shutdown().await;
     }
 }
 

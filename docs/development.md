@@ -8,6 +8,7 @@ This guide covers the source layout, local checks, complete runtime builds, and 
 | --- | --- |
 | `backend-rust/src/` | Rust backend and plugin supervisor. |
 | `backend-rust/native-json/` | Native JSON encoder crate. |
+| `backend-rust/decky-plugin/` | SDK for native (Rust) plugin backends, licensed 0BSD. |
 | `backend-rust/install.py`, `process_observer.py` | Production installer and process-ownership checks shipped in runtime bundles. |
 | `backend-rust/build-config.json`, Cargo files, and `deny.toml` | Pinned build inputs and dependency policy. |
 | `backend/` | Python backend, plugin support code, and frozen-worker packaging. |
@@ -132,6 +133,27 @@ Plugins with the `root` flag run only after root plugin support is enabled; see 
 ### Native JSON for plugins
 
 `decky.native.dumps(value, *, ensure_ascii=True)` calls the compiled `_decky_native_json` encoder. The module loads the extension only when the function is called, so the SDK still imports in a development environment without it. A missing or incompatible extension raises `ImportError`; there is no Python fallback. This is a fork extension to the pinned upstream SDK.
+
+### Native plugin backends
+
+A plugin can ship its own executable instead of `main.py`. Name it in `plugin.json`:
+
+```json
+{ "name": "Example", "author": "Me", "flags": [], "backend": "bin/backend" }
+```
+
+The path must be relative and stay inside the plugin. The loader opens every part of it without following symbolic links and starts the file only if it is an ELF executable. Build for `x86_64-unknown-linux-musl` (or another fully static target) so that SteamOS library updates cannot break the plugin. The installer gives plugin files mode 0755, so the file stays executable.
+
+The loader does for the executable what the Python worker does before it imports `main.py`: it creates the `settings`, `data` and `logs` folders, sets the same `DECKY_*`, `HOME` and `USER` variables, runs it as the host user in its own process group, and stops it with SIGTERM and then SIGKILL after five seconds. The program listens on the Unix socket named by `DECKY_PLUGIN_SOCKET` and speaks the worker protocol: newline-delimited JSON calls (`type` 0), replies (`type` 1) and events (`type` 2), plus `{"uninstall":true}` before an uninstall stop.
+
+The `decky-plugin` crate implements all of this, including a log file in `DECKY_PLUGIN_LOG_DIR` that is named and pruned like the Python `decky.logger` file. It is licensed 0BSD, so a plugin that links it can use any license. `backend-rust/decky-plugin/examples/native_example.rs` is a complete backend. Frontend code does not change: `callable(name)` and `addEventListener(event, …)` work as they do with Python.
+
+Limits:
+
+- A plugin cannot have both `main.py` and `backend`, and native backends cannot use the `root` flag yet. The loader refuses such plugins.
+- Only `loader/call_plugin_method` calls reach a native backend; the legacy `loader/call_legacy_plugin_method` route is refused.
+- This is a fork feature. The upstream loader treats a plugin without `main.py` as frontend-only, so its backend calls fail there.
+- The loader still needs the packaged Python worker at startup, even when every plugin is native, but it does not start the shared Python launcher for native plugins.
 
 ## Validate an owned VM copy
 

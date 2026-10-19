@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "native-json"]
+members = [".", "native-json", "decky-plugin"]
 default-members = ["."]
 resolver = "3"
 

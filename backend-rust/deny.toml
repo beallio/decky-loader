@@ -11,9 +11,11 @@ include-dev = true
 include-build = true
 unused-allowed-license = "warn"
 # Keep GPLv2 compatibility explicit. Apache-2.0-only dependencies are not
-# approved; dual-licensed crates must offer an allowed alternative.
+# approved; dual-licensed crates must offer an allowed alternative. 0BSD is the
+# plugin SDK's own license, so plugins that link it can use any license.
 allow = [
     "GPL-2.0-only",
+    "0BSD",
     "MIT",
     "ISC",
     "BSD-3-Clause",
