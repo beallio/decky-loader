@@ -2776,7 +2776,8 @@ fn is_managed_plugin_directory(plugin_root: &Path, directory: &Path) -> bool {
 }
 
 fn changed_plugin_directory(plugin_root: &Path, source: &Path) -> Option<String> {
-    let mut components = source.strip_prefix(plugin_root).ok()?.components();
+    let relative = source.strip_prefix(plugin_root).ok()?;
+    let mut components = relative.components();
     let directory = match components.next()? {
         std::path::Component::Normal(directory) => directory.to_str()?,
         _ => return None,
@@ -2784,6 +2785,7 @@ fn changed_plugin_directory(plugin_root: &Path, source: &Path) -> Option<String>
     if directory.starts_with('.') {
         return None;
     }
+    let plugin = plugin_root.join(directory);
     let is_source = match (components.next(), components.next(), components.next()) {
         (Some(std::path::Component::Normal(file)), None, None) => file == "main.py",
         (
@@ -2792,12 +2794,25 @@ fn changed_plugin_directory(plugin_root: &Path, source: &Path) -> Option<String>
             None,
         ) => dist == "dist" && file == "index.js",
         _ => false,
-    };
-    if is_source && plugin_root.join(directory).join("plugin.json").is_file() {
+    } || relative
+        .strip_prefix(directory)
+        .is_ok_and(|file| is_native_backend_file(&plugin, file));
+    if is_source && plugin.join("plugin.json").is_file() {
         Some(directory.to_owned())
     } else {
         None
     }
+}
+
+/// Whether `file` is the native backend named in the plugin's `plugin.json`. This only
+/// selects a reload; the import reads and checks the metadata again.
+fn is_native_backend_file(plugin: &Path, file: &Path) -> bool {
+    read_json(&plugin.join("plugin.json")).is_ok_and(|metadata| {
+        metadata
+            .get("backend")
+            .and_then(Value::as_str)
+            .is_some_and(|backend| Path::new(backend) == file)
+    })
 }
 
 /// Directories whose attributes changed, as seen by the plugin root watcher.
@@ -4073,6 +4088,18 @@ mod native_backend_tests {
                 "{backend}"
             );
         }
+    }
+
+    #[test]
+    fn rebuilding_the_native_backend_selects_its_plugin_for_live_reload() {
+        let temporary = TestDirectory::new();
+        let plugin = temporary.0.join("native");
+        write_plugin(&plugin, json!("bin/backend"), &[]);
+        let changed = |file: &str| changed_plugin_directory(&temporary.0, &plugin.join(file));
+        assert_eq!(changed("bin/backend").as_deref(), Some("native"));
+        assert_eq!(changed("bin/other"), None);
+        assert_eq!(changed("backend"), None);
+        assert_eq!(changed("main.py").as_deref(), Some("native"));
     }
 
     #[test]

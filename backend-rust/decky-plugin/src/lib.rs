@@ -227,6 +227,7 @@ impl Plugin {
     /// kills the process. SIGTERM or SIGINT stops the plugin at any time,
     /// including during migration.
     pub async fn run(self) -> io::Result<()> {
+        set_process_name(&env::var("DECKY_PLUGIN_NAME").unwrap_or_default());
         if let Err(error) = init_logging() {
             eprintln!("Could not open the plugin log file: {error}");
         }
@@ -396,6 +397,19 @@ impl Plugin {
     }
 }
 
+/// Names the process after the plugin, as the Python worker does, so that `ps`, `top`
+/// and Decky's status show the plugin. Linux keeps the first 15 bytes.
+fn set_process_name(name: &str) {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return;
+    };
+    if name.as_bytes().is_empty() {
+        return;
+    }
+    // SAFETY: PR_SET_NAME reads a NUL-terminated string; the kernel copies at most 16 bytes.
+    unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
+}
+
 fn boxed_hook<F, Fut>(hook: F) -> Hook
 where
     F: FnOnce(Context) -> Fut + Send + 'static,
@@ -495,7 +509,8 @@ fn local_time() -> (String, String, u32) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let seconds = now.as_secs() as libc::time_t;
+    // The type comes from localtime_r; naming libc::time_t warns on musl targets.
+    let seconds = now.as_secs() as _;
     // SAFETY: `tm` is plain data; all-zero bytes are a valid value.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: both pointers refer to live locals; localtime_r writes only `tm`.
@@ -760,6 +775,20 @@ mod tests {
             *results.lock().unwrap(),
             [io::ErrorKind::NotConnected, io::ErrorKind::NotConnected]
         );
+    }
+
+    #[test]
+    fn process_takes_the_plugin_name() {
+        // Runs on its own thread, so naming it does not affect other tests.
+        let comm = || fs::read_to_string("/proc/thread-self/comm").unwrap();
+        std::thread::spawn(move || {
+            set_process_name("Native Example Plugin");
+            assert_eq!(comm(), "Native Example \n");
+            set_process_name("");
+            assert_eq!(comm(), "Native Example \n");
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
