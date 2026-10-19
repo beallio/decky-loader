@@ -104,6 +104,8 @@ python3 scripts/runtime/build.py \
   --output "${TMPDIR:-/var/tmp/omp-1000}/decky-runtime"
 ```
 
+For repeated `dev` builds, add `--cargo-target-dir DIR` to reuse Rust compiler output between runs; CI does this with a cache. The builder refuses this option for a release version, so release builds always compile from a clean directory.
+
 The output directory must not already exist. A successful build produces:
 
 - `bundle/`, containing the complete runtime;

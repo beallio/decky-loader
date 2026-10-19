@@ -22,11 +22,22 @@ jobs:
       - name: Set up pinned Rust toolchain
         run: rustup toolchain install 1.98.1 --profile minimal
 
+      # Official release binaries, pinned by SHA-256; compiling them took over five minutes.
       - name: Install pinned audit tools
         run: |
-          cargo +1.98.1 install --locked --version 0.22.2 cargo-audit
-          cargo +1.98.1 install --locked --version 0.20.2 cargo-deny
-          cargo +1.98.1 install --locked --version 0.9.2 cargo-machete
+          set -euo pipefail
+          bin="$RUNNER_TEMP/audit-bin"
+          mkdir -p "$bin"
+          while read -r repo tag asset sha256; do
+            gh release download "$tag" --repo "$repo" --pattern "$asset" --dir "$RUNNER_TEMP"
+            echo "$sha256  $RUNNER_TEMP/$asset" | sha256sum --check --strict
+            tar -xzf "$RUNNER_TEMP/$asset" -C "$bin" --strip-components=1 --wildcards '*/cargo-*'
+          done <<'TOOLS'
+          rustsec/rustsec cargo-audit/v0.22.2 cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+          EmbarkStudios/cargo-deny 0.20.2 cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+          bnjbvr/cargo-machete v0.9.2 cargo-machete-v0.9.2-x86_64-unknown-linux-musl.tar.gz 48200087f54c55aabcd4db4af1e25742b49846c02a1b1bfa134711945b35b2e9
+          TOOLS
+          echo "$bin" >> "$GITHUB_PATH"
 
       - name: Fetch current official advisory database
         run: gh repo clone RustSec/advisory-db "$RUSTSEC_ADVISORY_DB" -- --depth 1

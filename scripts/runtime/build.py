@@ -69,7 +69,10 @@ def source_snapshot(destination: Path) -> dict[str, str]:
     }
 
 
-def build(output: Path, release_version: str, python_archive: Path | None) -> dict[str, object]:
+def build(output: Path, release_version: str, python_archive: Path | None,
+          cargo_target_dir: Path | None = None) -> dict[str, object]:
+    if cargo_target_dir is not None and release_version != 'dev':
+        raise ValueError('a release build must compile from a clean target directory; omit --cargo-target-dir')
     if platform.system() != 'Linux' or platform.machine() != 'x86_64':
         raise RuntimeError('this build targets Linux x86-64 only')
     if output.exists():
@@ -90,6 +93,8 @@ def build(output: Path, release_version: str, python_archive: Path | None) -> di
     environment = dict(tool_environment, TMPDIR=str(temporary_root), PYTHONDONTWRITEBYTECODE='1', HUSKY='0', CI='true')
     with tempfile.TemporaryDirectory(prefix='decky-runtime-build-', dir=temporary_root) as temporary:
         work = Path(temporary)
+        # Dev builds may reuse compiler output (a CI cache); releases always start clean.
+        target = cargo_target_dir or work / 'cargo-target'
         source = work / 'source'
         source_hashes = source_snapshot(source)
         python_config = CONFIG['python']
@@ -118,18 +123,18 @@ def build(output: Path, release_version: str, python_archive: Path | None) -> di
         run(['pnpm', 'install', '--frozen-lockfile'], cwd=source / 'frontend', env=environment)
         run(['pnpm', 'run', 'build'], cwd=source / 'frontend', env=environment)
         run(['cargo', 'build', '--release', '--locked', '--package', RUNTIME_NAME, '--manifest-path',
-             str(source / 'backend-rust/Cargo.toml'), '--target-dir', str(work / 'cargo-target')], env=environment)
+             str(source / 'backend-rust/Cargo.toml'), '--target-dir', str(target)], env=environment)
         native_environment = dict(worker_environment, PYO3_PYTHON=str(worker_python))
         run(['cargo', 'build', '--locked', '--profile', 'native', '--package', 'decky-native-json',
              '--features', 'extension-module', '--manifest-path', str(source / 'backend-rust/Cargo.toml'),
-             '--target-dir', str(work / 'cargo-target')], env=native_environment)
+             '--target-dir', str(target)], env=native_environment)
         native_modules = work / 'native-modules'
         native_modules.mkdir()
         extension_suffix = capture([str(worker_python), '-c',
                                     'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))'],
                                    env=worker_environment)
         native_module = native_modules / f'_decky_native_json{extension_suffix}'
-        shutil.copy2(work / 'cargo-target/native/lib_decky_native_json.so', native_module)
+        shutil.copy2(target / 'native/lib_decky_native_json.so', native_module)
         run([str(worker_python), '-m', 'unittest', 'discover', '-s',
              str(source / 'tests/native-json'), '-p', 'test_*.py'],
             env=dict(native_environment, PYTHONPATH=str(native_modules)))
@@ -149,7 +154,7 @@ def build(output: Path, release_version: str, python_archive: Path | None) -> di
         }
         from prepare_bundle import prepare
         result = prepare(work / 'worker-dist/DeckyPluginWorker/DeckyPluginWorker',
-                         work / f'cargo-target/release/{RUNTIME_NAME}',
+                         target / f'release/{RUNTIME_NAME}',
                          source / 'backend/decky_loader/static', source / 'backend/decky_loader/locales',
                          output, release_version, build_provenance=provenance, source_root=source)
     artifact = output / f'{ARTIFACT_NAME}.zip'
@@ -172,9 +177,12 @@ def main() -> None:
     parser.add_argument('--output', type=Path, required=True, help='new output directory for the complete bundle and ZIP')
     parser.add_argument('--release-version', default='dev', help='Rust release identity; Python SDK version remains pinned')
     parser.add_argument('--python-archive', type=Path, help='reuse the pinned CPython archive instead of downloading it')
+    parser.add_argument('--cargo-target-dir', type=Path,
+                        help='reuse this Cargo target directory (dev builds only; releases build clean)')
     args = parser.parse_args()
     print(json.dumps(build(args.output.expanduser().resolve(), args.release_version,
-                           args.python_archive.expanduser().resolve() if args.python_archive else None)))
+                           args.python_archive.expanduser().resolve() if args.python_archive else None,
+                           args.cargo_target_dir.expanduser().resolve() if args.cargo_target_dir else None)))
 
 
 if __name__ == '__main__':
