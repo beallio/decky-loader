@@ -259,7 +259,7 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
                       label: (
                         <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
                           {version.name}
-                          {version.store !== storePlugin.store && version.store && (
+                          {version.store && (version.store !== storePlugin.store || version.prerelease) && (
                             <span style={{ fontSize: '11px', color: '#969696' }}>
                               {version.prerelease ? t('PluginCard.plugin_prerelease') : storeLabel(version.store)}
                             </span>

@@ -14,6 +14,7 @@ import {
   migrateStoreSettings,
   providerVersion,
   storeSources,
+  withoutPrereleases,
 } from './storeSources';
 import { getSetting, setSetting } from './utils/settings';
 
@@ -156,7 +157,8 @@ export async function getPluginList(force = false): Promise<{
   stale: { url: string; fetchedAt: number }[];
   fetchedAt: number | null;
 }> {
-  const sources = storeSources(await getStoreSettings());
+  const settings = await getStoreSettings();
+  const sources = storeSources(settings);
   // Forget lists of stores that were removed from the settings. Storage errors only cost the clean-up.
   try {
     for (const key of Object.keys(localStorage)) {
@@ -175,7 +177,12 @@ export async function getPluginList(force = false): Promise<{
     Date.now(),
     force,
   );
-  return { ...mergePluginLists(results), stale, fetchedAt };
+  // Fork: a repository's GitHub pre-releases show only with "Include pre-releases". They are
+  // removed after the cache, so switching the setting takes effect without a refresh.
+  const shown = settings.includePrereleases
+    ? results
+    : results.map(({ source, value }) => ({ source, value: value && withoutPrereleases(value) }));
+  return { ...mergePluginLists(shown), stale, fetchedAt };
 }
 
 async function fetchVersionList(storeURL: string, signal: AbortSignal): Promise<UpdateEndpointVersions> {
@@ -193,7 +200,9 @@ async function fetchVersionList(storeURL: string, signal: AbortSignal): Promise<
   }
   // Fork: a store that cannot answer <store URL>/versions (for example a single
   // plugins.json file) still gets update checks, from its full plugin list.
-  return versionsFromPluginList(await fetchPluginList(storeURL, signal));
+  const plugins = await fetchPluginList(storeURL, signal);
+  const { includePrereleases } = await getStoreSettings();
+  return versionsFromPluginList(includePrereleases ? plugins : withoutPrereleases(plugins));
 }
 
 function versionsFromPluginList(plugins: StorePlugin[]): UpdateEndpointVersions {

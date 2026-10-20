@@ -70,8 +70,9 @@ interface GithubRelease {
 
 /**
  * The store list of a GitHub repository: name, author, tags, description and picture from its
- * plugin.json, one version per published release that has exactly one .zip, with a SHA-256 digest. GitHub
- * pre-releases and drafts are left out. No installable release gives an empty list.
+ * plugin.json, one version per published release that has exactly one .zip, with a SHA-256 digest.
+ * GitHub pre-releases are kept with `prerelease: true` (see `withoutPrereleases`); drafts are left
+ * out. No installable release gives an empty list.
  */
 export function githubRepoPlugins(pluginJson: unknown, releases: unknown): StorePlugin[] {
   const info = pluginJson as {
@@ -85,7 +86,7 @@ export function githubRepoPlugins(pluginJson: unknown, releases: unknown): Store
   const versions: StorePluginVersion[] = [];
   let downloads = 0;
   for (const release of releases as GithubRelease[]) {
-    if (release.draft !== false || release.prerelease !== false || typeof release.tag_name !== 'string') continue;
+    if (release.draft !== false || typeof release.tag_name !== 'string') continue;
     // Only a release with exactly one .zip is used: with several, the plugin download is not known.
     const zips = (release.assets ?? []).filter(
       (asset) => typeof asset.name === 'string' && asset.name.toLowerCase().endsWith('.zip'),
@@ -104,6 +105,7 @@ export function githubRepoPlugins(pluginJson: unknown, releases: unknown): Store
       hash: (asset.digest as string).slice('sha256:'.length),
       artifact: asset.browser_download_url as string,
       created: typeof release.published_at === 'string' ? release.published_at : undefined,
+      prerelease: release.prerelease === true,
     });
     if (typeof asset.download_count === 'number') downloads += asset.download_count;
   }
@@ -127,6 +129,19 @@ export function githubRepoPlugins(pluginJson: unknown, releases: unknown): Store
       versions,
     },
   ];
+}
+
+/**
+ * The lists without versions marked as pre-releases (only GitHub repository stores mark them).
+ * A plugin left without versions is dropped; the dates of a shortened plugin follow its remaining versions.
+ */
+export function withoutPrereleases(plugins: StorePlugin[]): StorePlugin[] {
+  return plugins.flatMap((plugin) => {
+    const versions = (plugin.versions ?? []).filter((version) => version.prerelease !== true);
+    if (versions.length === (plugin.versions ?? []).length) return [plugin];
+    if (!versions.length) return [];
+    return [{ ...plugin, versions, created: versions[versions.length - 1].created, updated: versions[0].created }];
+  });
 }
 
 /** The repository page of a GitHub artifact URL (https://github.com/<owner>/<repo>/...), or null. */
@@ -219,7 +234,7 @@ export function mergePluginLists(results: SourceResult<StorePlugin[]>[]): {
       const versions: StorePluginVersion[] = (plugin.versions ?? []).map((version) => ({
         ...version,
         store: source.url,
-        prerelease: source.prerelease,
+        prerelease: source.prerelease || version.prerelease === true,
       }));
       const provider = byName.get(plugin.name);
       if (!provider) {

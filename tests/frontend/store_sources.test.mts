@@ -20,6 +20,7 @@ import {
   providerVersion,
   restoreStoreView,
   tagGroups,
+  withoutPrereleases,
 } from '../../frontend/src/storeSources.ts';
 
 const official = { url: OFFICIAL_STORE, prerelease: false };
@@ -70,17 +71,37 @@ test('a repository store lists published releases that have a .zip with a SHA-25
   ];
   const [plugin] = githubRepoPlugins(info, releases);
   assert.deepEqual(
-    plugin.versions.map(({ name, hash }) => [name, hash[0]]),
+    plugin.versions.map(({ name, hash, prerelease }) => [name, hash[0], prerelease]),
     [
-      ['1.2.0', 'b'],
-      ['1.0.0', 'a'],
+      ['2.0.0-pre', 'c', true],
+      ['1.2.0', 'b', false],
+      ['1.0.0', 'a', false],
     ],
   );
   assert.deepEqual(plugin.tags, ['tools', 'root']);
-  assert.equal(plugin.downloads, 7);
+  assert.equal(plugin.downloads, 8);
   assert.equal(plugin.created, '2026-01-01T00:00:00Z');
-  assert.equal(plugin.updated, '2026-02-01T00:00:00Z');
+  assert.equal(plugin.updated, '2026-03-01T00:00:00Z');
   assert.equal(githubRepoUrl(plugin.versions[0].artifact), 'https://github.com/o/r');
+
+  // Without "Include pre-releases": the pre-release goes, and the update date follows the newest kept version.
+  const [stable] = withoutPrereleases([plugin]);
+  assert.deepEqual(
+    stable.versions.map(({ name }) => name),
+    ['1.2.0', '1.0.0'],
+  );
+  assert.equal(stable.updated, '2026-02-01T00:00:00Z');
+  const onlyPre = githubRepoPlugins(info, [releases[0]]);
+  assert.equal(onlyPre.length, 1);
+  assert.deepEqual(withoutPrereleases(onlyPre), []);
+
+  // With it: the merged list keeps the mark, so the version list labels it as a pre-release.
+  const repo = { url: 'https://github.com/o/r', prerelease: false };
+  const merged = mergePluginLists([{ source: repo, value: [plugin] }]).plugins[0];
+  assert.deepEqual(
+    merged.versions.map(({ prerelease }) => prerelease),
+    [true, false, false],
+  );
 });
 
 test('a release with several .zip files is left out, in any asset order', () => {

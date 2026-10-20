@@ -348,7 +348,7 @@
             "label": "Pre-release stores"
         },
         "prereleases": {
-            "desc": "Also show pre-release versions and plugins from the pre-release stores.",
+            "desc": "Also show pre-release versions and plugins from the pre-release stores, and the GitHub pre-releases of added repositories.",
             "label": "Include pre-releases"
         },
         "stores": {
