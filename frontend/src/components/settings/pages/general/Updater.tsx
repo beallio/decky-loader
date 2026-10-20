@@ -65,7 +65,10 @@ function PatchNotesModal({ versionInfo, closeModal }: { versionInfo: VerInfo | n
               }}
             >
               <div>
-                <h1>{versionInfo?.all?.[id]?.name || 'Invalid Update Name'}</h1>
+                {/* Fork: notes without links had nothing to focus, so the modal took no input and B could not close it. */}
+                <Focusable onActivate={() => {}} noFocusRing>
+                  <h1>{versionInfo?.all?.[id]?.name || 'Invalid Update Name'}</h1>
+                </Focusable>
                 {versionInfo?.all?.[id]?.body ? (
                   <WithSuspense>
                     <MarkdownRenderer onDismiss={closeModal}>{versionInfo.all[id].body}</MarkdownRenderer>
