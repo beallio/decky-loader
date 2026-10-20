@@ -265,8 +265,8 @@ def worker_description(path: Path, temp_dir: Path) -> dict[str, object]:
         raise BenchmarkError(f'{path} --describe did not return JSON: {error}') from error
     if not isinstance(description, dict):
         raise BenchmarkError(f'{path} --describe returned a non-object')
-    if not str(description.get('python', '')).startswith('3.11.'):
-        raise BenchmarkError(f'{path} is not the required CPython 3.11 worker: {description}')
+    if not str(description.get('python', '')).startswith('3.14.'):
+        raise BenchmarkError(f'{path} is not the required CPython 3.14 worker: {description}')
     if not SDK_TAG.fullmatch(str(description.get('decky_version'))) or description.get('frozen') is not True:
         raise BenchmarkError(f'{path} does not describe a frozen Decky worker on an upstream release tag: {description}')
     return description

@@ -52,7 +52,7 @@ name = "aiohttp"
 version = "{aiohttp}"
 dependencies = [
     {{ name = "async-timeout", marker = "python_full_version < '3.11'" }},
-    {{ name = "typing-extensions", marker = "python_full_version < '3.13'" }},
+    {{ name = "typing-extensions", marker = "python_full_version >= '3.11'" }},
 ]
 
 [package.optional-dependencies]
@@ -89,11 +89,11 @@ class ParityTest(unittest.TestCase):
                          ["brotli: upstream absent, fork 1.1.0"])
 
     def test_markers_are_evaluated_for_the_shipped_target(self):
-        windows_only = uv_lock().replace("python_full_version < '3.13'", "sys_platform == 'win32'")
+        windows_only = uv_lock().replace("python_full_version >= '3.11'", "sys_platform == 'win32'")
         self.assertEqual(python_parity.differences(POETRY, windows_only, {}),
                          ["typing-extensions: upstream 4.16.0, fork absent"])
-        upstream_on_311 = POETRY.replace('python_version == "3.10"', 'python_version < "3.12"')
-        self.assertEqual(python_parity.differences(upstream_on_311, uv_lock(), {}),
+        upstream_on_target = POETRY.replace('python_version == "3.10"', 'python_version >= "3.11"')
+        self.assertEqual(python_parity.differences(upstream_on_target, uv_lock(), {}),
                          ["async-timeout: upstream 5.0.1, fork absent"])
 
     def test_unknown_marker_syntax_fails_closed(self):

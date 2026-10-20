@@ -31,7 +31,6 @@ These parts of the official Decky Loader are removed or work differently in this
 - **No administrator plugins from a ZIP file.** You can install these plugins only from a store or from an `https://` address.
 - **A password for each administrator plugin.** Decky asks for your password each time you install or update one of these plugins. If your account can use `sudo` without a password, you cannot install these plugins.
 - **Updates come only from this fork.** Decky's update button installs new versions of this fork, not official versions. To go back to the official Decky, see [Undo](#undo).
-- **Plugins use Python 3.11.** The official Decky `v3.3.0` uses Python 3.14. Most plugins work with both. A few plugins include files made for one Python version, so they can work in one Decky and not in the other.
 - **No warning when you add a store.** The official Decky shows a warning when you use a store that is not official. This fork does not. Add only stores that you trust.
 - **The file browser shows only what your account can open.** When a plugin asks you to choose a file, you cannot open folders that only the administrator can read.
 - **Plugins cannot start or stop SSH through Decky.** This needs administrator access.
@@ -191,6 +190,8 @@ The `resources` part of the output shows how much CPU and memory Decky and each 
 - **A plugin shows "This plugin needs root".** See [Plugins that need administrator access](#plugins-that-need-administrator-access).
 - **A plugin shows "Decky could not start".** The plugin did not start. Update or remove it in Decky's settings.
 - **An update in Decky stops or fails, and your version is `v3.2.10-rust.8-rc.1` to `rc.10`.** These versions cannot update themselves to `v3.3.0` or later. Run the install command one time with `--channel preview`. After that, updates in Decky work again.
+- **An update in Decky fails with "bundle requires a frozen CPython 3.11 worker".** Versions up to `v3.3.0-rust.1-rc.12` cannot update themselves to a version that uses Python 3.14. Run the install command one time with `--channel preview`. After that, updates in Decky work again.
+- **A plugin stopped working after an update to a version with Python 3.14.** This fork now uses Python 3.14.8, the same as the official Decky `v3.3.0`. A few plugins include files made only for Python 3.11. Ask the plugin's author for a version that works with the official Decky `v3.3.0`.
 - **Another program uses port 1337 or 8080.** Decky needs these ports. Syncthing often uses port 8080. Change Syncthing to port 8384.
 - **The script stops because there is not enough space.** Delete some files, or use `--backup-dir` to choose a different folder, and try again. The script stops before it changes anything.
 - **The install stops before it is complete.** The script puts back the previous version. It shows where it saved a log file. When you [report a problem](https://github.com/beallio/decky-loader/issues), attach that file or the ZIP file from [collect-debug-info.sh](scripts/collect-debug-info.sh).

@@ -102,7 +102,7 @@ async def main(base: str, privileged: bool, expected_version: str, expected_user
 
             modern = await client.call('loader/call_plugin_method', 'Rust Probe Modern', 'compute', [3, 4])
             assert modern['total'] == 25 and modern['alias'] and modern['user'] == account.pw_uid, modern
-            assert modern['python'].startswith('3.11.'), modern
+            assert modern['python'].startswith('3.14.'), modern
             assert modern['native_modules'] == ['aiohttp._http_parser', 'multidict._multidict'], modern
             legacy = await client.call('loader/call_legacy_plugin_method', 'Rust Probe Legacy', 'compute', {'values': [3, 4]})
             assert legacy['success'] and legacy['result']['total'] == 25 and legacy['result']['user'] == account.pw_uid, legacy

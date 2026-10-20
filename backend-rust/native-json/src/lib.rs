@@ -30,19 +30,6 @@ impl Drop for Recursion {
     }
 }
 
-struct DictSnapshot<'py>(Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>);
-
-impl Drop for DictSnapshot<'_> {
-    fn drop(&mut self) {
-        // Match CPython's list-of-tuples snapshot: reverse pair order, then
-        // value before key. Finalizers can append to an enclosing live list.
-        while let Some((key, value)) = self.0.pop() {
-            drop(value);
-            drop(key);
-        }
-    }
-}
-
 struct Encoder<'py> {
     py: Python<'py>,
     ascii: bool,
@@ -403,13 +390,35 @@ impl<'py> Encoder<'py> {
             if !self.containers.insert(identifier) {
                 return Err(PyValueError::new_err("Circular reference detected"));
             }
-            let encoded = if let Ok(items) = value.cast::<PyDict>() {
+            let encoded = if value.is_instance_of::<PyDict>() {
                 self.bytes.push(b'{');
                 let result = (|| {
                     if value.is_exact_instance_of::<PyDict>() {
-                        let pairs = DictSnapshot(items.iter().collect());
-                        for (index, (key, item)) in pairs.0.iter().enumerate() {
-                            self.pair(index, key, item)?;
+                        // Match CPython 3.14: walk the live dict with PyDict_Next, so
+                        // keys that user code adds or removes while encoding count.
+                        let mut position: ffi::Py_ssize_t = 0;
+                        let mut key = std::ptr::null_mut();
+                        let mut item = std::ptr::null_mut();
+                        let mut index = 0;
+                        // SAFETY: value is a live exact dict and the GIL is held.
+                        // PyDict_Next writes borrowed references, which are made
+                        // owned at once (CPython's Py_INCREF) before user code runs.
+                        while unsafe {
+                            ffi::PyDict_Next(value.as_ptr(), &mut position, &mut key, &mut item)
+                        } != 0
+                        {
+                            let (key, item) = unsafe {
+                                (
+                                    Bound::from_borrowed_ptr(self.py, key),
+                                    Bound::from_borrowed_ptr(self.py, item),
+                                )
+                            };
+                            let result = self.pair(index, &key, &item);
+                            // CPython releases the key before the value.
+                            drop(key);
+                            drop(item);
+                            result?;
+                            index += 1;
                         }
                     } else {
                         // SAFETY: value is a live dict/subclass and the GIL is

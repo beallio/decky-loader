@@ -38,5 +38,13 @@ module-root = ""
 namespace = true
 
 [tool.ty.environment]
-python-version = "3.11"
+python-version = "3.14"
 python-platform = "linux"
+
+# Unchanged upstream file: its Python 3.12+ branch reads __qualname__ from Task.get_coro(),
+# typed as Coroutine. Editing it would add an SDK overlay.
+[[tool.ty.overrides]]
+include = ["decky_loader/main.py"]
+
+[tool.ty.overrides.rules]
+unresolved-attribute = "ignore"

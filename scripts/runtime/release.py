@@ -20,6 +20,7 @@ ASSET_CHECKSUM_NAME = ASSET_NAME + '.sha256'
 STABLE_TAG_PATTERN = r'v[0-9]+\.[0-9]+\.[0-9]+-rust\.[0-9]+'
 PREVIEW_TAG_PATTERN = STABLE_TAG_PATTERN + r'-rc\.[0-9]+'
 PYTHON_RELEASE_REPOSITORY = 'steamdeckhomebrew/decky-loader'
+LIBPYTHON = '_internal/libpython{}.{}.so.1.0'.format(*CONFIG['python']['version'].split('.')[:2])
 
 
 def release_channel(tag: str, requested: str | None = None) -> str:
@@ -141,7 +142,7 @@ def validate(directory: Path, tag: str, source_commit: str, channel: str | None 
         required = executable_names | {'install.py', 'process_observer.py', 'assets/index.js', 'locales/en-US.json'}
         packaging = manifest.get('worker_packaging')
         if packaging == 'onedir':
-            required |= {'_internal/libpython3.11.so.1.0', '_internal/base_library.zip'}
+            required |= {LIBPYTHON, '_internal/base_library.zip'}
         elif packaging != 'onefile':
             raise ValueError('runtime bundle must declare its worker packaging')
         if not required.issubset(hashes):

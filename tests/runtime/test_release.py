@@ -49,7 +49,7 @@ class ReleaseIntegrityTests(unittest.TestCase):
         self.payload = {'decky-loader-runtime': b'backend bytes', 'DeckyPluginWorker': b'worker bytes',
                         'install.py': b'installer fixture', 'process_observer.py': b'observer fixture',
                         'assets/index.js': b'frontend fixture', 'locales/en-US.json': b'{}',
-                        '_internal/libpython3.11.so.1.0': b'CPython fixture',
+                        release.LIBPYTHON: b'CPython fixture',
                         '_internal/base_library.zip': b'standard library fixture'}
         self.runtime = {'python': release.CONFIG['python']['version'], 'decky_version': release.CONFIG['sdk']['tag']}
         self.manifest = {'kind': 'decky-loader-runtime', 'release_version': self.tag, 'worker_packaging': 'onedir',
@@ -159,7 +159,7 @@ class ReleaseIntegrityTests(unittest.TestCase):
             release.validate(self.root, self.tag, self.commit)
 
     def test_rejects_missing_required_payload_even_with_consistent_inventory(self):
-        for name in ('process_observer.py', 'assets/index.js', '_internal/libpython3.11.so.1.0'):
+        for name in ('process_observer.py', 'assets/index.js', release.LIBPYTHON):
             with self.subTest(member=name):
                 data = self.payload.pop(name)
                 checksum = self.manifest['sha256'].pop(name)
