@@ -38,10 +38,6 @@ from process_observer import Process, cgroup_processes, read_process
 
 
 KIND = 'decky-loader-runtime'
-# Bundles may be built on any upstream SDK tag. The installer accepts a bundle
-# when its own records agree (see _validate_bundle), so an installed loader can
-# update to a release on a newer upstream base.
-SDK_TAG = re.compile(r'v\d+\.\d+\.\d+(-pre\d+)?')
 SERVICE_STOP_DIRECTORY = Path('/run/decky-loader-runtime-stops')
 LEGACY_MIGRATION_ROOT = Path('/var/lib/decky-loader-runtime/legacy-migrations')
 # On SteamOS /var is a small partition (about 230 MB) and each runtime is about
@@ -980,29 +976,11 @@ def _validate_bundle(bundle_value: str, user: pwd.struct_passwd) -> tuple[Path, 
     release_version = manifest.get('release_version')
     if not isinstance(release_version, str) or not release_version or any(ord(character) < 32 or ord(character) == 127 for character in release_version):
         _fail('bundle has no valid Rust release identity')
-    source = manifest.get('source_baseline')
-    if not isinstance(source, dict) or not isinstance(source.get('tag'), str) or not SDK_TAG.fullmatch(source['tag']):
-        _fail('bundle has no valid upstream source baseline tag')
-    for field in ('commit', 'backend_tree', 'frontend_tree'):
-        value = source.get(field)
-        if not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{40}', value):
-            _fail(f'bundle source baseline has invalid {field}')
-    cargo_hash = manifest.get('cargo_lock_sha256')
-    if not isinstance(cargo_hash, str) or not re.fullmatch(r'[0-9a-f]{64}', cargo_hash):
-        _fail('bundle has invalid Cargo.lock checksum metadata')
+    # Only checks that protect this device. Build facts (Python, SDK baseline, packaging) are
+    # enforced in CI before release; repeating them here makes old installers block new releases.
     runtime = manifest.get('runtime')
     if not isinstance(runtime, dict):
         _fail('bundle has no worker runtime description')
-    # Any 3.11 or newer worker: an installed loader must accept a release that moves to a newer Python.
-    python = runtime.get('python')
-    version = re.fullmatch(r'3\.(\d+)\.\d+', python) if isinstance(python, str) else None
-    if runtime.get('frozen') is not True or version is None or int(version[1]) < 11:
-        _fail('bundle requires a frozen CPython 3.11 or newer worker')
-    if runtime.get('decky_version') != source['tag']:
-        _fail(f'worker does not report the bundle source baseline {source["tag"]}')
-    packaging = manifest.get('worker_packaging')
-    if packaging not in ('onefile', 'onedir'):
-        _fail('bundle has an unsupported worker packaging variant')
     hashes = manifest.get('sha256')
     if not isinstance(hashes, dict) or not hashes:
         _fail('bundle manifest has no checksums')
@@ -1049,11 +1027,6 @@ def _validate_bundle(bundle_value: str, user: pwd.struct_passwd) -> tuple[Path, 
     for required in (RUST_EXECUTABLE, WORKER_EXECUTABLE, 'install.py', 'process_observer.py', 'assets/index.js', 'locales/en-US.json'):
         if required not in expected_paths:
             _fail(f'bundle is missing required member {required}')
-    runtime_tree = bundle / '_internal'
-    if packaging == 'onedir' and (not runtime_tree.is_dir() or runtime_tree.is_symlink() or not any(runtime_tree.rglob('*'))):
-        _fail('onedir worker bundle is missing its _internal runtime')
-    if packaging == 'onefile' and runtime_tree.exists() and not runtime_tree.is_dir():
-        _fail('_internal must be a real directory when present')
     rust = bundle / RUST_EXECUTABLE
     worker_path = bundle / WORKER_EXECUTABLE
     for path in (rust, worker_path):

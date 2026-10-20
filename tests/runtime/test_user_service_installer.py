@@ -70,36 +70,31 @@ class UserServiceInstallerTests(unittest.TestCase):
         self.assertEqual(validated, bundle)
         self.assertEqual(parsed["release_version"], "v1.2.3-rust.4")
 
-    def test_bundles_on_another_upstream_base_need_matching_records(self):
-        # An installed loader must accept a release built on a newer upstream base.
+    def test_build_facts_of_a_newer_release_do_not_block_installation(self):
+        # The installed installer checks new releases; build facts are CI's job, not its.
         user = pwd.getpwuid(os.geteuid())
-        for sdk_tag, worker_version, accepted in (
-            ("v3.3.0-pre1", "v3.3.0-pre1", True),
-            ("v3.3.0", "v3.3.0", True),
-            ("v3.3.0", "v3.2.10", False),
-            ("main", "main", False),
+        for sdk_tag, worker_version, worker_python in (
+            ("v3.3.0", "v3.3.0", "3.14.8"),
+            ("v4.0.0-rc1", "v4.0.0-rc1", "3.15.0"),
+            ("main", "v3.2.10", "3.10.13"),
         ):
-            with self.subTest(sdk_tag=sdk_tag, worker_version=worker_version), tempfile.TemporaryDirectory() as temporary:
+            with self.subTest(sdk_tag=sdk_tag, worker_python=worker_python), tempfile.TemporaryDirectory() as temporary:
                 bundle = Path(temporary)
-                self.write_bundle(bundle, sdk_tag, worker_version)
-                if accepted:
-                    installer._validate_bundle(str(bundle), user)
-                else:
-                    with self.assertRaises(installer.InstallerError):
-                        installer._validate_bundle(str(bundle), user)
+                self.write_bundle(bundle, sdk_tag, worker_version, worker_python)
+                installer._validate_bundle(str(bundle), user)
 
-    def test_bundle_worker_must_be_cpython_311_or_newer(self):
-        # An installed loader must accept a release that moves to a newer Python.
+    def test_changed_or_unlisted_bundle_files_are_rejected(self):
         user = pwd.getpwuid(os.geteuid())
-        for worker_python, accepted in (("3.11.9", True), ("3.14.8", True), ("3.10.13", False), ("3.14", False)):
-            with self.subTest(worker_python=worker_python), tempfile.TemporaryDirectory() as temporary:
+        for change in ("modify", "add"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
                 bundle = Path(temporary)
-                self.write_bundle(bundle, "v3.3.0", "v3.3.0", worker_python)
-                if accepted:
-                    installer._validate_bundle(str(bundle), user)
+                self.write_bundle(bundle, "v3.3.0", "v3.3.0")
+                if change == "modify":
+                    (bundle / "assets/index.js").write_bytes(b"tampered")
                 else:
-                    with self.assertRaisesRegex(installer.InstallerError, "3.11 or newer worker"):
-                        installer._validate_bundle(str(bundle), user)
+                    (bundle / "assets/extra.js").write_bytes(b"unlisted")
+                with self.assertRaisesRegex(installer.InstallerError, "checksum"):
+                    installer._validate_bundle(str(bundle), user)
 
     def test_manager_unit_directory_comes_from_structured_manager_path(self):
         user = pwd.getpwuid(os.geteuid())
