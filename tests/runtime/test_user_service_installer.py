@@ -96,6 +96,26 @@ class UserServiceInstallerTests(unittest.TestCase):
                 with self.assertRaisesRegex(installer.InstallerError, "checksum"):
                     installer._validate_bundle(str(bundle), user)
 
+    def test_update_hands_over_to_the_bundle_installer_only_when_it_matches_the_manifest(self):
+        argv = ["install.py", "queue-install-bundle", "--bundle", "B", "--version", "v1.2.3-rust.4"]
+        for tampered in (False, True):
+            with self.subTest(tampered=tampered), tempfile.TemporaryDirectory() as temporary:
+                bundle = Path(temporary)
+                self.write_bundle(bundle, "v3.3.0", "v3.3.0")
+                if tampered:
+                    (bundle / "install.py").write_bytes(b"changed installer")
+                with patch.object(installer.os, "execv") as execv, patch.object(installer.sys, "argv", argv):
+                    if tampered:
+                        with self.assertRaisesRegex(installer.InstallerError, "checksum"):
+                            installer._hand_over_to_bundle_installer(str(bundle))
+                        execv.assert_not_called()
+                    else:
+                        installer._hand_over_to_bundle_installer(str(bundle))
+                        execv.assert_called_once_with(
+                            installer.sys.executable,
+                            [installer.sys.executable, "-B", str(bundle / "install.py"), *argv[1:]],
+                        )
+
     def test_manager_unit_directory_comes_from_structured_manager_path(self):
         user = pwd.getpwuid(os.geteuid())
         with tempfile.TemporaryDirectory() as temporary:

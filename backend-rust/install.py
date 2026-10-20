@@ -2456,6 +2456,25 @@ def _cleanup_handoff_payloads(directory: Path) -> None:
     _fsync_directory(directory)
 
 
+def _hand_over_to_bundle_installer(bundle_value: str) -> None:
+    """Re-run this command with the new bundle's own installer.
+
+    The running loader starts its installed installer for an in-app update. Handing over lets
+    each release check and set up itself, so old installer code cannot block a new release.
+    """
+    bundle = Path(bundle_value)
+    installer = bundle / 'install.py'
+    if installer.resolve() == Path(__file__).resolve():
+        return
+    manifest_path = bundle / 'bundle.json'
+    if bundle.is_symlink() or manifest_path.is_symlink() or installer.is_symlink() or not installer.is_file():
+        _fail('bundle installer is missing or unsafe')
+    expected = _read_json(manifest_path).get('sha256')
+    if not isinstance(expected, dict) or not isinstance(expected.get('install.py'), str) or _digest(installer) != expected['install.py']:
+        _fail('bundle installer does not match its manifest checksum')
+    os.execv(sys.executable, [sys.executable, '-B', str(installer), *sys.argv[1:]])
+
+
 def _start_queued_activation(paths: dict[str, Any], request_id: str) -> dict[str, object]:
     unit = f'decky-updater-{request_id}'
     command = [
@@ -2468,7 +2487,10 @@ def _start_queued_activation(paths: dict[str, Any], request_id: str) -> dict[str
         '--property=KillMode=control-group',
         '--property=TimeoutStartSec=infinity',
         sys.executable,
-        str(Path(__file__).resolve(strict=True)),
+        # -B: no __pycache__ in the bundle, whose file list must still match its manifest.
+        '-B',
+        # The queued bundle's own installer activates it; this file may have moved with the bundle.
+        str((_request_directory(paths, request_id) / 'bundle' / 'install.py').resolve(strict=True)),
         'activate-queued',
         '--homebrew', str(paths['homebrew']),
         '--service-name', paths['unit'].stem,
@@ -6184,6 +6206,8 @@ def main() -> int:
     args = parser.parse_args()
     try:
         _require_system_python()
+        if args.command == 'queue-install-bundle':
+            _hand_over_to_bundle_installer(args.bundle)
         if args.command == 'legacy-user-stop':
             output = _run_legacy_user_stop(args)
         elif args.command == 'enable-root-plugins':

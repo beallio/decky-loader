@@ -77,6 +77,45 @@ jobs:
           name: decky-loader-runtime-linux-x86_64
           path: ${{ runner.temp }}/runtime-release
 
+      - name: Read pinned Python
+        id: config
+        run: printf 'python=%s\n' "$(jq -r .python.version backend-rust/build-config.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ steps.config.outputs.python }}
+
+      # An installed loader runs its own installer first when it updates in Decky, so the newest
+      # published release must accept this bundle; otherwise users need a bridge release.
+      - name: Check the bundle with the previous release's installer
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/runtime-release
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          previous="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName // empty')"
+          if [[ -z "$previous" ]]; then
+            echo "No published release yet; nothing to check."
+            exit 0
+          fi
+          check="$RUNNER_TEMP/previous-installer-check"
+          mkdir -p "$check/previous" "$check/bundle"
+          gh release download "$previous" --repo "$GITHUB_REPOSITORY" \
+            --pattern decky-loader-runtime-linux-x86_64.zip --dir "$check"
+          unzip -q "$check/decky-loader-runtime-linux-x86_64.zip" install.py process_observer.py -d "$check/previous"
+          unzip -q "$ARTIFACT_DIR/decky-loader-runtime-linux-x86_64.zip" -d "$check/bundle"
+          python3 -B - "$check/previous/install.py" "$check/bundle" "$previous" <<'PY'
+          import importlib.util, os, pwd, sys
+          installer, bundle, previous = sys.argv[1:4]
+          sys.path.insert(0, os.path.dirname(installer))
+          spec = importlib.util.spec_from_file_location('previous_installer', installer)
+          module = sys.modules['previous_installer'] = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          module._validate_bundle(bundle, pwd.getpwuid(os.geteuid()))
+          print(f'The {previous} installer accepts this bundle.')
+          PY
+
       - name: Verify release identity and every payload checksum
         env:
           ARTIFACT_DIR: ${{ runner.temp }}/runtime-release
