@@ -70,7 +70,7 @@ A plugin can also have a backend written in Rust instead of Python (see [For plu
 | Memory used by Decky and plugins (MB) | 119.6 | 18.3 | 101.3 MB less (85% less) |
 | Memory for each extra plugin (MB) | 6.9 | 1.1 | 5.8 MB less (84% less) |
 | Time to start (seconds) | 0.60 | 0.29 | 0.31 s faster (52% faster) |
-| Time to stop (seconds) | 0.069 | 0.013 | 0.056 s faster (82% faster) |
+| Time to stop (seconds) | 0.034 | 0.013 | 0.021 s faster (62% faster) |
 | CPU time for one plugin call (microseconds) | 113 | 87 | 23% less |
 | Time for one plugin call (microseconds) | 154 | 125 | 19% faster |
 
@@ -84,6 +84,7 @@ How we measured:
 - Each plugin answered one simple request. Real plugins do more work, so they use more memory and CPU.
 - The Rust plugins were copies of the example plugin in [`native_example.rs`](backend-rust/decky-plugin/examples/native_example.rs).
 - We ran each test 5 times, with 1, 4, 8, and 12 plugins. The table shows the average.
+- For the stop time, we ran all the tests again and stopped Decky in the same way as the installed service does.
 
 ## Install
 
