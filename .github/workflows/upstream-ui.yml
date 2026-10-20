@@ -1,0 +1,81 @@
+name: Upstream UI Library
+
+on:
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-ui
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Compare the @decky/ui version with upstream
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      UPSTREAM: SteamDeckHomebrew/decky-loader
+      LIBRARY: SteamDeckHomebrew/decky-frontend-lib
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Compare, then open, update or close the tracking issue
+        run: |
+          set -euo pipefail
+          # The resolved version, from the lockfile's package keys '@decky/ui@X.Y.Z':. Read all input:
+          # stopping early would kill the gh writer with SIGPIPE under pipefail.
+          locked() { grep -oP "^  '@decky/ui@\K[^']+(?=':)" | sort -u; }
+          upstream_locked() {
+            gh api -H 'Accept: application/vnd.github.raw' "repos/$UPSTREAM/contents/frontend/pnpm-lock.yaml?ref=$1" | locked
+          }
+          ours="$(locked < frontend/pnpm-lock.yaml)"
+          main="$(upstream_locked main)"
+          release="$(gh release view -R "$UPSTREAM" --json tagName --jq .tagName)"
+          released="$(upstream_locked "$release")"
+          library="$(gh release view -R "$LIBRARY" --json tagName --jq .tagName)"
+          existing="$(gh issue list --label upstream-ui --state open --limit 1 --json number --jq '.[0].number // empty')"
+
+          if [[ "$main" == "$ours" && "$released" == "$ours" ]]; then
+            echo "Upstream main and $release lock @decky/ui $ours, the same as this fork."
+            if [[ -n "$existing" ]]; then
+              gh issue close "$existing" --comment "Upstream main and $release now lock @decky/ui $ours, the same as this fork."
+            fi
+            exit 0
+          fi
+
+          body="$RUNNER_TEMP/upstream-ui.md"
+          {
+            echo "Upstream Decky Loader locks a different \`@decky/ui\` version than this fork."
+            echo
+            echo "| Where | \`@decky/ui\` |"
+            echo "|---|---|"
+            echo "| This fork (\`frontend/pnpm-lock.yaml\`) | $ours |"
+            echo "| Upstream \`main\` | $main |"
+            echo "| Upstream release $release | $released |"
+            echo "| Newest decky-frontend-lib release | $library |"
+            echo
+            echo "Recent upstream commits that change \`frontend/pnpm-lock.yaml\`:"
+            echo
+            gh api "repos/$UPSTREAM/commits?path=frontend/pnpm-lock.yaml&per_page=5" \
+              --jq '.[] | "- [`\(.sha[0:7])`](\(.html_url)) \(.commit.committer.date[0:10]) \(.commit.message | split("\n")[0])"'
+            echo
+            echo "Plugins use the loader's copy of this library at runtime. Before the fork moves to a new version, check the [UI library section](https://github.com/$GH_REPO/blob/main/docs/development.md#ui-library) of the development guide."
+          } > "$body"
+
+          title="Upstream decky-loader locks @decky/ui $main"
+          gh label create upstream-ui --force \
+            --description "Upstream Decky Loader uses a different @decky/ui version" --color 1D76DB
+          if [[ -n "$existing" ]]; then
+            gh issue edit "$existing" --title "$title" --body-file "$body"
+          else
+            gh issue create --label upstream-ui --title "$title" --body-file "$body"
+          fi

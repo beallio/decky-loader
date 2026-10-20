@@ -216,3 +216,18 @@ To move to a new upstream tag:
 4. Set `version` in `backend/pyproject.toml` to the new tag without the `v`. For each package that the report lists, match upstream: change the dependency range in `pyproject.toml` if upstream changed it, then `UV_NO_CONFIG=1 uv lock --upgrade-package NAME==VERSION` in `backend`. `python3 scripts/runtime/python_parity.py` must pass.
 5. Run the local checks and a complete build.
 6. Release as `vX.Y.Z-rust.N` (use `-rc.N` for a preview). See [Release validation and publication](#release-validation-and-publication).
+
+### UI library
+
+The frontend uses `@decky/ui` (decky-frontend-lib). Keep the version that the pinned SDK tag locks in `frontend/pnpm-lock.yaml`; `frontend/package.json` and the lockfile are upstream files, so a different version needs `SDK_OVERLAYS` entries. The `Upstream UI Library` workflow runs every day and can be started by hand. It compares the locked version with upstream `main` and the newest upstream release. When either differs, it opens one issue with the `upstream-ui` label and updates it on later runs. When both match again, it closes the issue.
+
+The loader sets `window.DFL` to its own copy of `@decky/ui`, and plugins read the library from there at runtime. A new version that removes exports breaks plugins built against the old one. Version 4.16.0 removed these runtime exports from the package root. Before the fork uses 4.16.0 or later, add them back on `window.DFL` as aliases, unless upstream has done so:
+
+| Removed export | Value in 4.16.0 `dist` | Difference |
+|---|---|---|
+| `QuickAccessTab` | `EQuickAccessTab` in `globals/stores/steamuistore/menu.js` | `Music` (7) is now `Soundtrack`; keep `Music: 7` in the alias |
+| `SideMenu` | `ESideMenu` in `globals/stores/steamuistore/menu.js` | none |
+| `EResult`, `EUIComposition` | `globals/steam-client/shared.js` | none |
+| `EBrowserType`, `ESteamRealm`, `EUIMode` | `globals/shared/enums.js` | none |
+
+`window.DFL` is a frozen module namespace, and some exports are `let` bindings that change later (`modules`, `Navigation`). Do not copy it with spread; add the aliases on an object that has the namespace as its prototype. The loader's own imports of `QuickAccessTab` and `EUIMode` also need the new deep paths, because 4.16.0 does not export `EQuickAccessTab`, `ESideMenu` or `EUIMode` from the root.
