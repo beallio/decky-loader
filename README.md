@@ -67,7 +67,7 @@ After this, `--restore-legacy` cannot work.
 
 The plugin store shows plugins from several stores at the same time. By default these are [Decky Extended](https://decky-extended-plugins.beallio.com/) and the official store. To change them, open Decky's settings, then **General**:
 
-- **Add store** adds another store by its web address.
+- **Add store** adds another store by its web address. You can also add one plugin's GitHub page, for example `https://github.com/owner/repo`. Decky then reads the plugin's name, author, tags, description and picture from the `plugin.json` file in the repository, and shows each published release that has exactly one `.zip` file as a version. GitHub pre-releases are not shown, and neither are releases with several `.zip` files, because Decky cannot tell which one is the plugin. Older releases may not show: GitHub only gives a checksum for files uploaded since mid-2025, and Decky does not install a file without one. GitHub allows about 60 checks per hour from one network, so add only a few repositories.
 - Press **X** on the list to change the order, move a store with up and down, then press **X** again to save. When two stores have the same plugin, the higher store provides it, and only that store sends you update notices for it. Versions that only a lower store has still show in the plugin's version list.
 - **Include pre-releases** adds the test stores (official testing and Decky Extended testing). Their versions show after the normal ones. Plugins that exist only in a test store also appear.
 

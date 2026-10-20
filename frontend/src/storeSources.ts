@@ -45,11 +45,88 @@ export interface MergedStorePlugin extends StorePlugin {
 
 export function storeLabel(url: string): string {
   if (KNOWN_STORES[url]) return KNOWN_STORES[url];
+  const repo = githubRepo(url);
+  if (repo) return repo;
   try {
     return new URL(url).host || url;
   } catch {
     return url;
   }
+}
+
+/** "owner/repo" when a store URL is a GitHub repository page (https://github.com/<owner>/<repo>), else null. */
+export function githubRepo(url: string): string | null {
+  const match = /^https:\/\/github\.com\/([A-Za-z0-9-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(url);
+  return match ? `${match[1]}/${match[2]}` : null;
+}
+
+interface GithubRelease {
+  tag_name?: unknown;
+  draft?: unknown;
+  prerelease?: unknown;
+  published_at?: unknown;
+  assets?: { name?: unknown; digest?: unknown; browser_download_url?: unknown; download_count?: unknown }[];
+}
+
+/**
+ * The store list of a GitHub repository: name, author, tags, description and picture from its
+ * plugin.json, one version per published release that has exactly one .zip, with a SHA-256 digest. GitHub
+ * pre-releases and drafts are left out. No installable release gives an empty list.
+ */
+export function githubRepoPlugins(pluginJson: unknown, releases: unknown): StorePlugin[] {
+  const info = pluginJson as {
+    name?: unknown;
+    author?: unknown;
+    flags?: unknown;
+    publish?: { tags?: unknown; description?: unknown; image?: unknown };
+  } | null;
+  if (!info || typeof info.name !== 'string' || !info.name) throw new Error('plugin.json has no plugin name');
+  if (!Array.isArray(releases)) throw new Error('GitHub did not return a release list');
+  const versions: StorePluginVersion[] = [];
+  let downloads = 0;
+  for (const release of releases as GithubRelease[]) {
+    if (release.draft !== false || release.prerelease !== false || typeof release.tag_name !== 'string') continue;
+    // Only a release with exactly one .zip is used: with several, the plugin download is not known.
+    const zips = (release.assets ?? []).filter(
+      (asset) => typeof asset.name === 'string' && asset.name.toLowerCase().endsWith('.zip'),
+    );
+    const asset = zips.length === 1 ? zips[0] : null;
+    if (
+      !asset ||
+      typeof asset.digest !== 'string' ||
+      !/^sha256:[0-9a-f]{64}$/.test(asset.digest) ||
+      typeof asset.browser_download_url !== 'string' ||
+      !asset.browser_download_url.startsWith('https://')
+    )
+      continue;
+    versions.push({
+      name: release.tag_name.replace(/^v(?=\d)/, ''),
+      hash: (asset.digest as string).slice('sha256:'.length),
+      artifact: asset.browser_download_url as string,
+      created: typeof release.published_at === 'string' ? release.published_at : undefined,
+    });
+    if (typeof asset.download_count === 'number') downloads += asset.download_count;
+  }
+  if (!versions.length) return [];
+  versions.sort((a, b) => (Date.parse(b.created ?? '') || 0) - (Date.parse(a.created ?? '') || 0));
+  const publish = info.publish ?? {};
+  const tags = Array.isArray(publish.tags) ? publish.tags.filter((tag): tag is string => typeof tag === 'string') : [];
+  // The store marks root plugins with a 'root' tag; a repository has the flag in plugin.json instead.
+  if (Array.isArray(info.flags) && info.flags.includes('root') && !tags.includes('root')) tags.push('root');
+  return [
+    {
+      id: 0,
+      name: info.name,
+      author: typeof info.author === 'string' ? info.author : '',
+      description: typeof publish.description === 'string' ? publish.description : '',
+      tags,
+      image_url: typeof publish.image === 'string' ? publish.image : '',
+      created: versions[versions.length - 1].created,
+      updated: versions[0].created,
+      downloads,
+      versions,
+    },
+  ];
 }
 
 /** The repository page of a GitHub artifact URL (https://github.com/<owner>/<repo>/...), or null. */

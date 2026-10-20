@@ -6,6 +6,8 @@ import {
   MergedStorePlugin,
   SourceResult,
   StoreSettings,
+  githubRepo,
+  githubRepoPlugins,
   loadFromEachStore,
   loadWithCache,
   mergePluginLists,
@@ -106,11 +108,24 @@ async function fromEachStore<T>(load: (url: string, signal: AbortSignal) => Prom
 }
 
 async function fetchPluginList(storeURL: string, signal: AbortSignal): Promise<StorePlugin[]> {
-  const response = await storeFetch(storeURL, signal);
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  const plugins = await response.json();
+  const repo = githubRepo(storeURL);
+  if (repo) {
+    // Fork: a GitHub repository as a store: plugin.json from its default branch, versions from its releases.
+    const [info, releases] = await Promise.all([
+      fetchJSON(`https://raw.githubusercontent.com/${repo}/HEAD/plugin.json`, signal),
+      fetchJSON(`https://api.github.com/repos/${repo}/releases?per_page=100`, signal),
+    ]);
+    return githubRepoPlugins(info, releases);
+  }
+  const plugins = await fetchJSON(storeURL, signal);
   if (!Array.isArray(plugins)) throw new Error('the store did not return a plugin list');
   return plugins;
+}
+
+async function fetchJSON(url: string, signal: AbortSignal): Promise<unknown> {
+  const response = await storeFetch(url, signal);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
 }
 
 // Fork: each store's plugin list is saved in localStorage for 6 hours (update checks stay live).
@@ -164,14 +179,17 @@ export async function getPluginList(force = false): Promise<{
 }
 
 async function fetchVersionList(storeURL: string, signal: AbortSignal): Promise<UpdateEndpointVersions> {
-  try {
-    const response = await storeFetch(storeURL + '/versions', signal);
-    if (response.ok) {
-      const versions = await response.json();
-      if (versions && typeof versions === 'object' && !Array.isArray(versions)) return versions;
+  // A GitHub repository has no /versions; its plugin list is small.
+  if (!githubRepo(storeURL)) {
+    try {
+      const response = await storeFetch(storeURL + '/versions', signal);
+      if (response.ok) {
+        const versions = await response.json();
+        if (versions && typeof versions === 'object' && !Array.isArray(versions)) return versions;
+      }
+    } catch (e) {
+      console.debug(`Store version list of ${storeURL} unavailable, using the plugin list`, e);
     }
-  } catch (e) {
-    console.debug(`Store version list of ${storeURL} unavailable, using the plugin list`, e);
   }
   // Fork: a store that cannot answer <store URL>/versions (for example a single
   // plugins.json file) still gets update checks, from its full plugin list.
@@ -195,7 +213,14 @@ export async function installFromURL(url: string) {
 
 export async function requestPluginInstall(plugin: string, selectedVer: StorePluginVersion, installType: InstallType) {
   const artifactUrl = selectedVer.artifact ?? pluginUrl(selectedVer.hash);
-  await installPlugin(artifactUrl, plugin, selectedVer.name, selectedVer.hash, installType, selectedVer.store);
+  await installPlugin(
+    artifactUrl,
+    plugin,
+    selectedVer.name,
+    selectedVer.hash,
+    installType,
+    countingStore(selectedVer.store),
+  );
 }
 
 export async function requestMultiplePluginInstalls(requests: PluginInstallRequest[]) {
@@ -206,9 +231,14 @@ export async function requestMultiplePluginInstalls(requests: PluginInstallReque
       version: selectedVer.name,
       hash: selectedVer.hash,
       install_type: installType,
-      store_url: selectedVer.store,
+      store_url: countingStore(selectedVer.store),
     })),
   );
+}
+
+// Fork: a GitHub repository has no install counter.
+function countingStore(store: string | undefined): string | undefined {
+  return store && !githubRepo(store) ? store : undefined;
 }
 
 export async function checkForPluginUpdates(plugins: (Plugin | DisabledPlugin)[]): Promise<PluginUpdateMapping> {

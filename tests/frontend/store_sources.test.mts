@@ -10,6 +10,8 @@ import {
   OFFICIAL_TESTING_STORE,
   STORE_CACHE_MS,
   filterStorePlugins,
+  githubRepo,
+  githubRepoPlugins,
   githubRepoUrl,
   loadFromEachStore,
   loadWithCache,
@@ -31,6 +33,70 @@ const plugin = (name: string, ...versions: string[]) => ({
   tags: [],
   image_url: '',
   versions: versions.map((version) => ({ name: version, hash: `${name}-${version}`, artifact: null })),
+});
+
+const digest = (char: string) => `sha256:${char.repeat(64)}`;
+const ghRelease = (tag: string, published: string, assets: object[], extra: object = {}) => ({
+  tag_name: tag,
+  draft: false,
+  prerelease: false,
+  published_at: published,
+  assets,
+  ...extra,
+});
+const ghZip = (char: string, downloads = 1) => ({
+  name: 'Plugin.zip',
+  digest: digest(char),
+  browser_download_url: `https://github.com/o/r/releases/download/${char}/Plugin.zip`,
+  download_count: downloads,
+});
+
+test('only a GitHub repository page is a repository store', () => {
+  assert.equal(githubRepo('https://github.com/owner/repo'), 'owner/repo');
+  assert.equal(githubRepo('https://github.com/owner/my.repo.git/'), 'owner/my.repo');
+  assert.equal(githubRepo('https://github.com/owner/repo/releases'), null);
+  assert.equal(githubRepo('http://github.com/owner/repo'), null);
+  assert.equal(githubRepo(OFFICIAL_STORE), null);
+});
+
+test('a repository store lists published releases that have a .zip with a SHA-256 digest', () => {
+  const info = { name: 'Plugin', author: 'me', flags: ['root'], publish: { tags: ['tools'], description: 'd', image: 'i' } };
+  const releases = [
+    ghRelease('v2.0.0-pre', '2026-03-01T00:00:00Z', [ghZip('c')], { prerelease: true }),
+    ghRelease('v1.2.0', '2026-02-01T00:00:00Z', [ghZip('b', 5)]),
+    ghRelease('v1.1.0', '2026-01-15T00:00:00Z', [{ ...ghZip('x'), digest: null }]),
+    ghRelease('v1.0.5', '2026-01-10T00:00:00Z', [ghZip('d')], { draft: true }),
+    ghRelease('1.0.0', '2026-01-01T00:00:00Z', [{ name: 'notes.txt' }, ghZip('a', 2)]),
+  ];
+  const [plugin] = githubRepoPlugins(info, releases);
+  assert.deepEqual(
+    plugin.versions.map(({ name, hash }) => [name, hash[0]]),
+    [
+      ['1.2.0', 'b'],
+      ['1.0.0', 'a'],
+    ],
+  );
+  assert.deepEqual(plugin.tags, ['tools', 'root']);
+  assert.equal(plugin.downloads, 7);
+  assert.equal(plugin.created, '2026-01-01T00:00:00Z');
+  assert.equal(plugin.updated, '2026-02-01T00:00:00Z');
+  assert.equal(githubRepoUrl(plugin.versions[0].artifact), 'https://github.com/o/r');
+});
+
+test('a release with several .zip files is left out, in any asset order', () => {
+  const debug = { ...ghZip('e'), name: 'Plugin-debug.zip' };
+  for (const assets of [
+    [ghZip('a'), debug],
+    [debug, ghZip('a')],
+  ]) {
+    assert.deepEqual(githubRepoPlugins({ name: 'Plugin' }, [ghRelease('v1.0.0', '2026-01-01T00:00:00Z', assets)]), []);
+  }
+});
+
+test('a repository store without an installable release lists nothing, and a bad plugin.json fails', () => {
+  assert.deepEqual(githubRepoPlugins({ name: 'Plugin' }, [ghRelease('v1', '2026-01-01T00:00:00Z', [])]), []);
+  assert.throws(() => githubRepoPlugins({ author: 'me' }, []));
+  assert.throws(() => githubRepoPlugins({ name: 'Plugin' }, { message: 'API rate limit exceeded' }));
 });
 
 test('a store that did not answer holds back updates from the stores below it', () => {

@@ -355,7 +355,7 @@
             "desc": "When two stores have the same plugin, the higher store provides it. Press X to change the order.",
             "label": "Plugin stores"
         },
-        "url_label": "Store URL"
+        "url_label": "Store URL or GitHub repository (https://github.com/owner/repo)"
     },
     "Testing": {
         "download": "Download",
