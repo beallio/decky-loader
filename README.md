@@ -1,16 +1,95 @@
 # Decky Loader (Rust fork)
 
-Decky Loader adds plugins to the Steam Deck's Gaming Mode. Plugins can [restyle menus](https://github.com/suchmememanyskill/SDH-CssLoader), [change system sounds](https://github.com/EMERALD0874/SDH-AudioLoader), [adjust colors](https://github.com/libvibrant/vibrantDeck), and [more](https://plugins.deckbrew.xyz/).
+Decky Loader adds plugins to the Steam Deck's Gaming Mode. Plugins can [restyle menus](https://github.com/suchmememanyskill/SDH-CssLoader), [change system sounds](https://github.com/EMERALD0874/SDH-AudioLoader), [adjust colors](https://github.com/libvibrant/vibrantDeck), and [do much more](https://plugins.deckbrew.xyz/).
 
-This fork keeps the normal Decky menus and Python plugins, but replaces the background service with a Rust version. It runs as your normal `deck` account instead of the administrator (root) account. Plugins that need administrator access do not run unless you turn on [root plugin support](#plugins-that-need-administrator-access).
+This is a modified copy (a "fork") of Decky Loader. It looks and works like the normal Decky, and your current plugins still work. The difference is the part that runs in the background: this fork replaces it with a smaller, faster program written in the Rust programming language. It also runs with your normal `deck` account, not with the administrator (root) account.
 
-This is not the official Decky Loader. For the official version, see [SteamDeckHomebrew/decky-loader](https://github.com/SteamDeckHomebrew/decky-loader).
+This is not the official Decky Loader. For the official version, go to [SteamDeckHomebrew/decky-loader](https://github.com/SteamDeckHomebrew/decky-loader).
+
+## What this fork adds
+
+These features are not in the official Decky Loader:
+
+- **Faster and lighter.** Decky starts and stops faster and uses less memory and CPU. See [Speed and memory](#speed-and-memory).
+- **No administrator access by default.** Decky and your plugins run with your normal `deck` account, not as administrator. Plugins can still read and change your account's files, so install only plugins that you trust.
+- **Safer administrator plugins.** Plugins that need administrator access run only if you turn them on. Before each install or update of such a plugin, Decky shows a warning and asks for your password. See [Plugins that need administrator access](#plugins-that-need-administrator-access).
+- **More than one plugin store.** The store page shows plugins from several stores at the same time, in the order that you choose. The [Decky Extended](https://decky-extended-plugins.beallio.com/) store is included by default.
+- **Plugins from GitHub.** You can add a plugin's GitHub page as a store, and get its new versions as updates.
+- **A better store page.** You can sort plugins by update date and filter them by store, tag, installed plugins, administrator access, and source code. Each plugin shows when it was last updated, a warning if it needs administrator access, and a button to its GitHub page.
+- **Stores that are slow or offline do not stop the store page.** Decky waits at most 20 seconds for each store. It saves each store's list for 6 hours and shows the saved list when a store does not answer.
+- **Update notices for more stores.** Decky finds plugin updates also in custom stores that the official Decky cannot check for updates.
+- **An install script that protects your data.** It saves a copy of your plugins and settings before each change. It can undo an update, move you from the official Decky to this fork, and move you back.
+- **Plugin CPU and memory use.** The status command shows how much CPU and memory each plugin uses.
+- **More options for plugin authors.** Plugins can have a backend written in Rust instead of Python, and Python plugins get a fast JSON encoder. See [For plugin authors](#for-plugin-authors).
+
+## What this fork removes or limits
+
+These parts of the official Decky Loader are removed or work differently in this fork:
+
+- **Steam Deck and Linux PCs only.** This fork works only on 64-bit Intel or AMD Linux computers that use systemd, such as the Steam Deck. It does not work on ARM devices, Windows, or macOS.
+- **Plugins that need administrator access do not run by default.** The official Decky runs them without asking. In this fork, you must [turn them on](#plugins-that-need-administrator-access) first.
+- **No administrator plugins from a ZIP file.** You can install these plugins only from a store or from an `https://` address.
+- **A password for each administrator plugin.** Decky asks for your password each time you install or update one of these plugins. If your account can use `sudo` without a password, you cannot install these plugins.
+- **Updates come only from this fork.** Decky's update button installs new versions of this fork, not official versions. To go back to the official Decky, see [Undo](#undo).
+- **Plugins use Python 3.11.** The official Decky `v3.3.0` uses Python 3.14. Most plugins work with both. A few plugins include files made for one Python version, so they can work in one Decky and not in the other.
+- **No warning when you add a store.** The official Decky shows a warning when you use a store that is not official. This fork does not. Add only stores that you trust.
+- **The file browser shows only what your account can open.** When a plugin asks you to choose a file, you cannot open folders that only the administrator can read.
+- **Plugins cannot start or stop SSH through Decky.** This needs administrator access.
+
+## Speed and memory
+
+We compared this fork with the official Decky on the same computer, with the same plugins. In each test, one plugin had no backend, and all the other plugins had a Python backend. Almost all plugins in the stores are of these two types. Smaller numbers are better.
+
+| What we measured (12 plugins, unless noted) | Official Decky | This fork | Difference |
+|---|---|---|---|
+| Memory used by Decky, no plugins (MB) | 38.6 | 8.4 | 30.2 MB less (78% less) |
+| Memory used by Decky and plugins (MB) | 159.4 | 155.6 | 3.8 MB less (2% less) |
+| Time to start (seconds) | 1.94 | 0.88 | 1.06 s faster (55% faster) |
+| Time to stop (seconds) | 5.36 | 0.18 | 5.18 s faster (97% faster) |
+| CPU use while idle (% of one CPU core) | 0.096 | 0.067 | 30% less |
+| CPU time for one plugin call (microseconds) | 222 | 127 | 43% less |
+
+With 4 and 8 plugins, the results were almost the same: the fork used about 3 MB less memory and 40–55% less idle CPU, and started 1.6 to 1.9 seconds faster.
+
+The memory saving is mostly in Decky itself. Each plugin still uses about the same memory as before, because most plugins are written in Python, and this fork still runs them with Python.
+
+How we measured:
+
+- Official Decky `v3.2.10` against this fork's `v3.3.0-rust.1-rc.1`, on 17 October 2026.
+- Each test ran 10 times. The table shows the average.
+- The tests ran in a SteamOS virtual machine, not on a real Steam Deck, and without the Steam user interface. Results on a real Deck can be different.
+- "Memory" is the memory that belongs to Decky and its plugins (PSS). 1 MB here is 1,048,576 bytes.
+
+### Plugins with a Rust backend
+
+A plugin can also have a backend written in Rust instead of Python (see [For plugin authors](#for-plugin-authors)). This only works in this fork. We ran this fork with 12 Python plugins, and then with 12 Rust plugins that did the same simple work.
+
+| What we measured (12 plugins, unless noted) | Python plugins | Rust plugins | Difference |
+|---|---|---|---|
+| Memory used by Decky and plugins, 1 plugin (MB) | 44.2 | 6.6 | 37.6 MB less (85% less) |
+| Memory used by Decky and plugins (MB) | 119.6 | 18.3 | 101.3 MB less (85% less) |
+| Memory for each extra plugin (MB) | 6.9 | 1.1 | 5.8 MB less (84% less) |
+| Time to start (seconds) | 0.60 | 0.29 | 0.31 s faster (52% faster) |
+| Time to stop (seconds) | 0.069 | 0.013 | 0.056 s faster (82% faster) |
+| CPU time for one plugin call (microseconds) | 113 | 87 | 23% less |
+| Time for one plugin call (microseconds) | 154 | 125 | 19% faster |
+
+While idle, both types used about 0.02% of one CPU core, which is almost nothing.
+
+The memory saving is the largest when all your plugins are Rust plugins. When you have at least one Python plugin, Decky also starts a shared Python program for all Python plugins. So if you mix the two types, the saving is smaller. We did not test mixed sets of plugins.
+
+How we measured:
+
+- A development build of this fork from 19 October 2026, on the same SteamOS virtual machine, without the Steam user interface.
+- Each plugin answered one simple request. Real plugins do more work, so they use more memory and CPU.
+- The Rust plugins were copies of the example plugin in [`native_example.rs`](backend-rust/decky-plugin/examples/native_example.rs).
+- We ran each test 5 times, with 1, 4, 8, and 12 plugins. The table shows the average.
 
 ## Install
 
 1. Press the Steam button, open **Power**, and select **Switch to Desktop**.
 2. Download [install-to-deck.sh](scripts/install-to-deck.sh) and save it in your **Downloads** folder.
-3. Open **Konsole** and run:
+3. Open **Konsole** and type:
 
    ```sh
    cd ~/Downloads
@@ -18,26 +97,26 @@ This is not the official Decky Loader. For the official version, see [SteamDeckH
    bash install-to-deck.sh
    ```
 
-   `--check` only tests the download and your Deck. The second command installs the latest stable release.
-4. Return to Gaming Mode.
+   The `--check` command only tests the download and your Deck. It changes nothing. The second command installs the latest stable version.
+4. Go back to Gaming Mode.
 
-You do not need a GitHub account or developer tools. Before each change, the script saves a copy of your `homebrew` folder (plugins and settings) in `~/decky-user-backups`. Use `--backup-dir DIR` to save it somewhere else.
+You do not need a GitHub account or developer tools. Before each change, the script saves a copy of your `homebrew` folder (your plugins and settings) in `~/decky-user-backups`. To save it in a different folder, add `--backup-dir FOLDER`.
 
-To install a test version, add `--channel preview`. To install one exact version, add `--version TAG`, for example `--version v3.2.10-rust.7`.
+To install a test version, add `--channel preview`. To install one specific version, add `--version` and the version name, for example `--version v3.2.10-rust.7`.
 
-### If you already have Decky installed
+### If the official Decky is already installed
 
-The official Decky runs as the administrator account. Move it to this fork with:
+The official Decky runs with the administrator account. To move to this fork, type:
 
 ```sh
 bash install-to-deck.sh --migrate-legacy
 ```
 
-This step asks for your password once. If you have not set a password, run `passwd` first. The script saves the old Decky so that you can put it back later.
+The script asks for your password one time. If you do not have a password, type `passwd` first to make one. The script keeps a copy of the official Decky, so you can go back to it later.
 
 ## Update
 
-Open Decky's settings in Gaming Mode and check for updates. Select **Stable** for normal releases or **Pre-Release** for test versions. You can also run the install command again.
+In Gaming Mode, open Decky's settings and check for updates. Select **Stable** for normal versions or **Pre-Release** for test versions. You can also run the install command again.
 
 ## Undo
 
@@ -47,7 +126,7 @@ To go back to the previous version of this fork:
 bash install-to-deck.sh --undo
 ```
 
-To go back to the official Decky that was installed before you moved to this fork:
+To go back to the official Decky that you had before this fork:
 
 ```sh
 bash install-to-deck.sh --restore-legacy
@@ -55,42 +134,47 @@ bash install-to-deck.sh --restore-legacy
 
 This asks for your password. Undo does not change your plugin data. If you need your old plugin files, they are in the backup folder.
 
-When this fork works well for a few days, you can delete the saved copy of the old Decky to free space:
+When this fork works well for a few days, you can delete the copy of the official Decky to get space back:
 
 ```sh
 bash install-to-deck.sh --forget-legacy
 ```
 
-After this, `--restore-legacy` cannot work.
+After you do this, `--restore-legacy` does not work.
 
 ## Plugin stores
 
-The plugin store shows plugins from several stores at the same time. By default these are [Decky Extended](https://decky-extended-plugins.beallio.com/) and the official store. To change them, open Decky's settings, then **General**:
+The store page shows plugins from more than one store. By default, these are [Decky Extended](https://decky-extended-plugins.beallio.com/) and the official store. To change the stores, open Decky's settings, then **General**.
 
-- **Add store** adds another store by its web address. You can also add one plugin's GitHub page, for example `https://github.com/owner/repo`. Decky then reads the plugin's name, author, tags, description and picture from the `plugin.json` file in the repository, and shows each published release that has exactly one `.zip` file as a version. Releases with several `.zip` files are not shown, because Decky cannot tell which one is the plugin. Older releases may not show: GitHub only gives a checksum for files uploaded since mid-2025, and Decky does not install a file without one. GitHub allows about 60 checks per hour from one network, so add only a few repositories.
-- Press **X** on the list to change the order, move a store with up and down, then press **X** again to save. When two stores have the same plugin, the higher store provides it, and only that store sends you update notices for it. Versions that only a lower store has still show in the plugin's version list.
-- **Include pre-releases** adds the test stores (official testing and Decky Extended testing), and the GitHub pre-releases of the repositories you added. Their versions are marked "Pre-release". Plugins that exist only in a test store also appear. When it is on, a pre-release can be offered as an update.
+- **Add a store.** Select **Add store** and type the store's web address.
+- **Add a plugin from GitHub.** You can also type the GitHub page of one plugin, for example `https://github.com/owner/repo`. Decky then shows the plugin's name, author, tags, description, and picture, and each release of the plugin as a version. Some releases do not show:
+  - Releases with more than one `.zip` file, because Decky cannot know which file is the plugin.
+  - Some older releases. Decky installs a file only when GitHub gives a checksum for it, and GitHub gives checksums only for files uploaded since mid-2025.
 
-If a store does not answer, the store page shows the other stores and a message. Until that store answers again, Decky does not offer updates from the stores below it.
+  GitHub lets one network check about 60 times per hour, so add only a few plugins this way.
+- **Change the order.** Press **X** on the list, move a store up or down, and press **X** again to save. When two stores have the same plugin, Decky uses the store that is higher in the list. Only that store sends you update notices for the plugin. If a lower store has other versions of the plugin, they also show in the plugin's version list.
+- **Test versions.** Turn on **Include pre-releases** to add the test stores (official testing and Decky Extended testing) and the test releases of the GitHub plugins you added. Decky marks these versions "Pre-release", and it can offer them as updates.
+
+If a store does not answer, the store page shows a message and the plugins from the other stores. Until that store answers again, Decky does not offer updates from the stores below it in the list.
 
 ## Plugins that need administrator access
 
-Some plugins, for example PowerTools, need administrator (root) access. By default they do not run, and Decky shows a message for them. To let them run:
+Some plugins, for example PowerTools, need administrator (root) access. By default, these plugins do not run, and Decky shows a message for them. To let them run, type:
 
 ```sh
 bash install-to-deck.sh --enable-root-plugins
 ```
 
-This installs the current version, asks for your `sudo` password once, and lists the installed plugins that need root. Answer `y` to allow them. Only plugins that need root run as root, in a separate background service. Decky itself and all other plugins still run as `deck`.
+This installs the current version of this fork and asks for your password one time. Then it shows the installed plugins that need administrator access. Type `y` to let them run. Only these plugins run as administrator, in a separate background program. Decky and all other plugins still run with your `deck` account.
 
-After this, you install, update and remove plugins that need root in Decky as usual: from the store, from a custom store, or from an `https://` URL in the developer settings. You do not need to run the command again. When Decky updates itself, the root service updates itself to the same version.
+You do this only one time. After this, you install, update, and remove these plugins in Decky as usual: from a store, or from an `https://` address in the developer settings. When Decky updates itself, the administrator program also updates.
 
-Before each install or update of a plugin that needs root, Decky shows a warning. You must wait 10 seconds, switch on "I understand", and type your `sudo` password. The root service checks the password with `sudo` itself. A wrong password stops the install, and after a wrong password you must wait 5 seconds before the next try. If your account can use `sudo` without a password, Decky cannot install plugins that need root.
+Before each install or update of a plugin that needs administrator access, Decky shows a warning. Wait 10 seconds, turn on "I understand", and type your password. If the password is wrong, the install stops, and you must wait 5 seconds before you try again. If your account does not need a password for `sudo`, Decky cannot install these plugins.
 
-- **Cost:** while at least one root plugin is on, one extra background process uses about 25 MB of memory. With no root plugins, nothing extra runs. It uses no CPU while idle.
-- **Risk:** a plugin that runs as root can change anything on your Deck. Install only plugins you trust. Your password is the only check: Decky installs any plugin that you confirm with it, from any place. Plugins that need root cannot come from a local ZIP file. As in the official Decky, a root plugin keeps its settings in your normal Decky folders.
+- **Cost:** when at least one of these plugins is on, one more background program runs. It uses about 25 MB of memory and no CPU while idle. When none of these plugins is on, nothing more runs.
+- **Risk:** a plugin with administrator access can change anything on your Deck. Install only plugins that you trust. Your password is the only check: Decky installs any plugin that you confirm with your password, from any address. You cannot install these plugins from a ZIP file on your Deck. As in the official Decky, these plugins keep their settings in your normal Decky folders.
 
-To turn root plugin support off, run `bash install-to-deck.sh --disable-root-plugins`. Root plugins then stop. Their files, and the settings, data and logs they saved in your `homebrew` folder, become owned by `deck` again. A root plugin's own home folder is `/root`, so anything it saved there stays with root.
+To stop these plugins, type `bash install-to-deck.sh --disable-root-plugins`. Their files, settings, data, and logs in your `homebrew` folder then belong to your `deck` account again. Anything that a plugin saved in the administrator's home folder (`/root`) stays there.
 
 ## Check status
 
@@ -98,27 +182,29 @@ To turn root plugin support off, run `bash install-to-deck.sh --disable-root-plu
 bash install-to-deck.sh --status
 ```
 
-The output also has a `resources` section. It shows CPU and memory for each plugin and for the whole service.
+The `resources` part of the output shows how much CPU and memory Decky and each plugin use.
 
 ## Problems
 
-- **Decky does not appear.** Restart the Deck. If it is still missing, run `--status`, then install again.
+- **Decky does not show.** Restart the Deck. If Decky still does not show, run `--status`, then install again.
 - **A plugin shows "This plugin needs root".** See [Plugins that need administrator access](#plugins-that-need-administrator-access).
-- **A plugin shows "Decky could not start".** The plugin failed to start. Update or remove it in Decky's settings.
-- **An update in Decky stops or fails, and you have version `v3.2.10-rust.8-rc.1` to `rc.10`.** These versions cannot update in Decky to `v3.3.0` and later. Run the install command once with `--channel preview`; after that, updates in Decky work again.
-- **Another program uses port 1337 or 8080.** Decky needs these ports. Syncthing often uses 8080; change Syncthing to 8384.
-- **The script stops with a space error.** Free some storage or choose a different `--backup-dir`, then try again. The script stops before it changes anything.
-- **The install fails part way.** The script puts back the previous version automatically. It prints the location of a log file. Attach that file, or the ZIP from [collect-debug-info.sh](scripts/collect-debug-info.sh), when you [report a problem](https://github.com/beallio/decky-loader/issues).
+- **A plugin shows "Decky could not start".** The plugin did not start. Update or remove it in Decky's settings.
+- **An update in Decky stops or fails, and your version is `v3.2.10-rust.8-rc.1` to `rc.10`.** These versions cannot update themselves to `v3.3.0` or later. Run the install command one time with `--channel preview`. After that, updates in Decky work again.
+- **Another program uses port 1337 or 8080.** Decky needs these ports. Syncthing often uses port 8080. Change Syncthing to port 8384.
+- **The script stops because there is not enough space.** Delete some files, or use `--backup-dir` to choose a different folder, and try again. The script stops before it changes anything.
+- **The install stops before it is complete.** The script puts back the previous version. It shows where it saved a log file. When you [report a problem](https://github.com/beallio/decky-loader/issues), attach that file or the ZIP file from [collect-debug-info.sh](scripts/collect-debug-info.sh).
 
-## Install from another computer
+## Install from a different computer
 
-To install over SSH from a Linux computer, add `--remote HOST`, for example `bash install-to-deck.sh --remote steamdeck`. Run `bash install-to-deck.sh --help` for all options.
+To install over SSH from a Linux computer, add `--remote` and the Deck's name, for example `bash install-to-deck.sh --remote steamdeck`. To see all options, type `bash install-to-deck.sh --help`.
 
 ## For plugin authors
 
-Plugins work as they do in official Decky. Plugins that set the `root` flag run only when the user turns on root plugin support. They see their own folder read-only at the path in `DECKY_PLUGIN_DIR`, and must not write into it. Start with the [plugin template](https://github.com/SteamDeckHomebrew/decky-plugin-template).
+Plugins work as they do in the official Decky. Start with the [plugin template](https://github.com/SteamDeckHomebrew/decky-plugin-template).
 
-This fork also offers a fast JSON encoder to Python plugins:
+Plugins that set the `root` flag run only when the user turns on support for administrator plugins. They can read their own folder at the path in `DECKY_PLUGIN_DIR`, but they cannot write to it.
+
+This fork has a fast JSON encoder for Python plugins:
 
 ```python
 from decky import native
@@ -126,10 +212,12 @@ from decky import native
 text = native.dumps({"name": "Deck", "values": [1, 2, 3]})
 ```
 
-For normal JSON data, `native.dumps` returns the same text as Python's `json.dumps` with its default settings. It also accepts `ensure_ascii=False`. It has no other `json.dumps` options. It is only available when your plugin runs in this fork. If your plugin also supports official Decky, check for it with `hasattr(decky, "native")`.
+For normal JSON data, `native.dumps` gives the same text as Python's `json.dumps` with its default settings. The only option it accepts is `ensure_ascii=False`. It is available only in this fork. If your plugin also supports the official Decky, check for it with `hasattr(decky, "native")`.
+
+A plugin can also have a backend written in Rust (or another compiled language) instead of `main.py`. This plugin does not need Python. It works only in this fork. See [Native plugin backends](docs/development.md#native-plugin-backends).
 
 To build or change this fork, see the [development guide](docs/development.md).
 
 ## Credits
 
-Decky Loader is made by [Steam Deck Homebrew](https://github.com/SteamDeckHomebrew) and its contributors. The original idea is based on [marios8543's Steam Deck UI Inject project](https://github.com/marios8543/steamdeck-ui-inject).
+Decky Loader is made by [Steam Deck Homebrew](https://github.com/SteamDeckHomebrew) and its contributors. The original idea is from [marios8543's Steam Deck UI Inject project](https://github.com/marios8543/steamdeck-ui-inject).
