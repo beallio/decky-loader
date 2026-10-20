@@ -165,9 +165,11 @@ async fn main() -> anyhow::Result<()> {
         .context("decoding worker runtime description")?;
     if runtime["python"]
         .as_str()
-        .is_none_or(|version| !version.starts_with("3.11."))
+        .and_then(|version| version.strip_prefix("3."))
+        .and_then(|rest| rest.split('.').next()?.parse::<u32>().ok())
+        .is_none_or(|minor| minor < 11)
     {
-        bail!("probe requires the CPython 3.11 release-compatibility runtime, received {runtime}");
+        bail!("the runtime requires a CPython 3.11 or newer worker, received {runtime}");
     }
     let sdk_version = runtime["decky_version"]
         .as_str()

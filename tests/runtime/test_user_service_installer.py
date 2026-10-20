@@ -25,7 +25,7 @@ from process_observer import Process
 
 
 class UserServiceInstallerTests(unittest.TestCase):
-    def write_bundle(self, bundle: Path, sdk_tag: str, worker_version: str) -> None:
+    def write_bundle(self, bundle: Path, sdk_tag: str, worker_version: str, worker_python: str = "3.11.9") -> None:
         files = {
             "decky-loader-runtime": b"rust executable",
             "DeckyPluginWorker": b"worker executable",
@@ -53,7 +53,7 @@ class UserServiceInstallerTests(unittest.TestCase):
             "cargo_lock_sha256": "d" * 64,
             "runtime": {
                 "frozen": True,
-                "python": "3.11.9",
+                "python": worker_python,
                 "decky_version": worker_version,
             },
             "worker_packaging": "onefile",
@@ -86,6 +86,19 @@ class UserServiceInstallerTests(unittest.TestCase):
                     installer._validate_bundle(str(bundle), user)
                 else:
                     with self.assertRaises(installer.InstallerError):
+                        installer._validate_bundle(str(bundle), user)
+
+    def test_bundle_worker_must_be_cpython_311_or_newer(self):
+        # An installed loader must accept a release that moves to a newer Python.
+        user = pwd.getpwuid(os.geteuid())
+        for worker_python, accepted in (("3.11.9", True), ("3.14.8", True), ("3.10.13", False), ("3.14", False)):
+            with self.subTest(worker_python=worker_python), tempfile.TemporaryDirectory() as temporary:
+                bundle = Path(temporary)
+                self.write_bundle(bundle, "v3.3.0", "v3.3.0", worker_python)
+                if accepted:
+                    installer._validate_bundle(str(bundle), user)
+                else:
+                    with self.assertRaisesRegex(installer.InstallerError, "3.11 or newer worker"):
                         installer._validate_bundle(str(bundle), user)
 
     def test_manager_unit_directory_comes_from_structured_manager_path(self):

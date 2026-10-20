@@ -993,8 +993,11 @@ def _validate_bundle(bundle_value: str, user: pwd.struct_passwd) -> tuple[Path, 
     runtime = manifest.get('runtime')
     if not isinstance(runtime, dict):
         _fail('bundle has no worker runtime description')
-    if runtime.get('frozen') is not True or not isinstance(runtime.get('python'), str) or not runtime['python'].startswith('3.11.'):
-        _fail('bundle requires a frozen CPython 3.11 worker')
+    # Any 3.11 or newer worker: an installed loader must accept a release that moves to a newer Python.
+    python = runtime.get('python')
+    version = re.fullmatch(r'3\.(\d+)\.\d+', python) if isinstance(python, str) else None
+    if runtime.get('frozen') is not True or version is None or int(version[1]) < 11:
+        _fail('bundle requires a frozen CPython 3.11 or newer worker')
     if runtime.get('decky_version') != source['tag']:
         _fail(f'worker does not report the bundle source baseline {source["tag"]}')
     packaging = manifest.get('worker_packaging')
