@@ -95,6 +95,12 @@ pnpm --dir frontend run build
 
 The output is consumed by both Python packaging and the complete Rust bundle build. The complete runtime builder performs this work in its temporary source snapshot; it does not replace the checkout's generated assets.
 
+### Catalog downloads
+
+Store catalog, version-map, and GitHub repository metadata requests use the authenticated `/fetch` proxy with `catalog=true`. The backend requests gzip, decodes it, and limits each response to 5 MB (5,000,000 decoded bytes). The 20-second backend deadline includes redirects, response headers, and the complete body. A timeout returns HTTP 504; an oversized body, invalid gzip, or unsupported content encoding returns HTTP 502.
+
+Catalog responses are buffered within that limit before they reach the frontend. HTTP status and cache headers are preserved. The frontend's existing store-level deadline and saved-list fallback still apply. Other plugin proxy requests, including audio and video streams, do not use these catalog limits.
+
 ## Build a complete Rust runtime
 
 Install the GitHub CLI and the pinned tools first. The builder downloads a checksum-verified CPython archive and installs Python dependencies in temporary environments. It does not activate a service or change an installed copy of Decky Loader.

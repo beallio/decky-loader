@@ -697,8 +697,8 @@ class PluginLoader extends Logger {
   }
 
   // Same syntax as fetch but only supports the url-based syntax and an object for headers since it's the most common usage pattern
-  fetchNoCors(input: string, init?: DeckyRequestInit | undefined): Promise<Response> {
-    const { headers: initHeaders = {}, ...restOfInit } = init || {};
+  fetchNoCors(input: string, init?: DeckyRequestInit & { catalog?: boolean }): Promise<Response> {
+    const { headers: initHeaders = {}, catalog = false, ...restOfInit } = init || {};
     const getPrefixedHeaders = () => {
       let prefixedInitHeaders: { [name: string]: any } = {};
       for (const [key, value] of Object.entries(initHeaders)) {
@@ -712,7 +712,7 @@ class PluginLoader extends Logger {
       headers['X-Decky-Fetch-Excluded-Headers'] = init.excludedHeaders.join(', ');
     }
 
-    return fetch(this.getExternalResourceURL(input), {
+    return fetch(this.getExternalResourceURL(input) + (catalog ? '&catalog=true' : ''), {
       ...restOfInit,
       credentials: 'include',
       headers,

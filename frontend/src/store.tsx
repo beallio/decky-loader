@@ -93,6 +93,7 @@ async function storeFetch(url: string, signal: AbortSignal): Promise<Response> {
   const version = await window.DeckyPluginLoader.updateVersion();
   return window.DeckyPluginLoader.fetchNoCors(url, {
     method: 'GET',
+    catalog: true,
     headers: {
       'X-Decky-Version': version.current,
     },

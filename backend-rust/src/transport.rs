@@ -36,6 +36,8 @@ use tokio::{
 use crate::backend::{Backend, RpcError};
 
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(20);
+const CATALOG_MAX_BYTES: usize = 5_000_000;
 
 type PendingCalls = HashMap<i64, PendingCall>;
 
@@ -81,6 +83,7 @@ struct AppState {
     socket_lifecycle: Arc<Mutex<()>>,
     next_connection_id: Arc<AtomicU64>,
     http_client: Client,
+    catalog_client: Client,
 }
 
 #[derive(Default)]
@@ -102,6 +105,8 @@ struct WsQuery {
 struct FetchQuery {
     auth: Option<String>,
     fetch_url: Option<String>,
+    #[serde(default)]
+    catalog: bool,
 }
 
 pub async fn serve(
@@ -131,6 +136,7 @@ pub async fn serve(
         socket_lifecycle: Arc::new(Mutex::new(())),
         next_connection_id: Arc::new(AtomicU64::new(1)),
         http_client,
+        catalog_client: catalog_client(CATALOG_TIMEOUT)?,
     };
 
     let mut event_receiver = events.subscribe();
@@ -837,6 +843,15 @@ async fn proxy_fetch(
         }
     }
 
+    if query.catalog {
+        if request.method() != Method::GET {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        return fetch_catalog(&state.catalog_client, url, headers)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
+
     let method = match reqwest::Method::from_bytes(request.method().as_str().as_bytes()) {
         Ok(method) => method,
         Err(_) => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
@@ -875,6 +890,74 @@ async fn proxy_fetch(
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     response
+}
+
+fn catalog_client(timeout: Duration) -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .no_proxy()
+        .gzip(true)
+        .no_brotli()
+        .no_deflate()
+        .timeout(timeout)
+        .build()
+}
+
+async fn fetch_catalog(
+    client: &Client,
+    url: String,
+    mut headers: HeaderMap,
+) -> Result<Response, (StatusCode, &'static str)> {
+    headers.insert("accept-encoding", HeaderValue::from_static("gzip"));
+    let mut upstream = client
+        .get(url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(catalog_upstream_error)?;
+    // Reject undecoded encodings so the browser cannot expand a body past the limit.
+    if upstream
+        .headers()
+        .get("content-encoding")
+        .is_some_and(|value| value != "identity")
+    {
+        return Err((StatusCode::BAD_GATEWAY, "Unsupported catalog encoding"));
+    }
+    let too_large = (StatusCode::BAD_GATEWAY, "Catalog exceeds 5 MB");
+    if upstream
+        .content_length()
+        .is_some_and(|size| size > CATALOG_MAX_BYTES as u64)
+    {
+        return Err(too_large);
+    }
+    let status = upstream.status();
+    let mut headers = upstream.headers().clone();
+    for name in [
+        "access-control-allow-origin",
+        "access-control-allow-credentials",
+        "access-control-expose-headers",
+        "transfer-encoding",
+        "content-length",
+    ] {
+        headers.remove(name);
+    }
+    let mut body = Vec::with_capacity(upstream.content_length().unwrap_or(0) as usize);
+    while let Some(chunk) = upstream.chunk().await.map_err(catalog_upstream_error)? {
+        if chunk.len() > CATALOG_MAX_BYTES - body.len() {
+            return Err(too_large);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let mut response = (status, body).into_response();
+    *response.headers_mut() = headers;
+    Ok(response)
+}
+
+fn catalog_upstream_error(error: reqwest::Error) -> (StatusCode, &'static str) {
+    if error.is_timeout() {
+        (StatusCode::GATEWAY_TIMEOUT, "Catalog request timed out")
+    } else {
+        (StatusCode::BAD_GATEWAY, "Catalog request failed")
+    }
 }
 
 fn transform_proxy_headers(
@@ -956,6 +1039,140 @@ fn decode_percent_once(input: &str) -> String {
 mod tests {
     use super::*;
     use crate::test_support::TestDirectory;
+
+    #[tokio::test]
+    async fn catalog_limit_counts_decoded_bytes_with_or_without_content_length() {
+        use std::io::Write;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/{encoding}/{size}",
+            get(
+                |AxumPath((encoding, size)): AxumPath<(String, usize)>, headers: HeaderMap| async move {
+                    let mut body = vec![b'a'; size];
+                    body[0] = b'"';
+                    body[size - 1] = b'"';
+                    let mut response = if encoding == "chunked" {
+                        Response::new(Body::from_stream(futures_util::stream::iter([Ok::<
+                            _,
+                            std::convert::Infallible,
+                        >(
+                            Bytes::from(body),
+                        )])))
+                    } else if encoding == "gzip" {
+                        if headers.get("accept-encoding") != Some(&HeaderValue::from_static("gzip")) {
+                            return StatusCode::NOT_ACCEPTABLE.into_response();
+                        }
+                        let mut gzip =
+                            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                        gzip.write_all(&body).unwrap();
+                        let mut response = gzip.finish().unwrap().into_response();
+                        response
+                            .headers_mut()
+                            .insert("content-encoding", HeaderValue::from_static("gzip"));
+                        response
+                    } else {
+                        body.into_response()
+                    };
+                    if encoding == "unsupported" {
+                        response
+                            .headers_mut()
+                            .insert("content-encoding", HeaderValue::from_static("zstd"));
+                    }
+                    response
+                        .headers_mut()
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                    response
+                        .headers_mut()
+                        .insert(CACHE_CONTROL, HeaderValue::from_static("max-age=600"));
+                    response
+                },
+            ),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = catalog_client(Duration::from_secs(5)).unwrap();
+        for encoding in ["plain", "gzip", "chunked"] {
+            for size in [CATALOG_MAX_BYTES, CATALOG_MAX_BYTES + 1] {
+                let response = fetch_catalog(
+                    &client,
+                    format!("http://{address}/{encoding}/{size}"),
+                    HeaderMap::from_iter([(
+                        HeaderName::from_static("accept-encoding"),
+                        HeaderValue::from_static("identity"),
+                    )]),
+                )
+                .await;
+                if size > CATALOG_MAX_BYTES {
+                    assert_eq!(
+                        response.unwrap_err().0,
+                        StatusCode::BAD_GATEWAY,
+                        "{encoding}"
+                    );
+                } else {
+                    let response = response.unwrap();
+                    assert_eq!(response.status(), StatusCode::OK, "{encoding}");
+                    assert_eq!(response.headers()[CACHE_CONTROL], "max-age=600");
+                    assert!(!response.headers().contains_key("content-encoding"));
+                    let body = axum::body::to_bytes(response.into_body(), CATALOG_MAX_BYTES)
+                        .await
+                        .unwrap();
+                    let decoded: String = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(decoded, "a".repeat(size - 2), "{encoding}");
+                }
+            }
+        }
+        let unsupported = fetch_catalog(
+            &client,
+            format!("http://{address}/unsupported/2"),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(unsupported.unwrap_err().0, StatusCode::BAD_GATEWAY);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn catalog_deadline_covers_headers_and_the_entire_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/headers",
+                get(|| async { std::future::pending::<Response>().await }),
+            )
+            .route(
+                "/body",
+                get(|| async {
+                    Response::new(Body::from_stream(futures_util::stream::unfold(
+                        (),
+                        |()| async {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            Some((
+                                Ok::<_, std::convert::Infallible>(Bytes::from_static(b" ")),
+                                (),
+                            ))
+                        },
+                    )))
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = catalog_client(Duration::from_millis(100)).unwrap();
+        for path in ["headers", "body"] {
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                fetch_catalog(
+                    &client,
+                    format!("http://{address}/{path}"),
+                    HeaderMap::new(),
+                ),
+            )
+            .await
+            .expect("a store must not keep the request alive");
+            assert_eq!(result.unwrap_err().0, StatusCode::GATEWAY_TIMEOUT, "{path}");
+        }
+        server.abort();
+    }
 
     #[test]
     fn only_plugin_call_frames_take_the_raw_path() {
@@ -1212,6 +1429,7 @@ mod tests {
             socket_lifecycle: Arc::new(Mutex::new(())),
             next_connection_id: Arc::new(AtomicU64::new(2)),
             http_client: Client::new(),
+            catalog_client: catalog_client(CATALOG_TIMEOUT).unwrap(),
         };
 
         handle_client_message(
