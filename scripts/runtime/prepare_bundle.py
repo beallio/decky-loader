@@ -41,6 +41,7 @@ SDK_OVERLAYS = (
     'frontend/src/components/settings/pages/general/Updater.tsx',
     'frontend/src/components/modals/RootPluginConfirmModal.tsx',
     'frontend/src/wsrouter.ts',
+    'frontend/src/toaster.tsx',
     'backend/decky_loader/localplatform/localplatform.py',
     'backend/decky_loader/localplatform/localplatformlinux.py',
     'backend/decky_loader/localplatform/localsocket.py',

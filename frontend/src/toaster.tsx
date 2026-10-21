@@ -89,13 +89,20 @@ class Toaster extends Logger {
     };
     const self = this;
     let expirationTimeout: number;
+    function remove() {
+      group && window.NotificationStore.RemoveGroupFromTray(group);
+      // The queue holds a copy of toastData, so match by ID. The predicate selects entries to keep.
+      window.NotificationStore.RemoveFromToastsWhere(
+        (n: { nNotificationID?: number } | undefined) => n?.nNotificationID !== toastData.nNotificationID,
+      );
+    }
     const toastResult: ToastNotification = {
       data: toast,
       dismiss() {
         // it checks against the id of notifications[0]
         try {
           expirationTimeout && clearTimeout(expirationTimeout);
-          group && window.NotificationStore.RemoveGroupFromTray(group);
+          remove();
         } catch (e) {
           self.error('Error while dismissing toast:', e);
         }
@@ -104,7 +111,7 @@ class Toaster extends Logger {
     if (toast.expiration) {
       expirationTimeout = setTimeout(() => {
         try {
-          group && window.NotificationStore.RemoveGroupFromTray(group);
+          remove();
         } catch (e) {
           this.error('Error while dismissing expired toast:', e);
         }
