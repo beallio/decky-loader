@@ -68,6 +68,7 @@ class NativeShimTests(unittest.TestCase):
 
         decky = types.ModuleType('decky')
         decky.DECKY_PLUGIN_DIR = str(self.plugin_dir)
+        decky.DECKY_PLUGIN_RUNTIME_DIR = str(self.plugin_dir / 'data')
         decky.logger = logging.getLogger('native-shim-test')
         decky.emit = emit
         self.enterContext(mock.patch.dict(sys.modules, {'decky': decky}))
@@ -97,9 +98,35 @@ class NativeShimTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'stopped'):
                 await plugin.echo()
             self.assertFalse(Path(plugin._directory).exists())
+            self.assertEqual(list((self.plugin_dir / 'data').iterdir()), [])
 
         asyncio.run(scenario())
         self.assertEqual(self.marks.read_text().split(), ['unload', 'uninstall'])
+
+    def test_runs_a_copy_so_an_update_can_replace_the_packaged_backend(self):
+        # Upstream extracts a ZIP update over the live folder; a running
+        # packaged executable would make that fail with ETXTBSY.
+        packaged = self.plugin_dir / 'bin' / 'backend'
+
+        async def scenario():
+            plugin = self.shim.Plugin()
+            main = asyncio.create_task(plugin._main())
+            self.assertEqual(await plugin.echo(), [])
+            command = Path(f'/proc/{plugin._process.pid}/cmdline').read_bytes().split(b'\0')
+            self.assertNotIn(str(packaged).encode(), command)
+            self.assertEqual([p.name for p in (self.plugin_dir / 'data').iterdir()], ['.decky-native-backend'])
+            packaged.write_text(BACKEND.replace('mark("unload")', 'mark("updated")'))
+            await plugin._unload()
+            await asyncio.wait_for(main, 5)
+            # The next start runs the updated file.
+            restarted = self.shim.Plugin()
+            main = asyncio.create_task(restarted._main())
+            self.assertEqual(await restarted.echo(), [])
+            await restarted._unload()
+            await asyncio.wait_for(main, 5)
+
+        asyncio.run(scenario())
+        self.assertEqual(self.marks.read_text().split(), ['unload', 'updated'])
 
     def test_kills_a_backend_that_ignores_sigterm_at_the_deadline(self):
         async def scenario():

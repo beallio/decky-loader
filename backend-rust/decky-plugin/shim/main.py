@@ -49,9 +49,29 @@ def _start(env):
         if _prctl(PR_SET_PDEATHSIG, signal.SIGKILL) != 0 or os.getppid() != worker:
             os._exit(1)
 
+    # Run a copy, so the packaged file is never busy: upstream can extract a
+    # ZIP update over the live plugin folder, and Linux refuses to overwrite a
+    # running executable (ETXTBSY). Replace the copy by rename for the same
+    # reason, and keep it while the backend runs, because a script backend's
+    # interpreter opens it by path after exec.
+    source = _backend_path()
+    os.makedirs(decky.DECKY_PLUGIN_RUNTIME_DIR, exist_ok=True)
+    fd, staged = tempfile.mkstemp(dir=decky.DECKY_PLUGIN_RUNTIME_DIR)
+    try:
+        with os.fdopen(fd, "wb") as target, open(source, "rb") as packaged:
+            shutil.copyfileobj(packaged, target)
+        os.chmod(staged, 0o700)
+        os.replace(staged, _copy_path())
+    except BaseException:
+        os.unlink(staged)
+        raise
     return subprocess.Popen(
-        [_backend_path()], env={**os.environ, **env}, preexec_fn=die_with_worker
+        [_copy_path()], env={**os.environ, **env}, preexec_fn=die_with_worker
     )
+
+
+def _copy_path():
+    return os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, ".decky-native-backend")
 
 
 def _wait(process, deadline):
@@ -164,7 +184,12 @@ class Plugin:
             process = _start({"DECKY_PLUGIN_HOOK": "uninstall"})
         except Exception as error:
             decky.logger.error(f"Could not run the backend uninstall hook: {error}")
-            return
-        _wait(process, deadline)
-        if process.returncode:
-            decky.logger.error(f"Backend uninstall hook exited with {process.returncode}")
+        else:
+            _wait(process, deadline)
+            if process.returncode:
+                decky.logger.error(f"Backend uninstall hook exited with {process.returncode}")
+        # Upstream leaves the runtime directory in place after an uninstall.
+        try:
+            os.unlink(_copy_path())
+        except FileNotFoundError:
+            pass
