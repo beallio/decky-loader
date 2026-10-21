@@ -32,7 +32,6 @@ datas = []
 binaries = []
 hiddenimports = [
     # The loader graph and SDK are imported dynamically by the standalone worker.
-    "decky_loader.main",
     "decky_loader.plugin.imports.decky",
     "decky_loader.plugin.sandboxed_plugin",
     "decky_loader.plugin.worker",
@@ -62,6 +61,7 @@ for package in runtime_packages:
             for path in sorted(sdk_root.rglob("*"))
             if path.is_file() and "__pycache__" not in path.parts
             and path.suffix not in (".pyc", ".pyo")
+            and path.relative_to(sdk_root).parts[0] not in ("static", "locales")
         ]
     datas += package_datas
     binaries += package_binaries

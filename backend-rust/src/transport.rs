@@ -955,6 +955,7 @@ fn decode_percent_once(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestDirectory;
 
     #[test]
     fn only_plugin_call_frames_take_the_raw_path() {
@@ -988,14 +989,6 @@ mod tests {
             r#"{"type":4,"messages":[]}"#,
         ] {
             assert!(plugin_call_frame(other).is_none(), "{other}");
-        }
-    }
-
-    struct TestDirectory(PathBuf);
-
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -1145,7 +1138,6 @@ mod tests {
                 crate::workers::WorkerConfiguration {
                     executable: std::env::current_exe().unwrap(),
                     mode: crate::workers::WorkerMode::Exec,
-                    bootstrap: crate::workers::WorkerBootstrap::Lean,
                     auth_token: "test-token".into(),
                     server_host: "127.0.0.1".into(),
                     server_port: 1339,
@@ -1179,9 +1171,7 @@ mod tests {
 
     #[tokio::test]
     async fn root_install_answers_reach_the_waiting_install() {
-        let directory = TestDirectory(
-            std::env::temp_dir().join(format!("decky-rpc-test-{}", uuid::Uuid::new_v4())),
-        );
+        let directory = TestDirectory::new("decky-rpc-test");
         let (registry, backend) = test_backend(&directory).await;
         // Without a waiting install the plugin manager must answer, not "route not found".
         for (route, args) in [
@@ -1206,9 +1196,7 @@ mod tests {
 
     #[tokio::test]
     async fn replayed_calls_do_not_repeat_persistent_settings_changes() {
-        let directory = TestDirectory(
-            std::env::temp_dir().join(format!("decky-rpc-test-{}", uuid::Uuid::new_v4())),
-        );
+        let directory = TestDirectory::new("decky-rpc-test");
         let (registry, backend) = test_backend(&directory).await;
         let (sender, mut replies) = mpsc::unbounded_channel();
         let state = AppState {

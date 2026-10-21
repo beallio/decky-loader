@@ -161,7 +161,4 @@ backend/decky_loader/static
 
 # plugins folder for local launches
 /plugins/*
-act/.directory
-act/artifacts/*
-bin/act
 /settings/

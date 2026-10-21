@@ -10,7 +10,6 @@ This creates a private candidate; it does not publish or activate a release.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,6 +19,8 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+
+from prepare_bundle import digest
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
@@ -36,14 +37,6 @@ def run(arguments: list[str], *, cwd: Path = REPO, env: dict[str, str] | None = 
 
 def capture(arguments: list[str], *, cwd: Path = REPO, env: dict[str, str] | None = None) -> str:
     return subprocess.check_output(arguments, cwd=cwd, env=env, text=True).strip()
-
-
-def digest(path: Path) -> str:
-    result = hashlib.sha256()
-    with path.open('rb') as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-            result.update(chunk)
-    return result.hexdigest()
 
 
 def snapshot_excluded(relative: Path) -> bool:
@@ -150,7 +143,7 @@ def build(output: Path, release_version: str, python_archive: Path | None,
             'python_packages': json.loads(capture(['uv', 'pip', 'list', '--format=json', '--python', str(worker_python)],
                                                   env=worker_environment)),
             'native_json': {'module': '_decky_native_json', 'sha256': digest(native_module),
-                            'abi_suffix': extension_suffix, 'system_unwind_library': 'libgcc_s.so.1'},
+                            'abi_suffix': extension_suffix},
         }
         from prepare_bundle import prepare
         result = prepare(work / 'worker-dist/DeckyPluginWorker/DeckyPluginWorker',

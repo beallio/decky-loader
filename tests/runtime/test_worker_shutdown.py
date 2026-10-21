@@ -82,7 +82,7 @@ class WorkerShutdownTests(unittest.TestCase):
                 arguments = [
                     '--plugin-root', str(plugin_root), '--plugin-directory', public.name,
                     '--homebrew', str(homebrew), '--socket', str(base / 'plugin.sock'),
-                    '--user', pwd.getpwuid(os.getuid()).pw_name, '--bootstrap', 'lean',
+                    '--user', pwd.getpwuid(os.getuid()).pw_name,
                     '--approved-launch', json.dumps(_approved_launch(directory_fd, flags=[])),
                 ]
                 config_path = base / 'child.json'

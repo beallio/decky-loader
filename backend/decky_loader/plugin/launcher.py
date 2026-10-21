@@ -258,22 +258,16 @@ def _assert_fork_safe() -> None:
             raise RuntimeError("the shared Python launcher must be single-threaded before fork")
 
 
-def _start_child(
-    request: dict[str, Any], bootstrap: str, children: dict[str, _Child]
-) -> dict[str, Any]:
+def _start_child(request: dict[str, Any], children: dict[str, _Child]) -> dict[str, Any]:
     identifier = _request(request, "id", str)
     if identifier in children:
         raise ValueError(f"worker id is already active: {identifier}")
-    requested_bootstrap = request.get("bootstrap", bootstrap)
-    if requested_bootstrap != bootstrap:
-        raise ValueError("worker bootstrap does not match launcher bootstrap")
     # Only these keys reach the worker; the user launcher never forwards
     # private_plugin_mount or socket_owner.
     arguments: dict[str, Any] = {}
     for key in ("plugin_root", "plugin_directory", "socket", "homebrew", "user"):
         arguments[key] = _request(request, key, str)
     arguments["approved_launch"] = _request(request, "approved_launch", dict)
-    arguments["bootstrap"] = bootstrap
     arguments["system_pythonpaths"] = _shared_system_pythonpaths(arguments["user"])
 
     inherited_fds = (_wake_read, _wake_write) + tuple(
@@ -285,14 +279,14 @@ def _start_child(
 
 
 def _handle_request(
-    request: Any, bootstrap: str, children: dict[str, _Child]
+    request: Any, children: dict[str, _Child]
 ) -> tuple[dict[str, Any], bool]:
     if not isinstance(request, dict):
         raise ValueError("control request must be a JSON object")
     request = cast(dict[str, Any], request)
     operation = request.get("op")
     if operation == "start":
-        return _start_child(request, bootstrap, children), False
+        return _start_child(request, children), False
 
     if operation == "shutdown":
         return {"ok": True, "op": "shutdown"}, True
@@ -367,8 +361,7 @@ def _request_child_poll(_signum: int, _frame: Any) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the shared Decky plugin fork launcher")
-    parser.add_argument("--bootstrap", choices=("full", "lean"), default="lean")
-    args = parser.parse_args(argv)
+    parser.parse_args(argv)
     global _wake_read, _wake_write, _children_changed, _stopping
     _stopping = False
     _children_changed = False
@@ -379,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGCHLD, _request_child_poll)
     children: dict[str, _Child] = {}
     try:
-        worker.prepare_runtime(args.bootstrap)
+        worker.prepare_runtime()
         _assert_fork_safe()
         _write_message({"ok": True, "op": "ready", "pid": os.getpid()})
 
@@ -399,7 +392,7 @@ def main(argv: list[str] | None = None) -> int:
                 break
             try:
                 request = json.loads(line)
-                response, shutdown = _handle_request(request, args.bootstrap, children)
+                response, shutdown = _handle_request(request, children)
             except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
                 _write_message({"ok": False, "error": str(error)})
                 continue

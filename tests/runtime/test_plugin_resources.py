@@ -195,12 +195,9 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report["by_role"]["backend"]["pids"], [10])
         self.assertEqual(report["by_role"]["shared launcher"]["pids"], [11])
 
-    def test_reused_pid_and_disabled_sampling_have_no_percent(self):
+    def test_reused_pid_has_no_percent(self):
         reused = {12: installer._StatSample("Weather", 11, 10, 999)}
         self.assertIsNone({row["pid"]: row for row in self.report(reused)["processes"]}[12]["cpu_percent"])
-        disabled = installer._resource_report(self.infos, self.samples, {}, self.memory, 10, 100, 0.0)
-        self.assertIsNone(disabled["service"]["cpu_percent"])
-        self.assertEqual(disabled["service"]["cpu_seconds_total"], 19.0)
 
 
 if __name__ == "__main__":

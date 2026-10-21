@@ -58,6 +58,7 @@ WORKER_EXECUTABLE = 'DeckyPluginWorker'
 MAX_HTTP_HEADERS = 65536
 MAX_WEBSOCKET_FRAME = 1024 * 1024
 HEALTH_RPC_IDS = (-1, -2, -3)
+RESOURCE_WINDOW_SECONDS = 1.0
 
 
 class InstallerError(RuntimeError):
@@ -870,21 +871,23 @@ def _fsync_file(path: Path) -> None:
         os.fsync(stream.fileno())
 
 
-def _metadata(path: Path, result: os.stat_result) -> dict[str, object]:
+def _metadata(target: Path | str | int, info: os.stat_result) -> dict[str, object]:
     attributes: dict[str, str] = {}
+    # Descriptors cannot take follow_symlinks; paths must not follow a final symlink.
+    options = {} if isinstance(target, int) else {'follow_symlinks': False}
     if hasattr(os, 'listxattr') and hasattr(os, 'getxattr'):
         try:
-            for name in os.listxattr(path, follow_symlinks=False):
-                attributes[name] = base64.b64encode(os.getxattr(path, name, follow_symlinks=False)).decode('ascii')
+            for name in os.listxattr(target, **options):
+                attributes[name] = base64.b64encode(os.getxattr(target, name, **options)).decode('ascii')
         except OSError as error:
             if error.errno not in (getattr(os, 'ENOTSUP', 95), getattr(os, 'EOPNOTSUPP', 95)):
-                raise InstallerError(f'cannot capture metadata for {path}: {error}') from error
+                raise InstallerError(f'cannot capture metadata for {target}: {error}') from error
     return {
-        'mode': stat.S_IMODE(result.st_mode),
-        'uid': result.st_uid,
-        'gid': result.st_gid,
-        'atime_ns': result.st_atime_ns,
-        'mtime_ns': result.st_mtime_ns,
+        'mode': stat.S_IMODE(info.st_mode),
+        'uid': info.st_uid,
+        'gid': info.st_gid,
+        'atime_ns': info.st_atime_ns,
+        'mtime_ns': info.st_mtime_ns,
         'xattrs': attributes,
     }
 
@@ -917,23 +920,6 @@ def _snapshot_file(path: Path, destination: Path) -> dict[str, object]:
     return {'exists': True, 'metadata': saved_metadata}
 
 
-def _apply_metadata(path: Path, metadata: dict[str, Any]) -> None:
-    try:
-        os.chown(path, int(metadata['uid']), int(metadata['gid']))
-        os.chmod(path, int(metadata['mode']))
-        xattrs = metadata.get('xattrs', {})
-        if not isinstance(xattrs, dict):
-            _fail('invalid xattr snapshot')
-        if xattrs and not hasattr(os, 'setxattr'):
-            _fail('this platform cannot restore captured extended attributes')
-        for name, encoded in xattrs.items():
-            value = base64.b64decode(str(encoded), validate=True)
-            os.setxattr(path, str(name), value, follow_symlinks=False)
-        os.utime(path, ns=(int(metadata['atime_ns']), int(metadata['mtime_ns'])))
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        raise InstallerError(f'cannot restore file metadata for {path}: {error}') from error
-
-
 def _restore_file(path: Path, snapshot: Path, state: dict[str, Any]) -> None:
     if not state.get('exists'):
         current = _lstat_regular_or_absent(path)
@@ -950,7 +936,11 @@ def _restore_file(path: Path, snapshot: Path, state: dict[str, Any]) -> None:
     try:
         temporary.unlink()
         _copy_regular(snapshot, temporary)
-        _apply_metadata(temporary, metadata)
+        descriptor = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            _apply_metadata_fd(descriptor, metadata)
+        finally:
+            os.close(descriptor)
         os.replace(temporary, path)
         _fsync_directory(path.parent)
     except BaseException:
@@ -1305,7 +1295,6 @@ def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_na
         str(paths['binary']),
         '--worker', str(runtime / WORKER_EXECUTABLE),
         '--worker-mode', worker_mode,
-        '--worker-bootstrap', 'lean',
         '--release-version', version,
         '--plugin-root', str(paths['homebrew'] / 'plugins'),
         '--homebrew', str(paths['homebrew']),
@@ -3030,10 +3019,10 @@ def _read_stat_sample(pid: int) -> _StatSample | None:
         return None
 
 
-def _service_resources(paths: dict[str, Path], sample_seconds: float) -> dict[str, Any]:
+def _service_resources(paths: dict[str, Path]) -> dict[str, Any]:
     """Per-process CPU and memory of the selected service from readable /proc files only."""
     def unavailable(reason: str) -> dict[str, Any]:
-        return {'available': False, 'reason': reason, 'sample_seconds': sample_seconds}
+        return {'available': False, 'reason': reason}
 
     try:
         properties = _unit_properties(paths)
@@ -3046,14 +3035,12 @@ def _service_resources(paths: dict[str, Path], sample_seconds: float) -> dict[st
     clock_ticks = os.sysconf('SC_CLK_TCK')
     try:
         previous: dict[int, _StatSample] = {}
-        window_start = 0.0
-        if sample_seconds > 0:
-            for pid in cgroup_processes(control_group):
-                sample = _read_stat_sample(pid)
-                if sample is not None:
-                    previous[pid] = sample
-            window_start = time.monotonic()
-            time.sleep(sample_seconds)
+        for pid in cgroup_processes(control_group):
+            sample = _read_stat_sample(pid)
+            if sample is not None:
+                previous[pid] = sample
+        window_start = time.monotonic()
+        time.sleep(RESOURCE_WINDOW_SECONDS)
         members = cgroup_processes(control_group)
     except (OSError, ValueError) as error:
         return unavailable(f'cannot observe service processes: {error}')
@@ -3062,7 +3049,7 @@ def _service_resources(paths: dict[str, Path], sample_seconds: float) -> dict[st
         sample = _read_stat_sample(pid)
         if sample is not None and sample.start_ticks == member.start_ticks:
             samples[pid] = sample
-    elapsed = time.monotonic() - window_start if sample_seconds > 0 else 0.0
+    elapsed = time.monotonic() - window_start
     infos: dict[int, _ProcessInfo] = {}
     memory: dict[int, dict[str, int | None]] = {}
     for pid, sample in samples.items():
@@ -3081,8 +3068,6 @@ def _service_resources(paths: dict[str, Path], sample_seconds: float) -> dict[st
     return {
         'available': True,
         'reason': None,
-        'sample_seconds': sample_seconds,
-        'window_seconds': round(elapsed, 3),
         'clock_ticks_per_second': clock_ticks,
         'control_group': control_group,
         'main_pid': main_pid,
@@ -3394,26 +3379,6 @@ def _open_services_directory(
     return homebrew / 'services', homebrew_fd, services_fd, info
 
 
-def _metadata_from_fd(descriptor: int, result: os.stat_result | None = None) -> dict[str, object]:
-    info = result or os.fstat(descriptor)
-    attributes: dict[str, str] = {}
-    if hasattr(os, 'listxattr') and hasattr(os, 'getxattr'):
-        try:
-            for name in os.listxattr(descriptor):
-                attributes[name] = base64.b64encode(os.getxattr(descriptor, name)).decode('ascii')
-        except OSError as error:
-            if error.errno not in (getattr(os, 'ENOTSUP', 95), getattr(os, 'EOPNOTSUPP', 95)):
-                raise InstallerError(f'cannot capture descriptor metadata: {error}') from error
-    return {
-        'mode': stat.S_IMODE(info.st_mode),
-        'uid': info.st_uid,
-        'gid': info.st_gid,
-        'atime_ns': info.st_atime_ns,
-        'mtime_ns': info.st_mtime_ns,
-        'xattrs': attributes,
-    }
-
-
 def _copy_descriptor(source_fd: int, destination: Path) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
     target_fd = os.open(destination, flags, 0o600)
@@ -3447,7 +3412,7 @@ def _snapshot_binary_at(services_fd: int, destination: Path) -> tuple[dict[str, 
         opened = os.fstat(source_fd)
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
             _fail('legacy backend binary changed while opening its rollback snapshot')
-        metadata = _metadata_from_fd(source_fd, opened)
+        metadata = _metadata(source_fd, opened)
         _copy_descriptor(source_fd, destination)
         _fsync_directory(destination.parent)
         after = os.fstat(source_fd)
@@ -3465,26 +3430,6 @@ def _snapshot_binary_at(services_fd: int, destination: Path) -> tuple[dict[str, 
         }, [opened.st_dev, opened.st_ino]
     finally:
         os.close(source_fd)
-def _metadata_for_symlink_at(parent_fd: int, name: str, info: os.stat_result) -> dict[str, object]:
-    attributes: dict[str, str] = {}
-    if hasattr(os, 'listxattr') and hasattr(os, 'getxattr'):
-        path = f'/proc/self/fd/{parent_fd}/{name}'
-        try:
-            for attribute in os.listxattr(path, follow_symlinks=False):
-                attributes[attribute] = base64.b64encode(
-                    os.getxattr(path, attribute, follow_symlinks=False)
-                ).decode('ascii')
-        except OSError as error:
-            if error.errno not in (getattr(os, 'ENOTSUP', 95), getattr(os, 'EOPNOTSUPP', 95)):
-                raise InstallerError(f'cannot capture symlink metadata for {name}: {error}') from error
-    return {
-        'mode': stat.S_IMODE(info.st_mode),
-        'uid': info.st_uid,
-        'gid': info.st_gid,
-        'atime_ns': info.st_atime_ns,
-        'mtime_ns': info.st_mtime_ns,
-        'xattrs': attributes,
-    }
 
 
 def _snapshot_legacy_file(source: Path, destination: Path) -> dict[str, Any]:
@@ -3511,7 +3456,7 @@ def _snapshot_legacy_file(source: Path, destination: Path) -> dict[str, Any]:
                 opened = os.fstat(source_fd)
                 if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
                     _fail(f'legacy system unit changed while opening its snapshot: {source}')
-                metadata = _metadata_from_fd(source_fd, opened)
+                metadata = _metadata(source_fd, opened)
                 _copy_descriptor(source_fd, destination)
                 _fsync_directory(destination.parent)
                 after = os.fstat(source_fd)
@@ -3531,7 +3476,7 @@ def _snapshot_legacy_file(source: Path, destination: Path) -> dict[str, Any]:
                 'identity': identity,
             }
         target = os.readlink(source.name, dir_fd=parent_fd)
-        metadata = _metadata_for_symlink_at(parent_fd, source.name, info)
+        metadata = _metadata(f'/proc/self/fd/{parent_fd}/{source.name}', info)
         current = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino) or os.readlink(
             source.name, dir_fd=parent_fd
@@ -3676,7 +3621,7 @@ def _object_matches_snapshot(parent_fd: int, name: str, item: dict[str, Any]) ->
                 return False
             return (
                 _digest_descriptor(descriptor) == item.get('sha256')
-                and _metadata_matches(_metadata_from_fd(descriptor, opened), metadata)
+                and _metadata_matches(_metadata(descriptor, opened), metadata)
             )
         finally:
             os.close(descriptor)
@@ -3684,7 +3629,7 @@ def _object_matches_snapshot(parent_fd: int, name: str, item: dict[str, Any]) ->
         if not stat.S_ISLNK(info.st_mode):
             return False
         target = os.readlink(name, dir_fd=parent_fd)
-        current_metadata = _metadata_for_symlink_at(parent_fd, name, info)
+        current_metadata = _metadata(f'/proc/self/fd/{parent_fd}/{name}', info)
         current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         return (
             target == item.get('target')
@@ -4119,7 +4064,7 @@ def _snapshot_legacy_system(args: argparse.Namespace, user: pwd.struct_passwd) -
     properties = _unit_properties(system_paths)
     services, homebrew_fd, services_fd, services_info = _open_services_directory(homebrew, user)
     try:
-        services_metadata = _metadata_from_fd(services_fd, services_info)
+        services_metadata = _metadata(services_fd, services_info)
         services_metadata['identity'] = [services_info.st_dev, services_info.st_ino]
         state_directory = directory / 'private' / 'snapshots'
         state_directory.mkdir(mode=0o700, exist_ok=True)
@@ -6121,26 +6066,6 @@ def _check_bundle(args: argparse.Namespace) -> dict[str, object]:
     return response
 
 
-def _activate_binary(args: argparse.Namespace, paths: dict[str, Any]) -> dict[str, object]:
-    _assert_no_system_instance(paths)
-    _assert_user_unit_source(paths)
-    activation = _capture_activation(paths)
-    if activation.get('load_state') != 'loaded':
-        _fail(f'user service {paths["unit"].name} is not installed')
-    stop_service(paths['unit'].name)
-    if activation.get('running'):
-        _systemctl(paths, 'start', paths['unit'].name, timeout=45)
-        _wait_running(paths)
-        _health(paths)
-    else:
-        _wait_stopped(paths)
-    return {
-        'ok': True,
-        'command': 'activate-binary',
-        'service': paths['unit'].name,
-        'active': bool(activation.get('running')),
-    }
-
 def _locked(paths: dict[str, Path]):
     lock_path = paths['lock']
     flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)
@@ -6157,16 +6082,6 @@ def _locked(paths: dict[str, Path]):
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--homebrew', required=True, metavar='DIR')
     parser.add_argument('--service-name', required=True, metavar='NAME')
-
-
-def _sample_seconds(value: str) -> float:
-    try:
-        seconds = float(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f'not a number: {value!r}') from None
-    if not 0 <= seconds <= 60:
-        raise argparse.ArgumentTypeError('must be from 0 to 60 seconds')
-    return seconds
 
 
 def main() -> int:
@@ -6189,7 +6104,6 @@ def main() -> int:
     _add_common(rollback)
     status = subparsers.add_parser('status', help='report selected service and recoverable installer state')
     _add_common(status)
-    status.add_argument('--sample-seconds', type=_sample_seconds, default=1.0, metavar='SECONDS', help='CPU percentage sampling window; 0 skips sampling (default 1)')
     check_bundle = subparsers.add_parser('check-bundle', help='verify a bundle and user-service target without installing')
     check_bundle.add_argument('--bundle', required=True, metavar='DIR')
     check_bundle.add_argument('--version', required=True, metavar='STRING')
@@ -6203,8 +6117,6 @@ def main() -> int:
     verify_bundle.add_argument('--homebrew', required=True, metavar='DIR')
     verify_bundle.add_argument('--user', required=True, metavar='USER')
     verify_bundle.add_argument('--service-name', required=True, metavar='NAME')
-    activate = subparsers.add_parser('activate-binary', help='restart the selected user service after binary replacement')
-    _add_common(activate)
     install_bundle = subparsers.add_parser('queue-install-bundle', help='durably hand off a verified Rust bundle installation')
     install_bundle.add_argument('--bundle', required=True, metavar='DIR')
     install_bundle.add_argument('--version', required=True, metavar='STRING')
@@ -6355,15 +6267,13 @@ def main() -> int:
                         output = _run_rollback(args)
                     elif args.command == 'status':
                         output = _run_status(args)
-                    elif args.command == 'activate-binary':
-                        output = _activate_binary(args, paths)
                     else:
                         _fail('unsupported installer command')
                 finally:
                     fcntl.flock(descriptor, fcntl.LOCK_UN)
                     os.close(descriptor)
                 if args.command == 'status':
-                    output['resources'] = _service_resources(paths, args.sample_seconds)
+                    output['resources'] = _service_resources(paths)
                     output['root_host'] = _root_host_status(user)
         print(json.dumps(output, sort_keys=True))
         return 0

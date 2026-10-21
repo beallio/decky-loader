@@ -12,8 +12,8 @@ import subprocess
 import sys
 import zipfile
 
-from build import ARTIFACT_NAME, CONFIG, REPO, SOURCE_ROOTS, digest, snapshot_excluded
-from prepare_bundle import SDK_OVERLAYS, SDK_REMOVALS
+from build import ARTIFACT_NAME, CONFIG, REPO, SOURCE_ROOTS, snapshot_excluded
+from prepare_bundle import SDK_OVERLAYS, SDK_REMOVALS, digest
 
 ASSET_NAME = ARTIFACT_NAME + '.zip'
 ASSET_CHECKSUM_NAME = ASSET_NAME + '.sha256'
@@ -170,7 +170,7 @@ def validate(directory: Path, tag: str, source_commit: str, channel: str | None 
     if any(source_hashes.get(name) != expected for name, expected in overlays.items()):
         raise ValueError('fork SDK overlay hashes differ from the pinned-source release snapshot')
     if any(name in source_hashes for name in SDK_REMOVALS):
-        raise ValueError('release source reintroduces removed privileged Steam workaround code')
+        raise ValueError('release source reintroduces a removed SDK file')
     for name, expected in source_hashes.items():
         if not isinstance(name, str) or any(ord(char) < 32 for char in name):
             raise ValueError('invalid build-source path')

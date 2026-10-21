@@ -61,6 +61,8 @@ SDK_REMOVALS = (
     'frontend/src/steamfixes/index.ts',
     'frontend/src/steamfixes/restart.ts',
     'frontend/src/steamfixes/socket.ts',
+    'backend/decky_loader/localplatform/localplatformmac.py',
+    'backend/decky_loader/localplatform/localplatformwin.py',
 )
 
 
@@ -84,7 +86,7 @@ def prepare(worker: Path, rust: Path, assets: Path, locales: Path, output: Path,
     if output.exists():
         raise ValueError(f'output already exists; use a new isolated path: {output}')
     if any((REPO / path).exists() or (REPO / path).is_symlink() for path in SDK_REMOVALS):
-        raise ValueError('obsolete privileged Steam workaround code is still present')
+        raise ValueError('a removed SDK file is still present')
     subprocess.run(
         ['git', 'diff', '--quiet', BASELINE_TAG, '--', 'backend/decky_loader', 'frontend',
          *(f':(exclude){path}' for path in (*SDK_OVERLAYS, *SDK_REMOVALS))],

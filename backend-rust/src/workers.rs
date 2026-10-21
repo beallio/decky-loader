@@ -107,7 +107,6 @@ pub struct PluginRegistry {
     mutations: Mutex<()>,
     worker_executable: PathBuf,
     worker_mode: WorkerMode,
-    worker_bootstrap: WorkerBootstrap,
     fork_launcher: Mutex<Option<Arc<ForkLauncher>>>,
     root_host: Mutex<Option<Arc<RootHost>>>,
     launcher_failure: Option<(watch::Sender<bool>, watch::Receiver<bool>)>,
@@ -165,25 +164,9 @@ pub enum WorkerMode {
     Fork,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkerBootstrap {
-    Full,
-    Lean,
-}
-
-impl WorkerBootstrap {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::Lean => "lean",
-        }
-    }
-}
-
 pub struct WorkerConfiguration {
     pub executable: PathBuf,
     pub mode: WorkerMode,
-    pub bootstrap: WorkerBootstrap,
     pub auth_token: String,
     pub server_host: String,
     pub server_port: u16,
@@ -195,7 +178,6 @@ pub struct WorkerConfiguration {
 struct WorkerLaunchConfig<'a> {
     worker_executable: &'a Path,
     worker_mode: WorkerMode,
-    worker_bootstrap: WorkerBootstrap,
     fork_launcher: Option<&'a Arc<ForkLauncher>>,
     root_host: Option<&'a Arc<RootHost>>,
     plugin_root: &'a Path,
@@ -362,7 +344,6 @@ impl PluginRegistry {
         let WorkerConfiguration {
             executable: worker_executable,
             mode: worker_mode,
-            bootstrap: worker_bootstrap,
             auth_token,
             server_host,
             server_port,
@@ -382,7 +363,6 @@ impl PluginRegistry {
             mutations: Mutex::new(()),
             worker_executable,
             worker_mode,
-            worker_bootstrap,
             fork_launcher: Mutex::new(None),
             root_host: Mutex::new(None),
             launcher_failure,
@@ -1217,7 +1197,6 @@ impl PluginRegistry {
         }
         let launcher = ForkLauncher::spawn(
             &self.worker_executable,
-            self.worker_bootstrap.as_str(),
             &self.plugin_root,
             &self.homebrew,
             &self.user,
@@ -1316,7 +1295,6 @@ impl PluginRegistry {
         WorkerLaunchConfig {
             worker_executable: &self.worker_executable,
             worker_mode: self.worker_mode,
-            worker_bootstrap: self.worker_bootstrap,
             fork_launcher,
             root_host,
             plugin_root: &self.plugin_root,
@@ -2042,21 +2020,7 @@ mod plugin_permission_tests {
         )
     }
 
-    struct TestDirectory(PathBuf);
-
-    impl TestDirectory {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("decky-permissions-{}", Uuid::new_v4()));
-            fs::create_dir(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::test_support::TestDirectory;
 
     fn set_mode(path: &Path, mode: u32) {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
@@ -2093,7 +2057,7 @@ mod plugin_permission_tests {
 
     #[test]
     fn root_plugin_policy_matches_process_credentials() {
-        let temporary = TestDirectory::new();
+        let temporary = TestDirectory::new("decky-permissions");
         let plugin_root = temporary.0.join("plugins");
         let plugin = plugin_root.join("Example");
         write_approved_plugin(&plugin, &["root"]);
@@ -2116,7 +2080,7 @@ mod plugin_permission_tests {
 
     #[tokio::test]
     async fn disabled_root_plugin_can_be_registered_again_during_recovery() {
-        let temporary = TestDirectory::new();
+        let temporary = TestDirectory::new("decky-permissions");
         let plugin_root = temporary.0.join("plugins");
         let plugin = plugin_root.join("Example");
         write_approved_plugin(&plugin, &["root"]);
@@ -2137,7 +2101,6 @@ mod plugin_permission_tests {
             WorkerConfiguration {
                 executable: std::env::current_exe().unwrap(),
                 mode: WorkerMode::Exec,
-                bootstrap: WorkerBootstrap::Lean,
                 auth_token: "recovery-test".into(),
                 server_host: "127.0.0.1".into(),
                 server_port: 1339,
@@ -2172,7 +2135,7 @@ mod plugin_permission_tests {
 
     #[tokio::test]
     async fn failed_reload_restores_currently_enabled_plugin_metadata() {
-        let temporary = TestDirectory::new();
+        let temporary = TestDirectory::new("decky-permissions");
         let plugin_root = temporary.0.join("plugins");
         write_approved_plugin(&plugin_root.join("Example"), &[]);
         fs::create_dir(temporary.0.join("settings")).unwrap();
@@ -2192,7 +2155,6 @@ mod plugin_permission_tests {
             WorkerConfiguration {
                 executable: temporary.0.join("missing-worker"),
                 mode: WorkerMode::Exec,
-                bootstrap: WorkerBootstrap::Lean,
                 auth_token: "recovery-test".into(),
                 server_host: "127.0.0.1".into(),
                 server_port: 1339,
@@ -2234,7 +2196,7 @@ mod plugin_permission_tests {
 
     #[test]
     fn linked_backend_entrypoints_remain_active() {
-        let temporary = TestDirectory::new();
+        let temporary = TestDirectory::new("decky-permissions");
         let plugin = temporary.0.join("plugin");
         write_approved_plugin(&plugin, &[]);
         fs::rename(plugin.join("main.py"), plugin.join("backend.py")).unwrap();
@@ -2245,7 +2207,7 @@ mod plugin_permission_tests {
 
     #[test]
     fn approved_metadata_and_permissions_stay_bound_after_parent_replacement() {
-        let temporary = TestDirectory::new();
+        let temporary = TestDirectory::new("decky-permissions");
         let plugin_root = temporary.0.join("plugins");
         let plugin_path = plugin_root.join("Example");
         write_approved_plugin(&plugin_path, &[]);
@@ -2320,7 +2282,7 @@ mod plugin_permission_tests {
 
     #[test]
     fn approved_metadata_reads_require_regular_nofollow_json_files() {
-        let temporary = TestDirectory::new();
+        let temporary = TestDirectory::new("decky-permissions");
         let plugin = temporary.0.join("plugin");
         write_approved_plugin(&plugin, &[]);
         let external_plugin_json = temporary.0.join("external-plugin.json");
@@ -2355,7 +2317,7 @@ mod plugin_permission_tests {
 
     #[test]
     fn metadata_stays_protected_while_standard_and_root_plugin_permissions_are_preserved() {
-        let temporary = TestDirectory::new();
+        let temporary = TestDirectory::new("decky-permissions");
         let root = fs::canonicalize(&temporary.0).unwrap();
         let plugin = root.join("plugin");
         let nested = plugin.join("nested");
@@ -2418,7 +2380,7 @@ mod plugin_permission_tests {
 
     #[test]
     fn ancestor_symlinks_and_external_hardlinks_are_not_changed() {
-        let temporary = TestDirectory::new();
+        let temporary = TestDirectory::new("decky-permissions");
         let root = fs::canonicalize(&temporary.0).unwrap();
         let outside_tree = root.join("outside-tree");
         let outside_plugin = outside_tree.join("plugin");
@@ -2467,7 +2429,7 @@ mod plugin_permission_tests {
 
     #[test]
     fn protected_metadata_cannot_reference_a_mutable_outside_file() {
-        let temporary = TestDirectory::new();
+        let temporary = TestDirectory::new("decky-permissions");
         let root = fs::canonicalize(&temporary.0).unwrap();
         let plugin = root.join("plugin");
         fs::create_dir(&plugin).unwrap();
@@ -3257,7 +3219,6 @@ async fn launch_worker(
     let WorkerLaunchConfig {
         worker_executable,
         worker_mode,
-        worker_bootstrap,
         fork_launcher,
         root_host,
         plugin_root,
@@ -3314,8 +3275,6 @@ async fn launch_worker(
                     .arg(homebrew)
                     .arg("--user")
                     .arg(user)
-                    .arg("--bootstrap")
-                    .arg(worker_bootstrap.as_str())
                     .arg("--approved-launch")
                     .arg(&approved_launch_argument)
                     .env("DECKY_AUTH_TOKEN", auth_token)
@@ -3360,7 +3319,6 @@ async fn launch_worker(
                         "socket": socket_path,
                         "homebrew": homebrew,
                         "user": user,
-                        "bootstrap": worker_bootstrap.as_str(),
                         "approved_launch": &approved_launch,
                     }))
                     .await
@@ -3673,11 +3631,11 @@ async fn terminate_and_reap(child: &mut Child, pid: u32) {
     }
 }
 
-fn send_signal(pid: u32, signal: i32) {
+pub(crate) fn send_signal(pid: u32, signal: i32) {
     let _ = platform::signal_process(pid, signal);
 }
 
-fn send_group_signal(pid: u32, signal: i32) {
+pub(crate) fn send_group_signal(pid: u32, signal: i32) {
     let _ = platform::signal_group(pid, signal);
 }
 
@@ -3953,19 +3911,11 @@ mod inotify_parser_tests {
 #[cfg(test)]
 mod launcher_failure_tests {
     use super::*;
-
-    struct TestDirectory(PathBuf);
-
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::test_support::TestDirectory;
 
     #[tokio::test]
     async fn lost_launcher_monitor_enters_failure_shutdown_and_removes_runtime_sockets() {
-        let homebrew =
-            TestDirectory(std::env::temp_dir().join(format!("decky-monitor-{}", Uuid::new_v4())));
+        let homebrew = TestDirectory::new("decky-monitor");
         let plugin_root = homebrew.0.join("plugins");
         fs::create_dir_all(&plugin_root).unwrap();
         let (events, _) = broadcast::channel(8);
@@ -3975,7 +3925,6 @@ mod launcher_failure_tests {
                 WorkerConfiguration {
                     executable: std::env::current_exe().unwrap(),
                     mode: WorkerMode::Fork,
-                    bootstrap: WorkerBootstrap::Lean,
                     auth_token: "monitor-regression".into(),
                     server_host: "127.0.0.1".into(),
                     server_port: 1339,
@@ -4027,23 +3976,8 @@ mod launcher_failure_tests {
 #[cfg(test)]
 mod native_backend_tests {
     use super::*;
+    use crate::test_support::TestDirectory;
     use std::os::unix::fs::symlink;
-
-    struct TestDirectory(PathBuf);
-
-    impl TestDirectory {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("decky-native-{}", Uuid::new_v4()));
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
 
     fn write_plugin(directory: &Path, backend: Value, flags: &[&str]) {
         fs::create_dir_all(directory.join("bin")).unwrap();
@@ -4062,7 +3996,7 @@ mod native_backend_tests {
 
     #[test]
     fn backend_metadata_replaces_main_py_and_refuses_unsupported_plugins() {
-        let temporary = TestDirectory::new();
+        let temporary = TestDirectory::new("decky-native");
         let plugin = temporary.0.join("native");
         write_plugin(&plugin, json!("bin/backend"), &[]);
         let metadata = read_plugin_metadata(&plugin, &[]).unwrap();
@@ -4094,7 +4028,7 @@ mod native_backend_tests {
 
     #[test]
     fn rebuilding_the_native_backend_selects_its_plugin_for_live_reload() {
-        let temporary = TestDirectory::new();
+        let temporary = TestDirectory::new("decky-native");
         let plugin = temporary.0.join("native");
         write_plugin(&plugin, json!("bin/backend"), &[]);
         let changed = |file: &str| changed_plugin_directory(&temporary.0, &plugin.join(file));
@@ -4106,7 +4040,7 @@ mod native_backend_tests {
 
     #[test]
     fn live_reload_selector_refuses_linked_or_special_metadata_without_blocking() {
-        let temporary = TestDirectory::new();
+        let temporary = TestDirectory::new("decky-native");
         let plugin = temporary.0.join("native");
         write_plugin(&plugin, json!("bin/backend"), &[]);
         let metadata = plugin.join("plugin.json");
@@ -4131,7 +4065,7 @@ mod native_backend_tests {
 
     #[test]
     fn backend_is_opened_without_symlinks_and_must_be_elf() {
-        let temporary = TestDirectory::new();
+        let temporary = TestDirectory::new("decky-native");
         let plugin = temporary.0.join("native");
         write_plugin(&plugin, json!("bin/backend"), &[]);
         let directory = open_plugin_directory_fd(&plugin).unwrap();
@@ -4166,7 +4100,7 @@ mod native_backend_tests {
 
     #[tokio::test]
     async fn native_plugins_skip_the_python_launcher_and_refuse_legacy_calls() {
-        let homebrew = TestDirectory::new();
+        let homebrew = TestDirectory::new("decky-native");
         let plugin_root = homebrew.0.join("plugins");
         let plugin = plugin_root.join("native");
         write_plugin(&plugin, json!("bin/backend"), &[]);
@@ -4178,7 +4112,6 @@ mod native_backend_tests {
             WorkerConfiguration {
                 executable: std::env::current_exe().unwrap(),
                 mode: WorkerMode::Fork,
-                bootstrap: WorkerBootstrap::Lean,
                 auth_token: "native-regression".into(),
                 server_host: "127.0.0.1".into(),
                 server_port: 1339,

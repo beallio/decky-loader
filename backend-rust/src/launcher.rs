@@ -1,3 +1,4 @@
+use crate::workers::{send_group_signal, send_signal};
 use std::{
     collections::HashSet,
     io,
@@ -51,7 +52,6 @@ pub(crate) struct LauncherEnvironment<'a> {
 impl ForkLauncher {
     pub(crate) async fn spawn(
         worker_executable: &Path,
-        bootstrap: &str,
         plugin_root: &Path,
         homebrew: &Path,
         user: &str,
@@ -65,8 +65,6 @@ impl ForkLauncher {
         let mut command = Command::new(worker_executable);
         command
             .arg("--launcher")
-            .arg("--bootstrap")
-            .arg(bootstrap)
             .env("PLUGIN_PATH", plugin_root)
             .env("UNPRIVILEGED_PATH", homebrew)
             .env("PRIVILEGED_PATH", plugin_root.parent().unwrap_or(homebrew))
@@ -393,12 +391,4 @@ async fn reap_launcher(
     }
     send_group_signal(pid, libc::SIGKILL);
     status
-}
-
-fn send_signal(pid: u32, signal: i32) {
-    let _ = crate::platform::signal_process(pid, signal);
-}
-
-fn send_group_signal(pid: u32, signal: i32) {
-    let _ = crate::platform::signal_group(pid, signal);
 }

@@ -364,7 +364,6 @@ class WorkerPinnedImportTests(unittest.TestCase):
                     socket=str(base / "plugin.sock"),
                     homebrew=str(base / "homebrew"),
                     user="selected-user",
-                    bootstrap="lean",
                     approved_launch=_approved_launch(directory_fd, flags=[]),
                 )
                 instances = []

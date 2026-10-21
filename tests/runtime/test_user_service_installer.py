@@ -719,6 +719,28 @@ class UserServiceInstallerTests(unittest.TestCase):
                 # The socket did not exist before, so a socket this command enabled is disabled again.
                 self.assertIn(("disable", "--now", socket.name), calls)
 
+    def test_restored_file_gets_snapshot_contents_and_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            target = base / "plugin_loader.service"
+            snapshot = base / "snapshot" / target.name
+            target.write_bytes(b"before")
+            target.chmod(0o640)
+            try:
+                os.setxattr(target, "user.decky", b"kept")
+            except OSError as error:
+                self.skipTest(f"user xattrs unavailable: {error}")
+            os.utime(target, ns=(1_000_000_000, 2_000_000_000))
+            state = installer._snapshot_file(target, snapshot)
+            target.write_bytes(b"after")
+            target.chmod(0o600)
+            os.removexattr(target, "user.decky")
+            installer._restore_file(target, snapshot, state)
+            self.assertEqual(target.read_bytes(), b"before")
+            self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(target.stat().st_mtime_ns, 2_000_000_000)
+            self.assertEqual(os.getxattr(target, "user.decky"), b"kept")
+
 
 if __name__ == "__main__":
     unittest.main()

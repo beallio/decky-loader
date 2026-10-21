@@ -832,7 +832,6 @@ class Host:
                 "socket": str(socket_path),
                 "homebrew": str(self.config.homebrew),
                 "user": self.config.user,
-                "bootstrap": "lean",
                 "approved_launch": {
                     "descriptor": {"pid": os.getpid(), "fd": directory_fd, "device": info.st_dev, "inode": info.st_ino},
                     "metadata": metadata,
@@ -1005,7 +1004,7 @@ def main(argv: list[str]) -> int:
             "UNPRIVILEGED_USER": config.user,
             "CHOWN_PLUGIN_PATH": "0",
         })
-        worker.prepare_runtime("lean")
+        worker.prepare_runtime()
         launcher._assert_fork_safe()
         return Host(config, listener).run()
     except (RootHostError, OSError, ValueError, KeyError) as error:

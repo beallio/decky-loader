@@ -99,7 +99,7 @@ SteamOS keeps `/etc` and `/var` across OS updates. The legacy migration already 
 
 The root host is a new subcommand of the same Rust binary (`decky-loader-runtime root-host --user
 deck`). It reuses the existing fork-launcher supervision, the approved-folder launch and process
-cleanup. It starts the shared Python host as root, with the `lean` bootstrap, and serves only root
+cleanup. It starts the shared Python host as root and serves only root
 plugins.
 
 ## Control protocol

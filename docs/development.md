@@ -17,7 +17,7 @@ This guide covers the source layout, local checks, complete runtime builds, and 
 | `tests/native-json/` | Differential encoder tests that require the compiled extension. |
 | `tests/fixtures/runtime/` | Reusable Python and JavaScript plugin fixtures. These are test inputs, not installed plugins. |
 | `scripts/runtime/` | Runtime build, bundle assembly, release validation, and dependency-audit tools. |
-| `scripts/runtime/validation/` | Maintained compatibility, privileged lifecycle, and VM benchmark tools. |
+| `scripts/runtime/validation/` | Maintained compatibility and privileged lifecycle validation tools. |
 | `scripts/` | End-user installation and diagnostic scripts. |
 | `docs/` | Contributor documentation and README images. |
 
@@ -166,19 +166,15 @@ The maintained entry points are:
 ```sh
 python3 scripts/runtime/validation/verify.py --help
 python3 scripts/runtime/validation/validate_user.py --help
-python3 scripts/runtime/validation/benchmark_vm.py --help
 ```
 
 Run these tools in a Python 3.11-or-newer environment with the backend's locked dependencies installed. The HTTP/WebSocket verifier imports `aiohttp`; a bare system Python installation may not provide it.
 
 Stage the validation scripts with their documented support inputs and fixtures. Keep captured evidence and disposable controllers in `TMPDIR`, not in the repository. The tools have different isolation and service effects:
 
-- `benchmark_vm.py` creates uniquely owned transient services in private network namespaces. It checks that the normal installation is unchanged and does not stop or reconfigure `plugin_loader.service`.
 - `verify.py` is an HTTP/WebSocket client for the supplied `--base` URL. It creates no service or network isolation. It makes plugin calls and reloads a fixture plugin, so point it at an owned test instance rather than treating it as a read-only health check.
 - `validate_user.py --verify-only` checks the staged bundle and packaged worker without starting a service.
 - `validate_user.py` without `--verify-only` starts a uniquely named temporary user service on a separate port. It does not stop or change `plugin_loader.service`. Run it as the plugin account, not as root.
-
-The benchmark's Python baseline must be the approved Python executable; never pass an installed Rust binary as the Python variant. Its standard workflow expects an installed Python baseline. If the normal installation has already changed to Rust, use an independently verified historical Python copy and a separate reviewed campaign adapter. Do not replace the normal service merely to fit the benchmark's assumptions.
 
 VM results do not establish compatibility with every third-party plugin or replace physical Steam Deck and Steam interface checks. Describe the exact candidate, workload, plugin counts, and measurement limits with each result. Do not infer reduced memory use from process count or from the implementation language.
 

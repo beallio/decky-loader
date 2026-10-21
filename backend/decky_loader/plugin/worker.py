@@ -21,7 +21,6 @@ import os
 import platform
 import stat
 import sys
-import sysconfig
 import zipimport
 from pathlib import Path
 from types import CodeType, ModuleType
@@ -47,7 +46,7 @@ _SDK_ALIAS_ROOTS = frozenset(
     ("browser", "enums", "helpers", "injector", "loader", "localplatform",
      "main", "plugin", "settings", "updater", "utilities", "wsrouter")
 )
-_prepared_bootstraps: set[str] = set()
+_runtime_prepared = False
 
 
 class _AnchoredSourceFileLoader(SourceFileLoader):
@@ -337,25 +336,20 @@ def _json_encoder_description() -> dict[str, Any]:
         "selected": selected,
         "default": default,
         "native": native_info,
-        "system_unwind_library": "libgcc_s.so.1",
     }
 
 
-def prepare_runtime(bootstrap: str) -> None:
-    if bootstrap in _prepared_bootstraps:
+def prepare_runtime() -> None:
+    global _runtime_prepared
+    if _runtime_prepared:
         return
     selected = _json_encoder_mode()
-    if bootstrap == "full":
-        importlib.import_module("decky_loader.main")
-    elif bootstrap == "lean":
-        from decky_loader.localplatform.localplatform import chmod
+    from decky_loader.localplatform.localplatform import chmod
 
-        if hasattr(sys, "_MEIPASS"):
-            chmod(cast(str, getattr(sys, "_MEIPASS")), 755)
-        if not any(isinstance(finder, _SdkAliasFinder) for finder in sys.meta_path):
-            sys.meta_path.insert(0, _SdkAliasFinder())
-    else:
-        raise WorkerError(f"unknown worker bootstrap: {bootstrap}")
+    if hasattr(sys, "_MEIPASS"):
+        chmod(cast(str, getattr(sys, "_MEIPASS")), 755)
+    if not any(isinstance(finder, _SdkAliasFinder) for finder in sys.meta_path):
+        sys.meta_path.insert(0, _SdkAliasFinder())
     importlib.import_module("decky_loader.localplatform.localsocket")
     from decky_loader.plugin import sandboxed_plugin
     if selected == "rust":
@@ -370,7 +364,7 @@ def prepare_runtime(bootstrap: str) -> None:
         from decky_loader import helpers
 
         helpers.csrf_token = auth_token
-    _prepared_bootstraps.add(bootstrap)
+    _runtime_prepared = True
 
 
 def _normalize_code(code: CodeType) -> CodeType:
@@ -404,8 +398,6 @@ def _runtime_description() -> dict[str, Any]:
     encoder_description = _json_encoder_description()
     return {
         "python": platform.python_version(),
-        "abi": sysconfig.get_config_var("SOABI") or sys.implementation.cache_tag,
-        "cache_tag": sys.implementation.cache_tag,
         "frozen": bool(getattr(sys, "frozen", False)),
         "executable": sys.executable,
         "decky_version": get_loader_version(),
@@ -423,7 +415,6 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--homebrew", help="isolated Decky homebrew directory")
     parser.add_argument("--user", help="account that owns the isolated Decky tree")
     parser.add_argument("--approved-launch", type=json.loads, help="authoritative launch metadata and directory reference")
-    parser.add_argument("--bootstrap", choices=("full", "lean"), default="lean", help="SDK startup path")
     return parser
 
 
@@ -779,7 +770,7 @@ def launch(args: argparse.Namespace) -> None:
             stream=sys.stderr,
         )
 
-        prepare_runtime(args.bootstrap)
+        prepare_runtime()
         from decky_loader.helpers import get_system_pythonpaths
         from decky_loader.localplatform.localsocket import LocalSocket
         from decky_loader.plugin.sandboxed_plugin import SandboxedPlugin

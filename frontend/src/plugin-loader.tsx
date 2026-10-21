@@ -243,7 +243,6 @@ class PluginLoader extends Logger {
 
   public async getUserInfo() {
     const userInfo = await DeckyBackend.call<[], UserInfo>('utilities/get_user_info');
-    setSetting('user_info.user_name', userInfo.username);
     setSetting('user_info.user_home', userInfo.path);
   }
 

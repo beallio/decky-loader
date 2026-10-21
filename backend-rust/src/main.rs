@@ -7,6 +7,8 @@ mod platform;
 mod plugin_manager;
 mod root_host;
 mod service_manager;
+#[cfg(test)]
+mod test_support;
 mod transport;
 mod updater;
 mod utilities;
@@ -22,9 +24,9 @@ use tokio::{
 };
 
 use backend::{Backend, RuntimeConfig};
-use workers::{PluginRegistry, WorkerBootstrap, WorkerConfiguration, WorkerMode};
+use workers::{PluginRegistry, WorkerConfiguration, WorkerMode};
 
-const HELP: &str = "Decky Rust backend (private SteamOS validation build)\n\nRequired:\n  --worker PATH              Packaged DeckyPluginWorker executable\n  --plugin-root PATH         Installed plugin directory\n  --homebrew PATH            Unprivileged settings/data/logs root\n  --user USER                Host user identity for normal plugins\n  --assets PATH              Existing Decky frontend bundles\n  --locales PATH             Existing Decky locale JSON directory\n\nOptional:\n  --worker-mode MODE         Worker supervision: fork or exec (default fork)\n  --worker-bootstrap MODE    Runtime preload: full or lean (default lean)\n  --release-version STRING  Installed Rust release identity (default dev)\n  --listen ADDRESS           Loopback address (default 127.0.0.1:1339)\n  --auth-file PATH           Read token from a private file\n  --service-name NAME        Loader user service (default plugin_loader)\n  --cef-url URL              Steam CEF debugger (default http://127.0.0.1:8080)\n  --inject-frontend BOOL     Run native frontend injector (default false)\n  --installer PATH           Transactional installer used for loader updates\n  --github-api URL           GitHub API origin\n  --release-repository NAME  Rust release repository (default beallio/decky-loader)\n  --testing-download-url URL Rust testing artifact service (default https://nightly.link)\n\nUses the upstream Decky frontend and packaged Python SDK pinned in build-config.json.\nSupports plugin management, utilities, native CEF integration and transactional\nloader updates.\n";
+const HELP: &str = "Decky Rust backend (private SteamOS validation build)\n\nRequired:\n  --worker PATH              Packaged DeckyPluginWorker executable\n  --plugin-root PATH         Installed plugin directory\n  --homebrew PATH            Unprivileged settings/data/logs root\n  --user USER                Host user identity for normal plugins\n  --assets PATH              Existing Decky frontend bundles\n  --locales PATH             Existing Decky locale JSON directory\n\nOptional:\n  --worker-mode MODE         Worker supervision: fork or exec (default fork)\n  --release-version STRING  Installed Rust release identity (default dev)\n  --listen ADDRESS           Loopback address (default 127.0.0.1:1339)\n  --auth-file PATH           Read token from a private file\n  --service-name NAME        Loader user service (default plugin_loader)\n  --cef-url URL              Steam CEF debugger (default http://127.0.0.1:8080)\n  --inject-frontend BOOL     Run native frontend injector (default false)\n  --installer PATH           Transactional installer used for loader updates\n  --github-api URL           GitHub API origin\n  --release-repository NAME  Rust release repository (default beallio/decky-loader)\n  --testing-download-url URL Rust testing artifact service (default https://nightly.link)\n\nUses the upstream Decky frontend and packaged Python SDK pinned in build-config.json.\nSupports plugin management, utilities, native CEF integration and transactional\nloader updates.\n";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -38,7 +40,6 @@ async fn main() -> anyhow::Result<()> {
         if ![
             "--worker",
             "--worker-mode",
-            "--worker-bootstrap",
             "--release-version",
             "--plugin-root",
             "--homebrew",
@@ -74,15 +75,6 @@ async fn main() -> anyhow::Result<()> {
         "exec" => WorkerMode::Exec,
         "fork" => WorkerMode::Fork,
         value => bail!("invalid --worker-mode {value:?}; expected exec or fork"),
-    };
-    let worker_bootstrap = match options
-        .remove("--worker-bootstrap")
-        .as_deref()
-        .unwrap_or("lean")
-    {
-        "full" => WorkerBootstrap::Full,
-        "lean" => WorkerBootstrap::Lean,
-        value => bail!("invalid --worker-bootstrap {value:?}; expected full or lean"),
     };
     let address: SocketAddr = options
         .remove("--listen")
@@ -232,7 +224,6 @@ async fn main() -> anyhow::Result<()> {
         WorkerConfiguration {
             executable: worker,
             mode: worker_mode,
-            bootstrap: worker_bootstrap,
             auth_token: auth.clone(),
             server_host: address.ip().to_string(),
             server_port: address.port(),

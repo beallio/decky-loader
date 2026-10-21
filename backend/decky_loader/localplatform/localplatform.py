@@ -1,4 +1,4 @@
-import platform, os, sys
+import platform, os
 
 ON_WINDOWS = platform.system() == "Windows"
 ON_MAC = platform.system() == "Darwin"
@@ -7,16 +7,8 @@ ON_LINUX = not ON_WINDOWS and not ON_MAC
 # macOS reports arm64, Linux reports aarch64
 ON_ARM64 = platform.machine() == "arm64" or platform.machine() == "aarch64" 
 
-# sys.platform here, not ON_WINDOWS/ON_MAC, so type checkers see the selected module.
-if sys.platform == "win32":
-    from .localplatformwin import *
-    from . import localplatformwin as localplatform
-elif sys.platform == "darwin":
-    from .localplatformmac import *
-    from . import localplatformmac as localplatform
-else:
-    from .localplatformlinux import *
-    from . import localplatformlinux as localplatform
+from .localplatformlinux import *
+from . import localplatformlinux as localplatform
 
 def get_privileged_path() -> str:
     '''Get path accessible by elevated user. Holds plugins, decky loader and decky loader configs'''

@@ -161,11 +161,7 @@ impl Utilities {
     ) -> Option<Result<Value, RpcError>> {
         if !matches!(
             route,
-            "utilities/ping"
-                | "utilities/settings/get"
-                | "utilities/settings/set"
-                | "utilities/get_user_info"
-                | "utilities/filepicker_ls"
+            "utilities/filepicker_ls"
                 | "utilities/http_request"
                 | "utilities/execute_in_tab"
                 | "utilities/inject_css_into_tab"
@@ -193,16 +189,6 @@ impl Utilities {
         args: Vec<Value>,
     ) -> Result<Value, RpcError> {
         match route {
-            "utilities/ping" => {
-                exact(&args, 0)?;
-                Ok(json!("pong"))
-            }
-            "utilities/settings/get" => self.call_legacy_method(backend, "get_setting", args).await,
-            "utilities/settings/set" => self.call_legacy_method(backend, "set_setting", args).await,
-            "utilities/get_user_info" => {
-                self.call_legacy_method(backend, "get_user_info", args)
-                    .await
-            }
             "utilities/filepicker_ls" => {
                 self.call_legacy_method(backend, "filepicker_ls", args)
                     .await
@@ -2233,29 +2219,14 @@ mod tests {
         FilePickerOptions, filepicker_listing, probe_listener, require_root_authority,
         run_tcp_forwarder, same_cef_debugger, stands_in_for_cef_forwarder,
     };
-    use std::{fs, path::PathBuf};
+    use std::fs;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
         sync::watch,
     };
-    use uuid::Uuid;
 
-    struct TestDir(PathBuf);
-
-    impl TestDir {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("decky-filepicker-{}", Uuid::new_v4()));
-            fs::create_dir_all(&path).expect("create temporary file picker directory");
-            Self(path)
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::test_support::TestDirectory;
 
     #[tokio::test]
     async fn external_forwarder_port_is_not_reported_as_stopped() {
@@ -2377,7 +2348,7 @@ mod tests {
 
     #[test]
     fn filepicker_filters_extensions_hides_dotfiles_and_keeps_directories_first() {
-        let temp = TestDir::new();
+        let temp = TestDirectory::new("decky-filepicker");
         fs::create_dir(temp.0.join("Folder")).unwrap();
         fs::write(temp.0.join("alpha.TXT"), b"a").unwrap();
         fs::write(temp.0.join("Beta.txt"), b"b").unwrap();
@@ -2423,7 +2394,7 @@ mod tests {
 
     #[test]
     fn filepicker_empty_or_missing_start_path_opens_home() {
-        let home = TestDir::new();
+        let home = TestDirectory::new("decky-filepicker");
         fs::write(home.0.join("in-home.txt"), b"x").unwrap();
         let home_path = home.0.to_string_lossy().into_owned();
         for path in [None, Some(String::new())] {
@@ -2435,7 +2406,7 @@ mod tests {
 
     #[test]
     fn filepicker_file_start_path_opens_its_folder() {
-        let temp = TestDir::new();
+        let temp = TestDirectory::new("decky-filepicker");
         fs::write(temp.0.join("chosen.txt"), b"x").unwrap();
         fs::write(temp.0.join("sibling.txt"), b"y").unwrap();
         let file = temp.0.join("chosen.txt").to_string_lossy().into_owned();
@@ -2447,7 +2418,7 @@ mod tests {
 
     #[test]
     fn filepicker_invalid_regex_falls_back_to_literal_substring() {
-        let temp = TestDir::new();
+        let temp = TestDirectory::new("decky-filepicker");
         fs::write(temp.0.join("[notes].txt"), b"x").unwrap();
         fs::write(temp.0.join("notes.txt"), b"y").unwrap();
         let listing = filepicker_listing(
@@ -2470,7 +2441,7 @@ mod tests {
     }
     #[test]
     fn filepicker_supports_regex_lookarounds_and_backreferences() {
-        let temp = TestDir::new();
+        let temp = TestDirectory::new("decky-filepicker");
         fs::write(temp.0.join("abba.txt"), b"x").unwrap();
         fs::write(temp.0.join("other.txt"), b"y").unwrap();
         let listing = filepicker_listing(
