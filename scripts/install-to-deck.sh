@@ -672,6 +672,7 @@ create_homebrew_archive() {
 import errno
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import tarfile
@@ -815,6 +816,17 @@ for suffix in range(1000):
         continue
     os.chmod(final, 0o600, follow_symlinks=False)
     os.unlink(temporary)
+    # Keep the newest KEEP archives of this service; each one holds the whole homebrew folder.
+    KEEP = 3
+    pattern = re.compile(rf'homebrew-{re.escape(service)}-\d{{8}}T\d{{6}}Z-\d+(-\d+)?\.tar')
+    archives = []
+    for entry in os.scandir(backup_directory):
+        info = entry.stat(follow_symlinks=False)
+        if pattern.fullmatch(entry.name) and stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid():
+            archives.append((info.st_mtime_ns, entry.name))
+    for _, name in sorted(archives, reverse=True)[KEEP:]:
+        if name != final.name:
+            os.unlink(backup_directory / name)
     print(final)
     break
 else:

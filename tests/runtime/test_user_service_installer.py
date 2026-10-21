@@ -559,6 +559,53 @@ class UserServiceInstallerTests(unittest.TestCase):
             self.assertTrue(staging.is_dir())
             self.assertFalse(final.exists())
 
+    def test_prune_keeps_three_undo_steps_and_the_runtimes_they_start(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {name: root / name for name in ("homebrew", "history", "runtimes", "units")}
+            for path in paths.values():
+                path.mkdir()
+            paths.update(unit=root / "units" / "plugin_loader.service", head=root / "head.json")
+
+            def runtime(number):
+                return f"{number + 100:032x}"
+
+            def unit_text(number):
+                return f"ExecStart=/x --worker {paths['runtimes']}/{runtime(number)}/DeckyPluginWorker\n"
+
+            def write_record(number, operation, parent):
+                record_id = f"{number:032x}"
+                before = paths["history"] / record_id / "before"
+                before.mkdir(parents=True)
+                (before / "unit").write_text(unit_text(number - 1), encoding="utf-8")
+                record = {
+                    "schema": 1, "id": record_id, "service": "plugin_loader.service",
+                    "homebrew": str(paths["homebrew"]), "operation": operation,
+                    "parent": parent, "files": {}, "activation": {},
+                }
+                (paths["history"] / record_id / "record.json").write_text(json.dumps(record), encoding="utf-8")
+                return record_id
+
+            parent = None
+            for number in range(1, 6):
+                (paths["runtimes"] / runtime(number)).mkdir()
+                parent = write_record(number, "install", parent)
+            orphan_rollback = write_record(99, "rollback", None)
+            paths["unit"].write_text(unit_text(5), encoding="utf-8")
+            paths["head"].write_text(json.dumps({"id": parent}), encoding="utf-8")
+
+            installer._prune_history(paths)
+
+            self.assertEqual({entry.name for entry in paths["history"].iterdir()}, {f"{n:032x}" for n in (3, 4, 5)})
+            self.assertNotIn(orphan_rollback, {entry.name for entry in paths["history"].iterdir()})
+            self.assertIsNone(installer._current_record(paths, f"{3:032x}")["parent"])
+            self.assertEqual({entry.name for entry in paths["runtimes"].iterdir()}, {runtime(n) for n in (2, 3, 4, 5)})
+
+            # A current unit that names no runtime must not make every runtime look unused.
+            paths["unit"].write_text("ExecStart=/x\n", encoding="utf-8")
+            installer._prune_history(paths)
+            self.assertEqual({entry.name for entry in paths["runtimes"].iterdir()}, {runtime(n) for n in (2, 3, 4, 5)})
+
     def test_root_plugin_adoption_restores_original_when_stage_rename_fails(self):
         user = pwd.getpwuid(os.geteuid())
         with tempfile.TemporaryDirectory() as temporary:

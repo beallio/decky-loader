@@ -2288,6 +2288,7 @@ def _run_install(args: argparse.Namespace) -> dict[str, object]:
             except BaseException as rollback_error:
                 raise InstallerError(f'installation failed ({error}); automatic recovery is pending ({rollback_error})') from error
             raise InstallerError(f'installation activation failed and was rolled back: {error}') from error
+        _prune_history_after_commit(paths)
         return {
             'ok': True,
             'command': 'install',
@@ -2317,6 +2318,52 @@ def _current_head(paths: dict[str, Path]) -> str | None:
         _fail('installer history head is invalid')
     _current_record(paths, value)
     return value
+
+
+ROLLBACK_DEPTH = 3
+
+
+def _prune_history(paths: dict[str, Path]) -> None:
+    # Keep the newest ROLLBACK_DEPTH undo steps and only the runtimes that they or the current unit start.
+    kept: dict[str, dict[str, Any]] = {}
+    record_id = _current_head(paths)
+    while record_id is not None and len(kept) < ROLLBACK_DEPTH:
+        try:
+            record = _current_record(paths, record_id)
+        except InstallerError:
+            break
+        kept[record_id] = record
+        parent = record.get('parent')
+        record_id = parent if isinstance(parent, str) and re.fullmatch(r'[0-9a-f]{32}', parent) else None
+    if kept:
+        oldest_id, oldest = list(kept.items())[-1]
+        if oldest.get('parent') is not None:
+            _write_json(paths['history'] / oldest_id / 'record.json', {**oldest, 'parent': None}, 0o600)
+
+    def runtimes_in(unit: Path) -> set[str]:
+        if not unit.is_file():
+            return set()
+        return {match.decode() for match in re.findall(rb'/runtimes/([0-9a-f]{32})/', unit.read_bytes())}
+
+    current = runtimes_in(paths['unit'])
+    used = current.union(*(runtimes_in(paths['history'] / record_id / 'before' / 'unit') for record_id in kept))
+    removable = [entry for entry in paths['history'].iterdir() if entry.name not in kept]
+    # If the current unit names no runtime, its runtime cannot be told apart from unused ones.
+    if current:
+        removable += [entry for entry in paths['runtimes'].iterdir() if entry.name not in used]
+    for entry in removable:
+        if re.fullmatch(r'[0-9a-f]{32}', entry.name) and entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+    _fsync_directory(paths['history'])
+    _fsync_directory(paths['runtimes'])
+
+
+def _prune_history_after_commit(paths: dict[str, Path]) -> None:
+    try:
+        _prune_history(paths)
+    except (OSError, InstallerError) as error:
+        print(f'install.py: could not remove old rollback data: {error}', file=sys.stderr)
+
 
 
 def _run_rollback(args: argparse.Namespace) -> dict[str, object]:
@@ -2364,6 +2411,7 @@ def _run_rollback(args: argparse.Namespace) -> dict[str, object]:
         except BaseException as rollback_error:
             raise InstallerError(f'rollback failed ({error}); recovery is pending ({rollback_error})') from error
         raise InstallerError(f'rollback failed and the current installation was restored: {error}') from error
+    _prune_history_after_commit(paths)
     return {
         'ok': True,
         'command': 'rollback',

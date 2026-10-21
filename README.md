@@ -100,7 +100,7 @@ How we measured:
    The `--check` command only tests the download and your Deck. It changes nothing. The second command installs the latest stable version.
 4. Go back to Gaming Mode.
 
-You do not need a GitHub account or developer tools. Before each change, the script saves a copy of your `homebrew` folder (your plugins and settings) in `~/decky-user-backups`. To save it in a different folder, add `--backup-dir FOLDER`.
+You do not need a GitHub account or developer tools. Before each change, the script saves a copy of your `homebrew` folder (your plugins and settings) in `~/decky-user-backups`. It keeps the 3 newest copies and deletes older ones. To save the copies in a different folder, add `--backup-dir FOLDER`.
 
 To install a test version, add `--channel preview`. To install one specific version, add `--version` and the version name, for example `--version v3.2.10-rust.7`.
 
@@ -125,6 +125,8 @@ To go back to the previous version of this fork:
 ```sh
 bash install-to-deck.sh --undo
 ```
+
+You can do this up to 3 times to go back 3 versions. Older versions are deleted to save disk space.
 
 To go back to the official Decky that you had before this fork:
 
