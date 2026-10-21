@@ -1,0 +1,170 @@
+# SPDX-License-Identifier: 0BSD
+"""Runs a native plugin backend on the upstream Python Decky Loader.
+
+Copy this file next to plugin.json as main.py, and set "api_version": 1 and
+"backend" in plugin.json. The Rust fork of Decky Loader starts the backend
+itself and ignores this file. The upstream loader imports this file; it starts
+the same backend and relays frontend calls and events over the native worker
+protocol (newline-delimited JSON on DECKY_PLUGIN_SOCKET).
+"""
+
+import asyncio
+import ctypes
+import itertools
+import json
+import os
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+
+import decky
+
+# Upstream sends SIGKILL to the worker 5 s after it asks it to stop; unload and
+# uninstall must both finish before that.
+STOP_SECONDS = 4.5
+PR_SET_PDEATHSIG = 1
+_prctl = ctypes.CDLL(None, use_errno=True).prctl
+
+
+def _backend_path():
+    with open(os.path.join(decky.DECKY_PLUGIN_DIR, "plugin.json")) as file:
+        backend = json.load(file).get("backend")
+    if not isinstance(backend, str) or not backend or os.path.isabs(backend):
+        raise RuntimeError("plugin.json has no relative backend path")
+    plugin = os.path.realpath(decky.DECKY_PLUGIN_DIR)
+    path = os.path.realpath(os.path.join(plugin, backend))
+    if os.path.commonpath([plugin, path]) != plugin or not os.access(path, os.X_OK):
+        raise RuntimeError(f"backend {backend!r} is not an executable inside the plugin")
+    return path
+
+
+def _start(env):
+    worker = os.getpid()
+
+    def die_with_worker():
+        # Last resort if the worker is killed. SIGKILL, because the SDK handles
+        # only the first SIGTERM and then waits for its hooks without a limit.
+        if _prctl(PR_SET_PDEATHSIG, signal.SIGKILL) != 0 or os.getppid() != worker:
+            os._exit(1)
+
+    return subprocess.Popen(
+        [_backend_path()], env={**os.environ, **env}, preexec_fn=die_with_worker
+    )
+
+
+def _wait(process, deadline):
+    # Blocks the event loop on purpose. When upstream closes the plugin socket
+    # during stop, its listener spins on EOF without yielding, so an _unload
+    # that awaits never resumes and the worker is killed after 5 s.
+    try:
+        process.wait(max(0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        decky.logger.warning("Backend did not stop in time; killing it")
+        process.kill()
+        process.wait()
+
+
+class Plugin:
+    def __init__(self):
+        self._process = None
+        self._writer = None
+        self._directory = None
+        self._ready = asyncio.Event()
+        self._error = None
+        self._pending = {}
+        self._ids = itertools.count()
+        self._deadline = None
+
+    def __getattr__(self, name):
+        # Upstream finds frontend methods with getattr; hooks start with "_".
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        async def call(*args):
+            return await self._call(name, list(args))
+
+        return call
+
+    async def _call(self, method, args):
+        await self._ready.wait()
+        if self._error is not None:
+            raise RuntimeError(self._error)
+        key = str(next(self._ids))
+        reply = asyncio.get_running_loop().create_future()
+        self._pending[key] = reply
+        message = {"type": 0, "method": method, "id": key, "args": args}
+        try:
+            self._writer.write(json.dumps(message).encode() + b"\n")
+            await self._writer.drain()
+            return await reply
+        finally:
+            self._pending.pop(key, None)
+
+    async def _main(self):
+        try:
+            self._directory = tempfile.mkdtemp(prefix="decky-native-")
+            socket = os.path.join(self._directory, "backend.sock")
+            self._process = _start({"DECKY_PLUGIN_SOCKET": socket})
+            # The backend listens only after its migration hook.
+            while True:
+                if self._process.poll() is not None:
+                    raise RuntimeError(f"backend exited with {self._process.returncode}")
+                try:
+                    reader, self._writer = await asyncio.open_unix_connection(
+                        socket, limit=64 * 1024 * 1024
+                    )
+                    break
+                except (FileNotFoundError, ConnectionRefusedError):
+                    await asyncio.sleep(0.05)
+        except Exception as error:
+            decky.logger.error(f"Could not start the native backend: {error}")
+            self._fail(f"native backend did not start: {error}")
+            return
+        self._ready.set()
+        await self._relay(reader)
+
+    async def _relay(self, reader):
+        while line := await reader.readline():
+            message = json.loads(line)
+            if message.get("type") == 1:
+                reply = self._pending.get(message.get("id"))
+                if reply is None or reply.done():
+                    continue
+                if message.get("success"):
+                    reply.set_result(message.get("res"))
+                else:
+                    reply.set_exception(RuntimeError(message.get("res")))
+            elif message.get("type") == 2:
+                await decky.emit(message["event"], *message.get("args", []))
+        self._writer.close()
+        self._fail("native backend stopped")
+
+    def _fail(self, error):
+        self._error = error
+        self._ready.set()
+        for reply in self._pending.values():
+            if not reply.done():
+                reply.set_exception(RuntimeError(error))
+
+    async def _unload(self):
+        self._deadline = time.monotonic() + STOP_SECONDS
+        if self._process is not None:
+            self._process.send_signal(signal.SIGTERM)
+            _wait(self._process, self._deadline)
+        if self._directory is not None:
+            shutil.rmtree(self._directory, ignore_errors=True)
+
+    async def _uninstall(self):
+        # Upstream reports an uninstall only after _unload, so run the backend's
+        # uninstall hook alone in a second process.
+        deadline = self._deadline or time.monotonic() + STOP_SECONDS
+        try:
+            process = _start({"DECKY_PLUGIN_HOOK": "uninstall"})
+        except Exception as error:
+            decky.logger.error(f"Could not run the backend uninstall hook: {error}")
+            return
+        _wait(process, deadline)
+        if process.returncode:
+            decky.logger.error(f"Backend uninstall hook exited with {process.returncode}")

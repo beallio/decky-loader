@@ -226,10 +226,23 @@ impl Plugin {
     /// unload and uninstall hooks. Decky allows five seconds for this before it
     /// kills the process. SIGTERM or SIGINT stops the plugin at any time,
     /// including during migration.
+    ///
+    /// With `DECKY_PLUGIN_HOOK=uninstall` it runs only the uninstall hook and
+    /// returns. The `main.py` shim for the upstream loader uses this, because
+    /// upstream tells it about an uninstall only after unload.
     pub async fn run(self) -> io::Result<()> {
         set_process_name(&env::var("DECKY_PLUGIN_NAME").unwrap_or_default());
         if let Err(error) = init_logging() {
             eprintln!("Could not open the plugin log file: {error}");
+        }
+        if let Some(hook) = env::var_os("DECKY_PLUGIN_HOOK") {
+            if hook != "uninstall" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown DECKY_PLUGIN_HOOK {hook:?}"),
+                ));
+            }
+            return self.uninstall_only(Env::from_env()).await;
         }
         let socket = env::var_os("DECKY_PLUGIN_SOCKET").ok_or_else(|| {
             io::Error::new(
@@ -246,6 +259,21 @@ impl Plugin {
             }
         };
         self.serve(Env::from_env(), Path::new(&socket), stop).await
+    }
+
+    async fn uninstall_only(self, env: Env) -> io::Result<()> {
+        let Some(uninstall) = self.uninstall else {
+            return Ok(());
+        };
+        // Decky never connects in this mode, so emit fails at once.
+        let (_, link) = watch::channel(Link::Unavailable);
+        let context = Context {
+            env: Arc::new(env),
+            link,
+        };
+        uninstall(context)
+            .await
+            .map_err(|error| io::Error::other(format!("uninstall failed: {error}")))
     }
 
     async fn serve(
@@ -677,6 +705,36 @@ mod tests {
             assert_eq!(*hooks.lock().unwrap(), expected);
             assert!(!socket.exists(), "the socket file is removed on exit");
         }
+    }
+
+    #[tokio::test]
+    async fn uninstall_only_runs_just_the_uninstall_hook() {
+        let hooks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = |name: &'static str| {
+            let hooks = Arc::clone(&hooks);
+            move |context: Context| async move {
+                hooks.lock().unwrap().push(name);
+                // Nothing listens for events in this mode; emit must not wait.
+                assert!(context.emit("gone", vec![]).await.is_err());
+                Ok(())
+            }
+        };
+        Plugin::new()
+            .on_migration(record("migration"))
+            .on_main(record("main"))
+            .on_unload(record("unload"))
+            .on_uninstall(record("uninstall"))
+            .uninstall_only(Env::default())
+            .await
+            .unwrap();
+        assert_eq!(*hooks.lock().unwrap(), ["uninstall"]);
+
+        let error = Plugin::new()
+            .on_uninstall(|_context| async { Err("disk full".to_owned()) })
+            .uninstall_only(Env::default())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("disk full"));
     }
 
     #[tokio::test]

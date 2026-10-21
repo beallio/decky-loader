@@ -160,10 +160,16 @@ The `decky-plugin` crate implements all of this, including a log file in `DECKY_
 
 Limits:
 
-- A plugin cannot have both `main.py` and `backend`, and native backends cannot use the `root` flag yet. The loader refuses such plugins.
-- Only `loader/call_plugin_method` calls reach a native backend; the legacy `loader/call_legacy_plugin_method` route is refused.
-- This is a fork feature. The upstream loader treats a plugin without `main.py` as frontend-only, so its backend calls fail there.
+- Native backends cannot use the `root` flag yet. The loader refuses such plugins.
+- Only `loader/call_plugin_method` calls reach a native backend; the legacy `loader/call_legacy_plugin_method` route is refused. Upstream refuses it too for `api_version` 1.
+- Without the shim, the upstream loader treats a native plugin as frontend-only, so its backend calls fail there.
 - The loader still needs the packaged Python worker at startup, even when every plugin is native, but it does not start the shared Python launcher for native plugins.
+
+#### Plugins for both loaders
+
+The upstream Python loader ignores `backend` and imports `main.py`. To ship one plugin for both loaders, copy [`backend-rust/decky-plugin/shim/main.py`](../backend-rust/decky-plugin/shim/main.py) next to `plugin.json` and set `"api_version": 1`. This loader starts the backend itself and ignores `main.py`. On upstream, the shim starts the same backend with its own socket, forwards frontend calls and events, and stops it with SIGTERM within upstream's five-second stop limit, then SIGKILL. If the worker dies, the kernel sends SIGKILL to the backend. For an uninstall, the shim then runs the backend again with `DECKY_PLUGIN_HOOK=uninstall`, and the crate runs only the `on_uninstall` hook. That hook therefore runs in a new process and cannot use state from the stopped backend.
+
+On upstream, the backend does not get `DECKY_AUTH_TOKEN`, `SERVER_HOST` or `SERVER_PORT`, and the `root` flag stays unsupported.
 
 ## Validate an owned VM copy
 

@@ -1617,19 +1617,16 @@ fn read_plugin_metadata_from_fd(
         }
         None => (None, 0),
     };
-    let has_main_py = is_regular_file_at(approved_directory.as_ref(), OsStr::new("main.py"))
-        .map_err(|error| {
-            WorkerError::Error(format!(
-                "Could not inspect plugin entry point {}: {error}",
-                directory_path.join("main.py").display()
-            ))
-        })?;
-    if has_main_py && native_backend.is_some() {
-        return Err(WorkerError::Error(format!(
-            "Plugin has both main.py and a native backend; remove one: {}",
-            directory_path.display()
-        )));
-    }
+    // A native backend wins: its main.py, if any, is a shim for the upstream loader.
+    let has_main_py = native_backend.is_none()
+        && is_regular_file_at(approved_directory.as_ref(), OsStr::new("main.py")).map_err(
+            |error| {
+                WorkerError::Error(format!(
+                    "Could not inspect plugin entry point {}: {error}",
+                    directory_path.join("main.py").display()
+                ))
+            },
+        )?;
     let passive = !has_main_py && native_backend.is_none();
 
     Ok(PluginMetadata {
@@ -3995,7 +3992,7 @@ mod native_backend_tests {
     }
 
     #[test]
-    fn backend_metadata_replaces_main_py_and_refuses_unsupported_plugins() {
+    fn backend_metadata_wins_over_main_py_and_refuses_unsupported_plugins() {
         let temporary = TestDirectory::new("decky-native");
         let plugin = temporary.0.join("native");
         write_plugin(&plugin, json!("bin/backend"), &[]);
@@ -4004,7 +4001,9 @@ mod native_backend_tests {
         assert!(!metadata.passive);
 
         fs::write(plugin.join("main.py"), b"pass\n").unwrap();
-        assert!(metadata_error(&plugin).contains("both main.py and a native backend"));
+        let metadata = read_plugin_metadata(&plugin, &[]).unwrap();
+        assert_eq!(metadata.native_backend.as_deref(), Some("bin/backend"));
+        assert!(!metadata.passive);
         fs::remove_file(plugin.join("main.py")).unwrap();
 
         write_plugin(&plugin, json!("bin/backend"), &["root"]);
