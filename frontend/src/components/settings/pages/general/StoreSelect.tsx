@@ -107,12 +107,15 @@ const StoreList: FC<{
           <FaPlus /> {t('StoreSelect.add_store')}
         </DialogButton>
       </Field>
-      <ReorderableList<StoreEntryData>
-        entries={entries}
-        onSave={(saved) => onChange(saved.map((entry) => entry.data!.url))}
-        interactables={StoreInteractables}
-        fieldProps={{ indentLevel: 1 }}
-      />
+      {/* Fork: the first store row touched the field above; match the 6px gap between rows and add a divider. */}
+      <div style={{ marginTop: '6px', paddingTop: '6px', borderTop: '1px solid #3a4652' }}>
+        <ReorderableList<StoreEntryData>
+          entries={entries}
+          onSave={(saved) => onChange(saved.map((entry) => entry.data!.url))}
+          interactables={StoreInteractables}
+          fieldProps={{ indentLevel: 1 }}
+        />
+      </div>
     </>
   );
 };
