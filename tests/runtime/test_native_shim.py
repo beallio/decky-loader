@@ -76,6 +76,8 @@ class NativeShimTests(unittest.TestCase):
         decky.emit = emit
         self.enterContext(mock.patch.dict(sys.modules, {'decky': decky}))
         self.enterContext(mock.patch.dict(os.environ, {'MARKS': str(self.marks)}))
+        # Keep the shim's process-wide socket patch out of other worker tests.
+        self.enterContext(mock.patch.dict(sys.modules, {'decky_loader.localplatform.localsocket': None}))
         spec = importlib.util.spec_from_file_location('native_shim', SHIM)
         self.shim = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.shim)
