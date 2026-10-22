@@ -10,7 +10,7 @@ import {
   Toggle,
   showModal,
 } from '@decky/ui';
-import { FC, useEffect, useState } from 'react';
+import { FC, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { FaEdit, FaPlus, FaTrash } from 'react-icons/fa';
 
@@ -76,6 +76,7 @@ const StoreList: FC<{
   onChange(urls: string[]): void;
 }> = ({ label, description, urls, takenURLs, minimum, onChange }) => {
   const { t } = useTranslation();
+  const addButton = useRef<HTMLDivElement>(null);
   const editURL = (title: string, initialURL: string, onSave: (url: string) => void) =>
     showModal(<StoreURLModal title={title} initialURL={initialURL} takenURLs={takenURLs} onSave={onSave} />);
 
@@ -93,7 +94,13 @@ const StoreList: FC<{
         editURL(t('StoreSelect.edit_store'), url, (edited) =>
           onChange(urls.map((other) => (other === url ? edited : other))),
         ),
-      onRemove: urls.length > minimum ? () => onChange(urls.filter((other) => other !== url)) : undefined,
+      onRemove:
+        urls.length > minimum
+          ? () => {
+              addButton.current?.focus();
+              onChange(urls.filter((other) => other !== url));
+            }
+          : undefined,
     },
   }));
 
@@ -101,6 +108,7 @@ const StoreList: FC<{
     <>
       <Field label={label} description={description}>
         <DialogButton
+          ref={addButton}
           style={{ display: 'flex', alignItems: 'center', gap: '8px' }}
           onClick={() => editURL(t('StoreSelect.add_store'), '', (added) => onChange([...urls, added]))}
         >
