@@ -1272,10 +1272,30 @@ def _environment_keys(lines: list[str]) -> set[str]:
 def _listener_configuration(environment: list[str], listen: str) -> tuple[list[str], list[str]]:
     host, port = _listen_endpoint(listen)
     assignments = [f'SERVER_HOST={host}', f'SERVER_PORT={port}']
-    environment.extend(f'Environment={assignment}' for assignment in assignments)
+    preserved: list[str] = []
+    for line in environment:
+        if not line.startswith('Environment='):
+            preserved.append(line)
+            continue
+        try:
+            entries = shlex.split(line.split('=', 1)[1], posix=True)
+        except ValueError as error:
+            raise InstallerError(f'cannot preserve an invalid existing Environment directive: {error}') from error
+        remaining = [
+            entry for entry in entries
+            if not (entry.partition('=')[1] and entry.partition('=')[0] in ('SERVER_HOST', 'SERVER_PORT'))
+        ]
+        if remaining:
+            preserved.append(
+                'Environment=' + ' '.join(json.dumps(entry, ensure_ascii=False) for entry in remaining)
+                if len(remaining) != len(entries) else line
+            )
+        elif not entries:
+            preserved.append(line)
+    preserved.extend(f'Environment={assignment}' for assignment in assignments)
     # EnvironmentFile and drop-ins can override Environment. Set the selected
     # endpoint immediately before exec, matching Rust's explicit --listen.
-    return environment, ['/usr/bin/env', *assignments]
+    return preserved, ['/usr/bin/env', *assignments]
 
 
 def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_name: str, listen: str, cef_url: str, inject_frontend: bool, worker_mode: str, github_api: str, release_repository: str, testing_download_url: str, version: str) -> bytes:

@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import pwd
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,49 @@ from process_observer import Process
 
 
 class UserServiceInstallerTests(unittest.TestCase):
+
+    def test_generated_unit_roundtrip_deduplicates_listener_environment(self) -> None:
+        paths = {
+            "unit": Path("loader.service"),
+            "homebrew": Path("/home/deck/homebrew"),
+            "services": Path("/home/deck/homebrew/services"),
+            "binary": Path("/runtime/decky-loader-runtime"),
+        }
+        generated = (
+            "[Service]\nEnvironment=\n"
+            'Environment="KEEP=plain" "QUOTED=value with spaces" SERVER_HOST=old SERVER_PORT=1\n'
+            "Environment=SERVER_HOST=older\nEnvironment=SERVER_PORT=2\n"
+            "EnvironmentFile=-/etc/decky-loader.env\n"
+            "[Install]\n"
+        )
+
+        def unit_source(*_args, **_kwargs):
+            return SimpleNamespace(stdout=generated)
+
+        with patch.object(installer, "_systemctl", side_effect=unit_source):
+            for listen in ("127.0.0.1:1337", "127.0.0.1:1337", "127.0.0.2:1444"):
+                generated = installer._generated_unit(
+                    paths, Path("/runtime"), "deck", "loader.service", listen,
+                    "http://127.0.0.1:8080", False, "default", "https://api.github.com",
+                    "beallio/decky-loader", "https://nightly.link", "1.0",
+                ).decode()
+
+        service = generated.split("[Service]\n", 1)[1].split("\n[Install]", 1)[0]
+        environment_lines = [line for line in service.splitlines() if line.startswith("Environment=")]
+        assignments = [
+            entry for line in environment_lines
+            for entry in shlex.split(line.split("=", 1)[1])
+        ]
+        self.assertEqual(sum(entry.startswith("SERVER_HOST=") for entry in assignments), 1)
+        self.assertEqual(sum(entry.startswith("SERVER_PORT=") for entry in assignments), 1)
+        self.assertIn("Environment=", service)
+        self.assertEqual(environment_lines.count("Environment="), 1)
+        self.assertIn("KEEP=plain", assignments)
+        self.assertIn("QUOTED=value with spaces", assignments)
+        self.assertIn("EnvironmentFile=-/etc/decky-loader.env", service)
+        self.assertIn("SERVER_HOST=127.0.0.2", service)
+        self.assertIn("SERVER_PORT=1444", service)
+
     def write_bundle(self, bundle: Path, sdk_tag: str, worker_version: str, worker_python: str = "3.11.9") -> None:
         files = {
             "decky-loader-runtime": b"rust executable",
