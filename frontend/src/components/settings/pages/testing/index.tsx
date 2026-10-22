@@ -106,6 +106,8 @@ export default function TestingVersionList() {
                         try {
                           await downloadTestingVersion(version.id, version.head_sha);
                           downloadToast.dismiss();
+                          // Fork: switch the branch only when the download worked.
+                          setSetting('branch', UpdateBranch.Testing);
                         } catch (e) {
                           if (e instanceof Error) {
                             DeckyPluginLoader.toaster.toast({
@@ -115,7 +117,6 @@ export default function TestingVersionList() {
                             });
                           }
                         }
-                        setSetting('branch', UpdateBranch.Testing);
                       }}
                     >
                       <div

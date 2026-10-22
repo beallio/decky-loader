@@ -55,6 +55,11 @@ SDK_OVERLAYS = (
     'frontend/src/components/store/PluginCard.tsx',
     'frontend/src/components/store/Store.tsx',
     'frontend/src/components/modals/RootInfoModal.tsx',
+    'frontend/src/components/modals/PluginInstallModal.tsx',
+    'frontend/src/components/modals/MultiplePluginsInstallModal.tsx',
+    'frontend/src/components/modals/PluginUninstallModal.tsx',
+    'frontend/src/components/settings/pages/developer/index.tsx',
+    'frontend/src/components/settings/pages/testing/index.tsx',
 )
 SDK_REMOVALS = (
     'frontend/src/steamfixes/README.md',

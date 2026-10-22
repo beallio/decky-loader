@@ -56,15 +56,26 @@ const PluginInstallModal: FC<PluginInstallModalProps> = ({
   return (
     <ConfirmModal
       bOKDisabled={loading}
+      strCancelButtonText={loading ? t('PluginInstallModal.close') : undefined}
       closeModal={closeModal}
       onOK={async () => {
         setLoading(true);
-        await onOK();
+        try {
+          await onOK();
+        } catch (e) {
+          // Fork: the request is consumed; show the error and close instead of offering a broken retry.
+          DeckyPluginLoader.toaster.toast({
+            title: t('PluginInstallModal.failed', { artifact }),
+            body: e instanceof Error ? e.message : String(e),
+          });
+          return;
+        }
         setTimeout(() => Navigation.OpenQuickAccessMenu(QuickAccessTab.Decky), 250);
         setTimeout(() => DeckyPluginLoader.checkPluginUpdates(), 1000);
       }}
       onCancel={async () => {
-        await onCancel();
+        // Fork: after confirmation, B only closes the window; it cannot cancel the install.
+        if (!loading) await onCancel();
       }}
       strTitle={
         <div>

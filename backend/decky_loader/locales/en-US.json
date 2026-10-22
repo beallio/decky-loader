@@ -58,6 +58,7 @@
             "reinstall": "Reinstall {{name}} {{version}}",
             "update": "Update {{name}} to {{version}}"
         },
+        "failed": "Could not install the plugins",
         "ok_button": {
             "idle": "Confirm",
             "loading": "Working"
@@ -93,6 +94,7 @@
         "plugin_version_label": "Plugin Version"
     },
     "PluginInstallModal": {
+        "close": "Close",
         "disabled": "The plugin will be re-enabled after installation",
         "downgrade": {
             "button_idle": "Downgrade",
@@ -100,6 +102,7 @@
             "desc": "Are you sure you want to downgrade {{artifact}} to version {{version}}?",
             "title": "Downgrade {{artifact}}"
         },
+        "failed": "Could not install {{artifact}}",
         "install": {
             "button_idle": "Install",
             "button_processing": "Installing",
@@ -176,6 +179,9 @@
         "plugin_update_one": "Updates available for 1 plugin!",
         "plugin_update_other": "Updates available for {{count}} plugins!"
     },
+    "PluginUninstallModal": {
+        "failed": "Could not uninstall {{name}}"
+    },
     "PluginView": {
         "disabled_one": "1 plugin is disabled",
         "disabled_other": "{{count}} plugins are disabled",
@@ -226,7 +232,8 @@
             "header": "Third-Party Plugins",
             "label_desc": "URL",
             "label_url": "Install Plugin from URL",
-            "label_zip": "Install Plugin from ZIP File"
+            "label_zip": "Install Plugin from ZIP File",
+            "zip_failed": "Could not open the plugin ZIP"
         },
         "valve_internal": {
             "desc1": "Enables the Valve internal developer menu.",
@@ -376,6 +383,7 @@
         "patch_notes_desc": "Patch Notes",
         "updates": {
             "check_button": "Check For Updates",
+            "check_failed": "Could not check for updates",
             "checking": "Checking",
             "cur_version": "Current version: {{ver}}",
             "failed": "Decky update failed",

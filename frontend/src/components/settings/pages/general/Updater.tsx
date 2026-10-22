@@ -153,9 +153,18 @@ export default function UpdaterSettings() {
               !versionInfo?.remote || versionInfo?.remote?.tag_name == versionInfo?.current
                 ? async () => {
                     setCheckingForUpdates(true);
-                    const verInfo = await checkForUpdates();
-                    setVersionInfo(verInfo);
-                    setCheckingForUpdates(false);
+                    try {
+                      setVersionInfo(await checkForUpdates());
+                    } catch (e) {
+                      // Fork: a failed check left the button disabled until the page was opened again.
+                      DeckyPluginLoader.toaster.toast({
+                        title: t('Updater.updates.check_failed'),
+                        body: e instanceof Error ? e.message : String(e),
+                        icon: <FaExclamation />,
+                      });
+                    } finally {
+                      setCheckingForUpdates(false);
+                    }
                   }
                 : async () => {
                     setUpdateProgress(0);

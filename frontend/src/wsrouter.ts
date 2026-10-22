@@ -50,7 +50,7 @@ interface FullSyncMessage {
 
 interface ErrorMessage {
   type: MessageType.ERROR;
-  error: { name: string; error: string; traceback: string | null };
+  error: { name: string; traceback: string | null } & ({ message: string } | { error: string });
   id: number;
 }
 
@@ -163,7 +163,9 @@ export class WSRouter extends Logger {
 
         case MessageType.ERROR:
           if (this.runningCalls.has(data.id)) {
-            let err = new PyError(data.error.name, data.error.error, data.error.traceback);
+            // Route errors use "error"; failures in a route use "message".
+            const message = 'message' in data.error ? data.error.message : data.error.error;
+            let err = new PyError(data.error.name, message, data.error.traceback);
             this.runningCalls.get(data.id)!.reject(err);
             this.runningCalls.delete(data.id);
             this.debug(`[${data.id}] Rejected PY call with error`, data.error);

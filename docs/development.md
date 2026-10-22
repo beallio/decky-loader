@@ -95,6 +95,10 @@ pnpm --dir frontend run build
 
 The output is consumed by both Python packaging and the complete Rust bundle build. The complete runtime builder performs this work in its temporary source snapshot; it does not replace the checkout's generated assets.
 
+Failed plugin installs and uninstalls close their confirmation window and show an error notification. Once an install starts, **Close** (or B) dismisses only the window; it does not cancel the install. To try a failed install again, start a new install request. Cancelling the ZIP picker is a normal exit. A failed update check releases its busy state, and a failed testing-build download does not change the update channel.
+
+WebSocket error replies have two shapes: missing-route errors use `error.error`, and failures inside a route use `error.message`. The frontend reads both so that error notifications retain the backend's explanation.
+
 ### Catalog downloads
 
 Store catalog, version-map, and GitHub repository metadata requests use the authenticated `/fetch` proxy with `catalog=true`. The backend requests gzip, decodes it, and limits each response to 5 MB (5,000,000 decoded bytes). The 20-second backend deadline includes redirects, response headers, and the complete body. A timeout returns HTTP 504; an oversized body, invalid gzip, or unsupported content encoding returns HTTP 502.
