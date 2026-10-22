@@ -16,6 +16,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -26,6 +27,31 @@ import decky
 STOP_SECONDS = 4.5
 PR_SET_PDEATHSIG = 1
 _prctl = ctypes.CDLL(None, use_errno=True).prctl
+
+
+def _park_at_socket_eof():
+    # Upstream's worker reads its loader socket in a loop that never yields at
+    # EOF. When the loader closes the socket before the worker handles SIGTERM,
+    # the worker spins until SIGKILL and _unload/_uninstall never run
+    # (SteamDeckHomebrew/decky-loader#975). Wait forever at EOF instead.
+    # shortcut: patches an upstream internal; drop once upstream ships #972.
+    module = sys.modules.get("decky_loader.localplatform.localsocket")
+    socket = getattr(module, "UnixSocket", None)
+    read = getattr(socket, "_read_single_line", None)
+    if read is None or getattr(read, "parks_at_eof", False):
+        return
+
+    async def read_or_park(self, reader):
+        line = await read(self, reader)
+        if not line and reader.at_eof():
+            await asyncio.get_running_loop().create_future()
+        return line
+
+    read_or_park.parks_at_eof = True
+    socket._read_single_line = read_or_park
+
+
+_park_at_socket_eof()
 
 
 def _backend_path():

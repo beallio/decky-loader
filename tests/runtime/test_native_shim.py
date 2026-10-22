@@ -7,12 +7,15 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
 from unittest import mock
 
 SHIM = Path(__file__).resolve().parents[2] / 'backend-rust' / 'decky-plugin' / 'shim' / 'main.py'
+# Same EOF handling as upstream's worker socket (SteamDeckHomebrew/decky-loader#975).
+LOCALSOCKET = Path(__file__).resolve().parents[2] / 'backend' / 'decky_loader' / 'localplatform' / 'localsocket.py'
 
 # Stands in for bin/backend: the worker protocol of the decky-plugin crate, plus
 # marks in $MARKS for each lifecycle hook it runs.
@@ -163,6 +166,32 @@ class NativeShimTests(unittest.TestCase):
                 await plugin.echo()
 
         asyncio.run(scenario())
+
+    def test_worker_socket_waits_at_eof_so_shutdown_can_run(self):
+        spec = importlib.util.spec_from_file_location('decky_loader.localplatform.localsocket', LOCALSOCKET)
+        localsocket = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(localsocket)
+        with mock.patch.dict(sys.modules, {'decky_loader.localplatform.localsocket': localsocket}):
+            self.shim._park_at_socket_eof()
+        resumed = threading.Event()
+
+        async def scenario():
+            worker = localsocket.UnixSocket()
+            worker.socket_addr = str(self.plugin_dir / 'loader.sock')
+
+            async def on_new_message(line):
+                return None
+
+            await worker.setup_server(on_new_message)
+            _, loader = await asyncio.open_unix_connection(worker.socket_addr)
+            loader.close()  # the loader closes its end while it stops the plugin
+            # A spinning listener never lets this sleep resume.
+            await asyncio.sleep(0.2)
+            resumed.set()
+
+        # A daemon thread, so a spinning loop fails the test instead of hanging it.
+        threading.Thread(target=asyncio.run, args=(scenario(),), daemon=True).start()
+        self.assertTrue(resumed.wait(3))
 
 
 if __name__ == '__main__':

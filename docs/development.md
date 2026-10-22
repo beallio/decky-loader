@@ -171,6 +171,8 @@ The upstream Python loader ignores `backend` and imports `main.py`. To ship one 
 
 On upstream, the shim runs a copy of the backend, `.decky-native-backend` in `DECKY_PLUGIN_RUNTIME_DIR`, and removes it after an uninstall. Upstream installs a local ZIP whose file name differs from the plugin name by extracting it over the live plugin folder ([upstream #993](https://github.com/SteamDeckHomebrew/decky-loader/issues/993)). Linux refuses to overwrite a running executable (`ETXTBSY`), so running the packaged file would leave such an update half applied.
 
+The shim also patches upstream's worker socket reader so that it waits at EOF instead of spinning. Upstream's listener never yields once the loader closes the socket, so a stop that loses that race ends in SIGKILL after five seconds, and `_unload` and `_uninstall` never run ([upstream #975](https://github.com/SteamDeckHomebrew/decky-loader/issues/975), fixed by the open [#972](https://github.com/SteamDeckHomebrew/decky-loader/pull/972)). If upstream renames the reader, the patch does nothing.
+
 On upstream, the backend does not get `DECKY_AUTH_TOKEN`, `SERVER_HOST` or `SERVER_PORT`, and the `root` flag stays unsupported.
 
 ## Validate an owned VM copy
