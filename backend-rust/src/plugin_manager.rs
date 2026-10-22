@@ -672,13 +672,7 @@ impl PluginManager {
 
         if let Some(before) = &before_settings {
             let mut after = before.clone();
-            if was_registered {
-                for key in SETTINGS_KEYS {
-                    remove_first(after.get_mut(key), name);
-                }
-            } else {
-                after.get_mut("pluginOrder").push(name.to_owned());
-            }
+            reconcile_install_settings(&mut after, name, was_registered, was_installed);
             persist_settings_lists(backend, before, &after).await?;
         }
         backend
@@ -772,13 +766,7 @@ impl PluginManager {
 
         if let Some(before) = &before_settings {
             let mut after = before.clone();
-            if was_registered {
-                for key in SETTINGS_KEYS {
-                    remove_first(after.get_mut(key), name);
-                }
-            } else if !was_installed {
-                after.get_mut("pluginOrder").push(name.to_owned());
-            }
+            reconcile_install_settings(&mut after, name, was_registered, was_installed);
             if let Err(error) = persist_settings_lists(backend, before, &after).await {
                 let rollback_error = self
                     .rollback_install(
@@ -1708,6 +1696,23 @@ fn remove_first(values: &mut Vec<String>, needle: &str) {
     }
 }
 
+fn reconcile_install_settings(
+    settings: &mut SettingsLists,
+    name: &str,
+    was_registered: bool,
+    was_installed: bool,
+) {
+    if was_registered {
+        for key in SETTINGS_KEYS {
+            if key != "pluginOrder" {
+                remove_first(settings.get_mut(key), name);
+            }
+        }
+    } else if !was_installed {
+        settings.get_mut("pluginOrder").push(name.to_owned());
+    }
+}
+
 async fn restore_registered_plugin(
     backend: &Backend,
     directory: Option<&Path>,
@@ -1894,6 +1899,33 @@ mod tests {
         assert_eq!(
             settings.get("disabled_plugins"),
             ["already-disabled", "enabled"]
+        );
+    }
+
+    #[test]
+    fn install_settings_preserve_existing_order_and_append_fresh_installs_once() {
+        let mut settings = SettingsLists {
+            values: SETTINGS_KEYS
+                .into_iter()
+                .map(|key| {
+                    (
+                        key,
+                        vec!["before".to_owned(), "Target".to_owned(), "after".to_owned()],
+                    )
+                })
+                .collect(),
+        };
+
+        reconcile_install_settings(&mut settings, "Target", true, true);
+        assert_eq!(settings.get("pluginOrder"), ["before", "Target", "after"]);
+        assert_eq!(settings.get("frozenPlugins"), ["before", "after"]);
+        assert_eq!(settings.get("hiddenPlugins"), ["before", "after"]);
+        assert_eq!(settings.get("disabled_plugins"), ["before", "after"]);
+
+        reconcile_install_settings(&mut settings, "Fresh", false, false);
+        assert_eq!(
+            settings.get("pluginOrder"),
+            ["before", "Target", "after", "Fresh"]
         );
     }
 }

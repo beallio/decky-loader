@@ -99,6 +99,8 @@ Failed plugin installs and uninstalls close their confirmation window and show a
 
 WebSocket error replies have two shapes: missing-route errors use `error.error`, and failures inside a route use `error.message`. The frontend reads both so that error notifications retain the backend's explanation.
 
+Replacing an installed plugin preserves its position in `pluginOrder`, for both normal and root plugins. Fresh installs append once; uninstall removes the entry. Installation still clears that plugin's frozen, hidden, and disabled flags, as before.
+
 ### Catalog downloads
 
 Store catalog, version-map, and GitHub repository metadata requests use the authenticated `/fetch` proxy with `catalog=true`. The backend requests gzip, decodes it, and limits each response to 5 MB (5,000,000 decoded bytes). The 20-second backend deadline includes redirects, response headers, and the complete body. A timeout returns HTTP 504; an oversized body, invalid gzip, or unsupported content encoding returns HTTP 502.
