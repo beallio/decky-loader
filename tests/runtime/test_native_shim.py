@@ -39,6 +39,10 @@ server.bind(os.environ["DECKY_PLUGIN_SOCKET"])
 server.listen()
 stream = server.accept()[0].makefile("rwb")
 for line in stream:
+    if mode == "garbage":
+        stream.write(b"not json\\n")
+        stream.flush()
+        continue
     call = json.loads(line)
     reply = {"type": 1, "id": call["id"], "success": True, "res": call["args"]}
     if call["method"] == "fail":
@@ -132,6 +136,32 @@ class NativeShimTests(unittest.TestCase):
 
         asyncio.run(scenario())
         self.assertEqual(self.marks.read_text().split(), ['unload', 'updated'])
+
+    def test_unparsable_reply_fails_pending_calls_instead_of_hanging(self):
+        async def scenario():
+            plugin = self.shim.Plugin()
+            main = asyncio.create_task(plugin._main())
+            with self.assertRaisesRegex(RuntimeError, 'relay failed'):
+                await asyncio.wait_for(plugin.echo(), 5)
+            with self.assertRaisesRegex(RuntimeError, 'relay failed'):
+                await plugin.echo()
+            await plugin._unload()
+            await asyncio.wait_for(main, 5)
+
+        with mock.patch.dict(os.environ, {'FAKE_MODE': 'garbage'}):
+            asyncio.run(scenario())
+
+    def test_lone_surrogate_argument_rejects_and_later_calls_still_work(self):
+        async def scenario():
+            plugin = self.shim.Plugin()
+            main = asyncio.create_task(plugin._main())
+            with self.assertRaises(UnicodeEncodeError):
+                await asyncio.wait_for(plugin.echo('\ud800'), 5)
+            self.assertEqual(await plugin.echo('ok'), ['ok'])
+            await plugin._unload()
+            await asyncio.wait_for(main, 5)
+
+        asyncio.run(scenario())
 
     def test_kills_a_backend_that_ignores_sigterm_at_the_deadline(self):
         async def scenario():

@@ -35,6 +35,7 @@ use std::{
 };
 
 pub use serde_json;
+pub use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -47,8 +48,17 @@ use tokio::{
 /// that rejects the frontend call.
 pub type MethodResult = Result<Value, String>;
 
+/// Like [`MethodResult`], with the value already serialized. A large result can be
+/// serialized straight from borrowed data instead of first being copied into a [`Value`].
+pub type RawMethodResult = Result<Box<RawValue>, String>;
+
+enum Reply {
+    Value(Value),
+    Raw(Box<RawValue>),
+}
+
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-type Method = Box<dyn Fn(Context, Vec<Value>) -> BoxFuture<MethodResult> + Send + Sync>;
+type Method = Box<dyn Fn(Context, Vec<Value>) -> BoxFuture<Result<Reply, String>> + Send + Sync>;
 type Hook = Box<dyn FnOnce(Context) -> BoxFuture<Result<(), String>> + Send>;
 type Writer = Arc<Mutex<OwnedWriteHalf>>;
 
@@ -177,7 +187,26 @@ impl Plugin {
     {
         self.methods.insert(
             name.into(),
-            Box::new(move |context, args| Box::pin(method(context, args))),
+            Box::new(move |context, args| {
+                let call = method(context, args);
+                Box::pin(async move { call.await.map(Reply::Value) })
+            }),
+        );
+        self
+    }
+
+    /// Like [`Plugin::method`], for a method that returns already-serialized JSON.
+    pub fn method_raw<F, Fut>(mut self, name: impl Into<String>, method: F) -> Self
+    where
+        F: Fn(Context, Vec<Value>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = RawMethodResult> + Send + 'static,
+    {
+        self.methods.insert(
+            name.into(),
+            Box::new(move |context, args| {
+                let call = method(context, args);
+                Box::pin(async move { call.await.map(Reply::Raw) })
+            }),
         );
         self
     }
@@ -335,7 +364,7 @@ impl Plugin {
                 link.send_replace(Link::Connected(Arc::clone(&writer)));
                 let mut lines = BufReader::new(reader).lines();
                 while let Some(line) = lines.next_line().await? {
-                    let message: Value = match serde_json::from_str(&line) {
+                    let mut message: Value = match serde_json::from_str(&line) {
                         Ok(message) => message,
                         Err(error) => {
                             log::error!("Ignoring a message that is not JSON: {error}");
@@ -355,8 +384,8 @@ impl Plugin {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned();
-                    let args = match message.get("args") {
-                        Some(Value::Array(args)) => args.clone(),
+                    let args = match message.get_mut("args").map(Value::take) {
+                        Some(Value::Array(args)) => args,
                         _ => Vec::new(),
                     };
                     let (methods, context, writer) =
@@ -377,11 +406,10 @@ impl Plugin {
                             .await
                             .unwrap_or_else(|error| Err(format!("Method {name} failed: {error}")));
                         let (success, res) = match result {
-                            Ok(value) => (true, value),
-                            Err(message) => (false, Value::String(message)),
+                            Ok(reply) => (true, reply),
+                            Err(message) => (false, Reply::Value(Value::String(message))),
                         };
-                        let reply = json!({"type": 1, "id": id, "success": success, "res": res});
-                        if let Err(error) = write_line(&writer, &reply).await {
+                        if let Err(error) = write_reply(&writer, &id, success, &res).await {
                             log::error!("Could not answer {name}: {error}");
                         }
                     });
@@ -450,6 +478,25 @@ async fn write_line(writer: &Mutex<OwnedWriteHalf>, message: &Value) -> io::Resu
     let mut line = serde_json::to_vec(message)?;
     line.push(b'\n');
     writer.lock().await.write_all(&line).await
+}
+
+/// Writes a reply line. A raw result goes to the socket as is, so a large reply is
+/// never copied into a second buffer.
+async fn write_reply(writer: &Mutex<OwnedWriteHalf>, id: &Value, success: bool, res: &Reply) -> io::Result<()> {
+    let mut head = format!(r#"{{"type":1,"id":{},"success":{success},"res":"#, serde_json::to_string(id)?).into_bytes();
+    match res {
+        Reply::Value(value) => {
+            serde_json::to_writer(&mut head, value)?;
+            head.extend_from_slice(b"}\n");
+            writer.lock().await.write_all(&head).await
+        }
+        Reply::Raw(raw) => {
+            let mut writer = writer.lock().await;
+            writer.write_all(&head).await?;
+            writer.write_all(raw.get().as_bytes()).await?;
+            writer.write_all(b"}\n").await
+        }
+    }
 }
 
 /// Sends [`log`] records to a new file in `DECKY_PLUGIN_LOG_DIR` and to standard
@@ -623,6 +670,10 @@ mod tests {
                     Ok(json!(args.iter().filter_map(Value::as_i64).sum::<i64>()))
                 })
                 .method("fail", |_context, _args| async { Err("nope".to_owned()) })
+                .method_raw("raw", |_context, args| async move {
+                    serde_json::value::to_raw_value(&json!({"args": args, "text": "é\n"}))
+                        .map_err(|error| error.to_string())
+                })
                 .method("panic", |_context, _args| async { panic!("handler bug") })
                 .method(
                     "panic_early",
@@ -660,6 +711,7 @@ mod tests {
                 ("c", "gone", json!([])),
                 ("d", "panic", json!([])),
                 ("e", "panic_early", json!([])),
+                ("f", "raw", json!([1, "x"])),
             ] {
                 let call = json!({"type": 0, "method": method, "id": id, "args": args});
                 writer
@@ -672,6 +724,10 @@ mod tests {
                     "add" => assert_eq!(
                         (&reply["success"], &reply["res"]),
                         (&json!(true), &json!(5))
+                    ),
+                    "raw" => assert_eq!(
+                        (&reply["success"], &reply["res"]),
+                        (&json!(true), &json!({"args": [1, "x"], "text": "é\n"}))
                     ),
                     "fail" => assert_eq!(
                         (&reply["success"], &reply["res"]),
