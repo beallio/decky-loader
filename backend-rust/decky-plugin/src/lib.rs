@@ -500,9 +500,23 @@ async fn write_reply(
             writer.lock().await.write_all(&head).await
         }
         Reply::Raw(raw) => {
+            // Each message is one line. In valid JSON a newline can only be whitespace
+            // (strings escape it), so dropping it keeps a pretty-printed value intact.
+            let bytes = raw.get().as_bytes();
+            let compact: Vec<u8>;
+            let bytes = if bytes.contains(&b'\n') {
+                compact = bytes
+                    .iter()
+                    .copied()
+                    .filter(|byte| *byte != b'\n')
+                    .collect();
+                &compact
+            } else {
+                bytes
+            };
             let mut writer = writer.lock().await;
             writer.write_all(&head).await?;
-            writer.write_all(raw.get().as_bytes()).await?;
+            writer.write_all(bytes).await?;
             writer.write_all(b"}\n").await
         }
     }
@@ -680,8 +694,10 @@ mod tests {
                 })
                 .method("fail", |_context, _args| async { Err("nope".to_owned()) })
                 .method_raw("raw", |_context, args| async move {
-                    serde_json::value::to_raw_value(&json!({"args": args, "text": "é\n"}))
-                        .map_err(|error| error.to_string())
+                    // Pretty-printed on purpose: newlines must not split the reply line.
+                    let text = serde_json::to_string_pretty(&json!({"args": args, "text": "é\n"}))
+                        .map_err(|error| error.to_string())?;
+                    RawValue::from_string(text).map_err(|error| error.to_string())
                 })
                 .method("panic", |_context, _args| async { panic!("handler bug") })
                 .method(
