@@ -2483,7 +2483,8 @@ impl InotifyWatcher {
     fn new(plugin_root: &Path) -> io::Result<Self> {
         let plugin_root = fs::canonicalize(plugin_root)?;
         let mut watcher = Self {
-            fd: AsyncFd::new(platform::inotify_init()?)?,
+            // SAFETY: the new inotify OwnedFd is moved into AsyncFd and never closed or replaced while owned.
+            fd: unsafe { AsyncFd::register(platform::inotify_init()?)? },
             plugin_root,
             watched_directories: HashMap::new(),
         };
@@ -2961,7 +2962,8 @@ async fn live_reload_loop(
     }
 }
 fn process_exit_notification(pid: u32) -> io::Result<AsyncFd<OwnedFd>> {
-    AsyncFd::new(platform::process_exit_fd(pid)?)
+    // SAFETY: the new pidfd OwnedFd is moved into AsyncFd and never closed or replaced while owned.
+    Ok(unsafe { AsyncFd::register(platform::process_exit_fd(pid)?)? })
 }
 
 fn socket_filename() -> String {
