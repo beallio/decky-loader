@@ -482,8 +482,17 @@ async fn write_line(writer: &Mutex<OwnedWriteHalf>, message: &Value) -> io::Resu
 
 /// Writes a reply line. A raw result goes to the socket as is, so a large reply is
 /// never copied into a second buffer.
-async fn write_reply(writer: &Mutex<OwnedWriteHalf>, id: &Value, success: bool, res: &Reply) -> io::Result<()> {
-    let mut head = format!(r#"{{"type":1,"id":{},"success":{success},"res":"#, serde_json::to_string(id)?).into_bytes();
+async fn write_reply(
+    writer: &Mutex<OwnedWriteHalf>,
+    id: &Value,
+    success: bool,
+    res: &Reply,
+) -> io::Result<()> {
+    let mut head = format!(
+        r#"{{"type":1,"id":{},"success":{success},"res":"#,
+        serde_json::to_string(id)?
+    )
+    .into_bytes();
     match res {
         Reply::Value(value) => {
             serde_json::to_writer(&mut head, value)?;
