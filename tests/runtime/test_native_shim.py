@@ -163,6 +163,33 @@ class NativeShimTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_trim_waits_for_quiet_traffic_and_no_pending_calls(self):
+        trims = []
+        self.shim._malloc_trim = lambda pad: trims.append(pad)
+        self.shim.TRIM_DELAY_SECONDS = 0.2
+
+        async def scenario():
+            plugin = self.shim.Plugin()
+            main = asyncio.create_task(plugin._main())
+            large = 'x' * (self.shim.TRIM_LINE_BYTES + 1)
+            self.assertEqual(await plugin.echo(large), [large])
+            # Small calls every 0.1 s for 0.8 s keep postponing the trim.
+            for _ in range(8):
+                self.assertEqual(await plugin.echo('small'), ['small'])
+                await asyncio.sleep(0.1)
+            self.assertEqual(trims, [])
+            # A call still waiting for its reply also defers it.
+            plugin._pending['held'] = asyncio.get_running_loop().create_future()
+            await asyncio.sleep(0.5)
+            self.assertEqual(trims, [])
+            del plugin._pending['held']
+            await asyncio.sleep(0.5)
+            self.assertEqual(trims, [0])
+            await plugin._unload()
+            await asyncio.wait_for(main, 5)
+
+        asyncio.run(scenario())
+
     def test_returns_freed_memory_once_after_a_burst_of_large_replies(self):
         trims = []
         self.shim._malloc_trim = lambda pad: trims.append(pad)
