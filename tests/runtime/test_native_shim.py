@@ -163,6 +163,28 @@ class NativeShimTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_returns_freed_memory_once_after_a_burst_of_large_replies(self):
+        trims = []
+        self.shim._malloc_trim = lambda pad: trims.append(pad)
+        self.shim.TRIM_DELAY_SECONDS = 0.2
+
+        async def scenario():
+            plugin = self.shim.Plugin()
+            main = asyncio.create_task(plugin._main())
+            self.assertEqual(await plugin.echo('small'), ['small'])
+            await asyncio.sleep(0.4)
+            self.assertEqual(trims, [])
+            large = 'x' * (self.shim.TRIM_LINE_BYTES + 1)
+            for _ in range(3):
+                self.assertEqual(await plugin.echo(large), [large])
+            self.assertEqual(trims, [])
+            await asyncio.sleep(0.4)
+            self.assertEqual(trims, [0])
+            await plugin._unload()
+            await asyncio.wait_for(main, 5)
+
+        asyncio.run(scenario())
+
     def test_kills_a_backend_that_ignores_sigterm_at_the_deadline(self):
         async def scenario():
             plugin = self.shim.Plugin()
