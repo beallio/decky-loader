@@ -30,6 +30,10 @@ const HELP: &str = "Decky Rust backend (private SteamOS validation build)\n\nReq
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // glibc raises its mmap threshold after the first large free, so later plugin
+    // download buffers stayed in thread arenas; a fixed 1 MiB returns them on free.
+    // SAFETY: mallopt only sets an allocator parameter and takes no pointers.
+    unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 1024 * 1024) };
     let mut arguments = std::env::args().skip(1);
     let mut options = HashMap::new();
     while let Some(key) = arguments.next() {
