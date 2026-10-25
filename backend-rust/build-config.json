@@ -3,8 +3,8 @@
     "version": "3.14.8",
     "repository": "astral-sh/python-build-standalone",
     "release": "20261013",
-    "asset": "cpython-3.14.8+20261013-x86_64-unknown-linux-gnu-install_only.tar.gz",
-    "sha256": "322271a761140ffb3f522431048f701831e412c8f64770103d2b881ee2bbaed0"
+    "asset": "cpython-3.14.8+20261013-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+    "sha256": "d8faa1b588506b9e3e5a3f57807bb056d534a1641a6b10d15b6ea3f0b413b960"
   },
   "rust": "1.98.1",
   "node": "24.18.0",
