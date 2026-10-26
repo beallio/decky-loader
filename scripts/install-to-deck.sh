@@ -1181,6 +1181,11 @@ PY
     if [[ $action == forget-legacy ]]; then
         need sudo
         legacy_helper=$(protected_legacy_helper) || fail 'No saved legacy service was found'
+        # Helpers saved before --forget-legacy existed lack the command; the retained kit has it.
+        if [[ $(python3 -B "$legacy_helper" --help) != *forget-legacy-system* ]]; then
+            [[ -f $kit/install.py && -f $kit/process_observer.py ]] || fail "No retained user installer kit at $kit"
+            legacy_helper=$kit/install.py
+        fi
         "${sudo_args[@]}" python3 -B "$legacy_helper" forget-legacy-system \
             --homebrew "$homebrew" --service-name "$unit" --user "$user"
         printf 'The saved copy of the old Decky was deleted.\n'
