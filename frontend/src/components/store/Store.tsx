@@ -81,6 +81,15 @@ const StorePage: FC<{}> = () => {
 // Steam can restart before CEF writes localStorage to disk, which brought back an older view.
 const VIEW_SETTING = 'store_view';
 
+const ERROR_BANNER = {
+  marginLeft: '20px',
+  marginRight: '20px',
+  marginBottom: '20px',
+  padding: '8px 12px',
+  background: 'rgba(255, 0, 0, 0.067)',
+  border: '2px solid rgba(255, 0, 0, 0.467)',
+};
+
 const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }> = ({ setPluginCount }) => {
   const { t } = useTranslation();
 
@@ -111,6 +120,7 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
   const [staleStores, setStaleStores] = useState<{ url: string; fetchedAt: number }[]>([]);
   const [fetchedAt, setFetchedAt] = useState<number | null>(null);
   const [refreshing, setRefreshing] = useState<boolean>(false);
+  const [storeError, setStoreError] = useState<'load_failed' | 'update_required' | null>(null);
   const [now, setNow] = useState<number>(Date.now());
   const [isTesting, setIsTesting] = useState<boolean>(false);
   const searchField = useRef<HTMLDivElement>(null);
@@ -118,13 +128,17 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
   const load = useCallback(async (force: boolean) => {
     setRefreshing(true);
     try {
-      const { plugins, failed, stale, fetchedAt } = await getPluginList(force);
+      const { plugins, failed, stale, fetchedAt, updateRequired } = await getPluginList(force);
       logger.debug('got data!', plugins, failed, stale);
       setPluginList(plugins);
       setFailedStores(failed);
       setStaleStores(stale);
       setFetchedAt(fetchedAt);
       setPluginCount(plugins.length);
+      setStoreError(updateRequired ? 'update_required' : null);
+    } catch (e) {
+      logger.error('Failed to load the plugin store', e);
+      setStoreError('load_failed');
     } finally {
       setRefreshing(false);
       setNow(Date.now());
@@ -165,9 +179,13 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
 
   useEffect(() => {
     (async () => {
-      const { includePrereleases } = await getStoreSettings();
-      logger.debug(`includePrereleases is ${includePrereleases}`);
-      setIsTesting(includePrereleases);
+      try {
+        const { includePrereleases } = await getStoreSettings();
+        logger.debug(`includePrereleases is ${includePrereleases}`);
+        setIsTesting(includePrereleases);
+      } catch (e) {
+        logger.error('Failed to read the store settings', e);
+      }
     })();
   }, []);
 
@@ -370,27 +388,25 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
           })}
         </div>
       ))}
+      {/* No retry button: a button that disappears loses the controller focus; Refresh retries. */}
+      {storeError && (
+        <div role="alert" style={ERROR_BANNER}>
+          {storeError === 'update_required' ? t('Store.errors.update_required') : t('Store.errors.load_failed')}
+        </div>
+      )}
       {failedStores.map((url) => (
-        <div
-          key={url}
-          style={{
-            marginLeft: '20px',
-            marginRight: '20px',
-            marginBottom: '20px',
-            padding: '8px 12px',
-            background: 'rgba(255, 0, 0, 0.067)',
-            border: '2px solid rgba(255, 0, 0, 0.467)',
-          }}
-        >
+        <div key={url} style={ERROR_BANNER}>
           {/* React escapes the text; i18next escaping would show "/" as "&#x2F;". */}
           {t('Store.store_unavailable', { url, interpolation: { escapeValue: false } })}
         </div>
       ))}
       <div>
         {!shownPlugins ? (
-          <div style={{ height: '100%' }}>
-            <SteamSpinner background="transparent" />
-          </div>
+          !pluginList && storeError ? null : (
+            <div style={{ height: '100%' }}>
+              <SteamSpinner background="transparent" />
+            </div>
+          )
         ) : shownPlugins.length === 0 ? (
           <div style={{ margin: '40px 20px', textAlign: 'center', color: '#8b929a' }}>{t('Store.store_no_match')}</div>
         ) : (

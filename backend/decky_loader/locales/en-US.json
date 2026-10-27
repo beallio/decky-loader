@@ -284,6 +284,11 @@
             "start": "Initializing",
             "uninstalling_previous": "Uninstalling previous copy"
         },
+        "errors": {
+            "load_failed": "Unable to load the plugin store. Please try again.",
+            "update_required": "Update Decky Loader to use the plugin store."
+        },
+        "retry": "Retry",
         "store_cache": {
             "age": "Store list updated {{when}}",
             "next": "automatic refresh {{when}}"

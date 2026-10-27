@@ -3,7 +3,7 @@
 [project]
 name = "decky-loader"
 # The SDK tag from backend-rust/build-config.json, without the "v".
-version = "3.3.0"
+version = "3.3.1"
 description = "A plugin loader for the Steam Deck"
 license = "GPL-2.0-only"
 requires-python = ">=3.10,<3.15"

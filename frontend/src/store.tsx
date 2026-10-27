@@ -124,9 +124,16 @@ async function fetchPluginList(storeURL: string, signal: AbortSignal): Promise<S
   return plugins;
 }
 
+class StoreRequestError extends Error {
+  constructor(public readonly status: number) {
+    super(`Plugin store request failed (HTTP ${status})`);
+    this.name = 'StoreRequestError';
+  }
+}
+
 async function fetchJSON(url: string, signal: AbortSignal): Promise<unknown> {
   const response = await storeFetch(url, signal);
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  if (!response.ok) throw new StoreRequestError(response.status);
   return response.json();
 }
 
@@ -157,6 +164,8 @@ export async function getPluginList(force = false): Promise<{
   failed: string[];
   stale: { url: string; fetchedAt: number }[];
   fetchedAt: number | null;
+  /** A store answered 426: it refuses this Decky version. */
+  updateRequired: boolean;
 }> {
   const settings = await getStoreSettings();
   const sources = storeSources(settings);
@@ -170,9 +179,14 @@ export async function getPluginList(force = false): Promise<{
   } catch (e) {
     console.warn('Could not clean the saved plugin lists', e);
   }
+  let updateRequired = false;
   const { results, stale, fetchedAt } = await loadWithCache(
     sources,
-    fetchPluginList,
+    (url, signal) =>
+      fetchPluginList(url, signal).catch((e) => {
+        if (e instanceof StoreRequestError && e.status === 426) updateRequired = true;
+        throw e;
+      }),
     STORE_TIMEOUT_MS,
     savedLists,
     Date.now(),
@@ -183,7 +197,7 @@ export async function getPluginList(force = false): Promise<{
   const shown = settings.includePrereleases
     ? results
     : results.map(({ source, value }) => ({ source, value: value && withoutPrereleases(value) }));
-  return { ...mergePluginLists(shown), stale, fetchedAt };
+  return { ...mergePluginLists(shown), stale, fetchedAt, updateRequired };
 }
 
 async function fetchVersionList(storeURL: string, signal: AbortSignal): Promise<UpdateEndpointVersions> {

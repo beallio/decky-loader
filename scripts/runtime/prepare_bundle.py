@@ -60,6 +60,7 @@ SDK_OVERLAYS = (
     'frontend/src/components/modals/PluginUninstallModal.tsx',
     'frontend/src/components/settings/pages/developer/index.tsx',
     'frontend/src/components/settings/pages/testing/index.tsx',
+    'frontend/src/index.ts',
 )
 SDK_REMOVALS = (
     'frontend/src/steamfixes/README.md',

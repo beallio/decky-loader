@@ -1,5 +1,8 @@
 // Sets up DFL, then loads start.ts which starts up the loader
 
+// Enums only, safe to load before Steam's React is found.
+import { EResult, EUIComposition } from '@decky/ui/dist/globals/steam-client/shared';
+
 interface SteamAppInitialization {
   BFinishedInitBeforeLogin?: () => boolean;
   BFinishedInitStageOne?: () => boolean;
@@ -43,7 +46,17 @@ const isSteamAppInitialized = () => {
     }
   }
   console.debug('[Decky:Boot] Setting up @decky/ui...');
-  window.DFL = await import('@decky/ui');
+  const DFL = await import('@decky/ui');
+  // Fork: @decky/ui 4.16 dropped these from its root, and plugins built against 4.15 read them from window.DFL.
+  // The namespace is frozen and has live bindings, so the aliases sit on an object that inherits from it.
+  window.DFL = Object.create(
+    DFL,
+    Object.getOwnPropertyDescriptors({
+      EResult,
+      EUIComposition,
+      QuickAccessTab: { ...DFL.QuickAccessTab, Music: DFL.QuickAccessTab.Soundtrack },
+    }),
+  );
   console.debug('[Decky:Boot] Authenticating with Decky backend...');
   window.deckyAuthToken = await fetch('http://127.0.0.1:1337/auth/token').then((r) => r.text());
   console.debug('[Decky:Boot] Connecting to Decky backend...');

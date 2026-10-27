@@ -1,21 +1,20 @@
 import type { ToastData, ToastNotification } from '@decky/api';
-import { ErrorBoundary, Patch, callOriginal, findModuleExport, injectFCTrampoline, replacePatch } from '@decky/ui';
+import {
+  ESteamNotificationAction,
+  ErrorBoundary,
+  Patch,
+  callOriginal,
+  findModuleExport,
+  injectFCTrampoline,
+  replacePatch,
+} from '@decky/ui';
 
 import Toast from './components/Toast';
 import Logger from './logger';
 
-// TODO export
-enum ToastType {
-  New,
-  Update,
-  Remove,
-}
-
 declare global {
   interface Window {
     __TOASTER_INSTANCE: any;
-    settingsStore: any;
-    NotificationStore: any;
   }
 }
 
@@ -92,8 +91,9 @@ class Toaster extends Logger {
     function remove() {
       group && window.NotificationStore.RemoveGroupFromTray(group);
       // The queue holds a copy of toastData, so match by ID. The predicate selects entries to keep.
+      // @decky/ui types call the field notificationID; Steam's queued copy has nNotificationID.
       window.NotificationStore.RemoveFromToastsWhere(
-        (n: { nNotificationID?: number } | undefined) => n?.nNotificationID !== toastData.nNotificationID,
+        (n) => (n as { nNotificationID?: number } | undefined)?.nNotificationID !== toastData.nNotificationID,
       );
     }
     const toastResult: ToastNotification = {
@@ -118,7 +118,7 @@ class Toaster extends Logger {
       }, toast.expiration);
     }
     try {
-      window.NotificationStore.ProcessNotification(info, toastData, ToastType.New);
+      window.NotificationStore.ProcessNotification(info, toastData, ESteamNotificationAction.New);
     } catch (e) {
       this.error('Error while sending toast:', e);
     }

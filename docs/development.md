@@ -103,6 +103,8 @@ Replacing an installed plugin preserves its position in `pluginOrder`, for both 
 
 When a store row is removed, focus moves to that list's **Add store** button before the row disappears. This keeps controller navigation on the store controls.
 
+If the merged store list cannot load, or a store answers HTTP 426 because it refuses this Decky version, the store page shows a message above the list. There is no separate retry button, because a button that disappears loses controller focus; **Refresh** tries again.
+
 ### Catalog downloads
 
 Store catalog, version-map, and GitHub repository metadata requests use the authenticated `/fetch` proxy with `catalog=true`. The backend requests gzip, decodes it, and limits each response to 5 MB (5,000,000 decoded bytes). The 20-second backend deadline includes redirects, response headers, and the complete body. A timeout returns HTTP 504; an oversized body, invalid gzip, or unsupported content encoding returns HTTP 502.
@@ -130,7 +132,7 @@ The output directory must not already exist. A successful build produces:
 
 The manifest records source hashes, tool and package versions, and the Rust release identity. These records support repeatable builds; they do not promise byte-for-byte identical binaries on different hosts. Developer tools and tests are build inputs, not installed runtime payloads.
 
-The Python plugin support code and frontend are based on upstream `v3.3.0` (see `sdk` in [build-config.json](../backend-rust/build-config.json)). Bundle assembly verifies the pinned upstream baseline, records the worker startup changes, and checks packaged helper code against its source. The Rust release identity is separate; `dev` builds do not offer updates. CI fetches the upstream SDK tag and verifies its pinned commit and source hashes, so a fork does not need its own copy of that tag. On the device, the installer checks only what protects the device: file checksums, safe paths and permissions, the release identity, and that the new runtime starts. It does not check build facts such as the upstream base, the Python version or the worker packaging; CI checks those before release.
+The Python plugin support code and frontend are based on upstream `v3.3.1` (see `sdk` in [build-config.json](../backend-rust/build-config.json)). Bundle assembly verifies the pinned upstream baseline, records the worker startup changes, and checks packaged helper code against its source. The Rust release identity is separate; `dev` builds do not offer updates. CI fetches the upstream SDK tag and verifies its pinned commit and source hashes, so a fork does not need its own copy of that tag. On the device, the installer checks only what protects the device: file checksums, safe paths and permissions, the release identity, and that the new runtime starts. It does not check build facts such as the upstream base, the Python version or the worker packaging; CI checks those before release.
 
 An update in Decky starts the installed `install.py` with `queue-install-bundle`. That installer checks the new bundle's `install.py` against the bundle checksum and hands the command over to it, so each release checks and sets up itself, including the service command line. Releases up to `v3.3.0-rust.1-rc.14` do not hand over; they install with their own code. Keep the `queue-install-bundle` and `release-queued` options and their JSON replies compatible, because older loaders still call them. The `Runtime Release` workflow checks each new bundle with the newest published release's installer before it publishes.
 
@@ -185,7 +187,7 @@ The shim also patches upstream's worker socket reader so that it waits at EOF in
 
 On upstream, the backend does not get `DECKY_AUTH_TOKEN`, `SERVER_HOST` or `SERVER_PORT`, and the `root` flag stays unsupported.
 
-The optional `tests/runtime/test_native_shim_upstream.py` test drives the official upstream `PluginWrapper` and `SandboxedPlugin` using the shim and the SDK example backend. Set `DECKY_UPSTREAM_ROOT` to a directory containing extracted `v3.2.10` and `v3.3.0` source trees, and set `DECKY_EXAMPLE_BACKEND` and `DECKY_EXAMPLE_UPDATED` to equal-size builds of `native_example.rs` that emit `example_event` and `updated_event`, respectively. With upstream's `setproctitle`, `aiohttp`, `certifi`, and `packaging` dependencies installed, run:
+The optional `tests/runtime/test_native_shim_upstream.py` test drives the official upstream `PluginWrapper` and `SandboxedPlugin` using the shim and the SDK example backend. Set `DECKY_UPSTREAM_ROOT` to a directory containing extracted `v3.2.10` and `v3.3.1` source trees, and set `DECKY_EXAMPLE_BACKEND` and `DECKY_EXAMPLE_UPDATED` to equal-size builds of `native_example.rs` that emit `example_event` and `updated_event`, respectively. With upstream's `setproctitle`, `aiohttp`, `certifi`, and `packaging` dependencies installed, run:
 
 ```sh
 python3 -m unittest discover -s tests/runtime -p test_native_shim_upstream.py
@@ -255,13 +257,11 @@ To move to a new upstream tag:
 
 The frontend uses `@decky/ui` (decky-frontend-lib). Keep the version that the pinned SDK tag locks in `frontend/pnpm-lock.yaml`; `frontend/package.json` and the lockfile are upstream files, so a different version needs `SDK_OVERLAYS` entries. The `Upstream UI Library` workflow runs every day and can be started by hand. It compares the locked version with upstream `main` and the newest upstream release. When either differs, it opens one issue with the `upstream-ui` label and updates it on later runs. When both match again, it closes the issue.
 
-The loader sets `window.DFL` to its own copy of `@decky/ui`, and plugins read the library from there at runtime. A new version that removes exports breaks plugins built against the old one. Version 4.16.0 removed these runtime exports from the package root. Before the fork uses 4.16.0 or later, add them back on `window.DFL` as aliases, unless upstream has done so:
+The loader sets `window.DFL` to its own copy of `@decky/ui`, and plugins read the library from there at runtime. A new version that removes exports breaks plugins built against the old one. Compared with 4.15.1, version 4.16.4 no longer exports these values from the package root, so [index.ts](../frontend/src/index.ts) adds them back on `window.DFL`:
 
-| Removed export | Value in 4.16.0 `dist` | Difference |
-|---|---|---|
-| `QuickAccessTab` | `EQuickAccessTab` in `globals/stores/steamuistore/menu.js` | `Music` (7) is now `Soundtrack`; keep `Music: 7` in the alias |
-| `SideMenu` | `ESideMenu` in `globals/stores/steamuistore/menu.js` | none |
-| `EResult`, `EUIComposition` | `globals/steam-client/shared.js` | none |
-| `EBrowserType`, `ESteamRealm`, `EUIMode` | `globals/shared/enums.js` | none |
+| Missing export | Source in 4.16.4 `dist` |
+|---|---|
+| `EResult`, `EUIComposition` | `globals/steam-client/shared.js` |
+| `QuickAccessTab.Music` (7) | renamed `Soundtrack` in `globals/stores/steamuistore/menu.js` |
 
-`window.DFL` is a frozen module namespace, and some exports are `let` bindings that change later (`modules`, `Navigation`). Do not copy it with spread; add the aliases on an object that has the namespace as its prototype. The loader's own imports of `QuickAccessTab` and `EUIMode` also need the new deep paths, because 4.16.0 does not export `EQuickAccessTab`, `ESideMenu` or `EUIMode` from the root.
+`window.DFL` is a frozen module namespace, and some exports are `let` bindings that change later (`modules`, `Navigation`). Do not copy it with spread; add the aliases on an object that has the namespace as its prototype. When the locked version changes, compare its root exports and enum members with the previous version and update the aliases.

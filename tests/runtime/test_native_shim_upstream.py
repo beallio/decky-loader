@@ -187,8 +187,8 @@ class OfficialUpstreamTests(unittest.TestCase):
     def test_v3_2_10(self):
         self.run_tag('v3.2.10')
 
-    def test_v3_3_0(self):
-        self.run_tag('v3.3.0')
+    def test_v3_3_1(self):
+        self.run_tag('v3.3.1')
 
 
 if __name__ == '__main__':
