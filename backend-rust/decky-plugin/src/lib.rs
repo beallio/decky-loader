@@ -359,12 +359,12 @@ impl Plugin {
             let methods = Arc::new(methods);
             let connection = async {
                 let listener = UnixListener::bind(socket)?;
-                let mut stopping = false;
+                let stopping = AtomicBool::new(false);
                 let stream = tokio::select! {
                     biased;
                     accepted = listener.accept() => Some(accepted?.0),
                     _ = &mut stop => {
-                        stopping = true;
+                        stopping.store(true, Ordering::Release);
                         match listener.into_std()?.accept() {
                             Ok((stream, _)) => {
                                 stream.set_nonblocking(true)?;
@@ -394,6 +394,9 @@ impl Plugin {
                         };
                         if let Some(flag) = message.get("uninstall") {
                             uninstalling.store(flag.as_bool() == Some(true), Ordering::Release);
+                            continue;
+                        }
+                        if stopping.load(Ordering::Acquire) {
                             continue;
                         }
                         if message.get("type").and_then(Value::as_u64) != Some(0) {
@@ -438,16 +441,18 @@ impl Plugin {
                     Ok::<(), io::Error>(())
                 };
                 let mut incoming = std::pin::pin!(incoming);
-                if stopping {
+                if stopping.load(Ordering::Acquire) {
                     shutdown_read(fd)?;
                     incoming.await
                 } else {
                     tokio::select! {
-                        outcome = &mut incoming => outcome,
+                        biased;
                         _ = &mut stop => {
+                            stopping.store(true, Ordering::Release);
                             shutdown_read(fd)?;
                             incoming.await
                         }
+                        outcome = &mut incoming => outcome,
                     }
                 }
             };
@@ -836,11 +841,20 @@ mod tests {
             let directory = TestDirectory::new();
             let socket = directory.0.join("p.sock");
             let hooks = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let called = Arc::new(AtomicBool::new(false));
             let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
             let server = tokio::spawn({
                 let (socket, hooks) = (socket.clone(), Arc::clone(&hooks));
+                let called = Arc::clone(&called);
                 async move {
                     Plugin::new()
+                        .method("late", move |_context, _args| {
+                            let called = Arc::clone(&called);
+                            async move {
+                                called.store(true, Ordering::Release);
+                                Ok(Value::Null)
+                            }
+                        })
                         .on_unload({
                             let hooks = Arc::clone(&hooks);
                             move |_context| async move {
@@ -860,7 +874,7 @@ mod tests {
             });
             let mut stream = connect(&socket).await;
             stream
-                .write_all(b"{\"uninstall\":false}\n{\"uninstall\":true}\n")
+                .write_all(b"{\"type\":0,\"method\":\"late\",\"id\":\"x\",\"args\":[]}\n{\"uninstall\":false}\n{\"uninstall\":true}\n")
                 .await
                 .unwrap();
             stop.send(()).unwrap();
@@ -869,6 +883,8 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(!called.load(Ordering::Acquire));
             assert_eq!(*hooks.lock().unwrap(), ["unload", "uninstall"]);
         }
     }
