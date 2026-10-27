@@ -171,7 +171,7 @@ The `decky-plugin` crate implements all of this, including a log file in `DECKY_
 Limits:
 
 - Native backends cannot use the `root` flag yet. The loader refuses such plugins.
-- Only `loader/call_plugin_method` calls reach a native backend; the legacy `loader/call_legacy_plugin_method` route is refused. Upstream refuses it too for `api_version` 1.
+- Only `loader/call_plugin_method` calls reach a native backend; the legacy `loader/call_legacy_plugin_method` route is rejected before method lookup. Upstream refuses it too for `api_version` 1.
 - Without the shim, the upstream loader treats a native plugin as frontend-only, so its backend calls fail there.
 - The loader still needs the packaged Python worker at startup, even when every plugin is native, but it does not start the shared Python launcher for native plugins.
 

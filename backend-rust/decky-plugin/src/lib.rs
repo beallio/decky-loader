@@ -56,6 +56,7 @@ pub type RawMethodResult = Result<Box<RawValue>, String>;
 enum Reply {
     Value(Value),
     Raw(Box<RawValue>),
+    Static(&'static str),
 }
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -403,6 +404,14 @@ impl Plugin {
                             continue;
                         }
                         let id = message.get("id").cloned().unwrap_or(Value::Null);
+                        if message.get("legacy").and_then(Value::as_bool) == Some(true) {
+                            let error =
+                                Reply::Static("Legacy methods may not be used on api_version > 0");
+                            if let Err(error) = write_reply(&writer, &id, false, &error).await {
+                                log::error!("Could not reject legacy request: {error}");
+                            }
+                            continue;
+                        }
                         let name = message
                             .get("method")
                             .and_then(Value::as_str)
@@ -541,11 +550,8 @@ async fn write_reply(
     )
     .into_bytes();
     match res {
-        Reply::Value(value) => {
-            serde_json::to_writer(&mut head, value)?;
-            head.extend_from_slice(b"}\n");
-            writer.lock().await.write_all(&head).await
-        }
+        Reply::Value(value) => serde_json::to_writer(&mut head, value)?,
+        Reply::Static(value) => serde_json::to_writer(&mut head, value)?,
         Reply::Raw(raw) => {
             // Each message is one line. In valid JSON a newline can only be whitespace
             // (strings escape it), so dropping it keeps a pretty-printed value intact.
@@ -564,9 +570,11 @@ async fn write_reply(
             let mut writer = writer.lock().await;
             writer.write_all(&head).await?;
             writer.write_all(bytes).await?;
-            writer.write_all(b"}\n").await
+            return writer.write_all(b"}\n").await;
         }
     }
+    head.extend_from_slice(b"}\n");
+    writer.lock().await.write_all(&head).await
 }
 
 /// Sends [`log`] records to a new file in `DECKY_PLUGIN_LOG_DIR` and to standard
@@ -728,6 +736,7 @@ mod tests {
             let directory = TestDirectory::new();
             let socket = directory.0.join("p.sock");
             let hooks = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let legacy_called = Arc::new(AtomicBool::new(false));
             let record = |name: &'static str| {
                 let hooks = Arc::clone(&hooks);
                 move |_context: Context| async move {
@@ -738,6 +747,16 @@ mod tests {
             let plugin = Plugin::new()
                 .method("add", |_context, args| async move {
                     Ok(json!(args.iter().filter_map(Value::as_i64).sum::<i64>()))
+                })
+                .method("legacy_probe", {
+                    let legacy_called = Arc::clone(&legacy_called);
+                    move |_context, _args| {
+                        let legacy_called = Arc::clone(&legacy_called);
+                        async move {
+                            legacy_called.store(true, Ordering::Release);
+                            Ok(Value::Null)
+                        }
+                    }
                 })
                 .method("fail", |_context, _args| async { Err("nope".to_owned()) })
                 .method_raw("raw", |_context, args| async move {
@@ -815,6 +834,30 @@ mod tests {
                     _ => assert_eq!(reply["success"], false),
                 }
             }
+            for (id, method) in [
+                ("legacy-existing", "legacy_probe"),
+                ("legacy-missing", "missing"),
+            ] {
+                let call = json!({"type": 0, "method": method, "id": id, "args": {"x": 1}, "legacy": true});
+                writer
+                    .write_all(format!("{call}\n").as_bytes())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    next(&mut lines).await,
+                    json!({"type": 1, "id": id, "success": false, "res": "Legacy methods may not be used on api_version > 0"})
+                );
+            }
+            assert!(!legacy_called.load(Ordering::Acquire));
+            let call = json!({"type": 0, "method": "add", "id": "non-legacy", "args": [4, 5], "legacy": false});
+            writer
+                .write_all(format!("{call}\n").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(
+                next(&mut lines).await,
+                json!({"type": 1, "id": "non-legacy", "success": true, "res": 9})
+            );
             if uninstall {
                 writer.write_all(b"{\"uninstall\":true}\n").await.unwrap();
             }
