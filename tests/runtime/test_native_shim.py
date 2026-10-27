@@ -163,6 +163,30 @@ class NativeShimTests(unittest.TestCase):
         asyncio.run(scenario())
         self.assertEqual(self.marks.read_text().split(), ['unload', 'unload', 'update', 'update'])
 
+    def test_unreadable_staged_copy_is_replaced(self):
+        staged = Path(self.shim._stage())
+        staged.chmod(0o111)
+        if os.access(staged, os.R_OK):
+            self.skipTest('the test user can read mode 0111')
+        self.assertEqual(self.shim._stage(), str(staged))
+        self.assertEqual(staged.read_text(), BACKEND)
+        self.assertTrue(os.access(staged, os.X_OK))
+
+    def test_packaged_read_failure_is_not_treated_as_cache_miss(self):
+        staged = Path(self.shim._stage())
+        packaged = self.plugin_dir / 'bin' / 'backend'
+        original_digest = self.shim._digest
+
+        def digest(file):
+            if os.path.samefile(file.name, packaged):
+                raise OSError('packaged read failed')
+            return original_digest(file)
+
+        with mock.patch.object(self.shim, '_digest', side_effect=digest):
+            with self.assertRaisesRegex(OSError, 'packaged read failed'):
+                self.shim._stage()
+        self.assertEqual(staged.read_text(), BACKEND)
+
     def test_unparsable_reply_fails_pending_calls_instead_of_hanging(self):
         async def scenario():
             plugin = self.shim.Plugin()

@@ -84,6 +84,7 @@ def _stage():
     os.makedirs(decky.DECKY_PLUGIN_RUNTIME_DIR, exist_ok=True)
     copy = _copy_path()
     with open(source, "rb") as packaged:
+        existing_digest = None
         try:
             if (
                 not os.path.islink(copy)
@@ -92,11 +93,13 @@ def _stage():
                 and not os.path.samefile(source, copy)
             ):
                 with open(copy, "rb") as existing:
-                    if _digest(packaged) == _digest(existing):
-                        return copy
-                packaged.seek(0)
-        except FileNotFoundError:
+                    existing_digest = _digest(existing)
+        except OSError:
             pass
+        if existing_digest is not None:
+            if _digest(packaged) == existing_digest:
+                return copy
+            packaged.seek(0)
         fd, staged = tempfile.mkstemp(dir=decky.DECKY_PLUGIN_RUNTIME_DIR)
         try:
             with os.fdopen(fd, "wb") as target:
