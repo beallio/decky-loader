@@ -187,6 +187,20 @@ class NativeShimTests(unittest.TestCase):
                 self.shim._stage()
         self.assertEqual(staged.read_text(), BACKEND)
 
+    def test_staged_copy_cannot_alias_the_packaged_file(self):
+        packaged = self.plugin_dir / 'bin' / 'backend'
+        staged = Path(self.shim._stage())
+        staged.chmod(0o600)
+        self.shim._stage()
+        self.assertTrue(os.access(staged, os.X_OK))
+        for make_alias in (lambda: os.link(packaged, staged), lambda: staged.symlink_to(packaged)):
+            staged.unlink()
+            make_alias()
+            self.shim._stage()
+            self.assertFalse(staged.is_symlink())
+            self.assertFalse(os.path.samefile(staged, packaged))
+            self.assertTrue(os.access(staged, os.X_OK))
+
     def test_unparsable_reply_fails_pending_calls_instead_of_hanging(self):
         async def scenario():
             plugin = self.shim.Plugin()
@@ -318,6 +332,9 @@ class NativeShimTests(unittest.TestCase):
             loader.close()  # the loader closes its end while it stops the plugin
             # A spinning listener never lets this sleep resume.
             await asyncio.sleep(0.2)
+            if worker.server_writer is not None:
+                worker.server_writer.close()
+            worker.socket.close()
             resumed.set()
 
         # A daemon thread, so a spinning loop fails the test instead of hanging it.

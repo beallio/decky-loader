@@ -177,13 +177,21 @@ Limits:
 
 #### Plugins for both loaders
 
-The upstream Python loader ignores `backend` and imports `main.py`. To ship one plugin for both loaders, copy [`backend-rust/decky-plugin/shim/main.py`](../backend-rust/decky-plugin/shim/main.py) next to `plugin.json` and set `"api_version": 1`. This loader starts the backend itself and ignores `main.py`. On upstream, the shim starts the same backend with its own socket, forwards frontend calls and events, and stops it with SIGTERM within upstream's five-second stop limit, then SIGKILL. If the worker dies, the kernel sends SIGKILL to the backend. For an uninstall, the shim then runs the backend again with `DECKY_PLUGIN_HOOK=uninstall`, and the crate runs only the `on_uninstall` hook. That hook therefore runs in a new process and cannot use state from the stopped backend.
+The upstream Python loader ignores `backend` and imports `main.py`. To ship one plugin for both loaders, copy [`backend-rust/decky-plugin/shim/main.py`](../backend-rust/decky-plugin/shim/main.py) next to `plugin.json` and set `"api_version": 1`. This loader starts the backend itself and ignores `main.py`. On upstream, the shim starts the same backend with its own socket, forwards frontend calls and events, and stops it with SIGTERM within upstream's five-second stop limit, then SIGKILL. If the backend exits unexpectedly, the relay keeps the worker's loader socket open and rejects calls, rather than exposing backend EOF to the upstream loader. If the worker dies, the kernel sends SIGKILL to the backend. For an uninstall, the shim then runs the backend again with `DECKY_PLUGIN_HOOK=uninstall`, and the crate runs only the `on_uninstall` hook. That hook therefore runs in a new process and cannot use state from the stopped backend.
 
 On upstream, the shim runs a copy of the backend, `.decky-native-backend` in `DECKY_PLUGIN_RUNTIME_DIR`, and removes it after an uninstall. Upstream installs a local ZIP whose file name differs from the plugin name by extracting it over the live plugin folder ([upstream #993](https://github.com/SteamDeckHomebrew/decky-loader/issues/993)). Linux refuses to overwrite a running executable (`ETXTBSY`), so running the packaged file would leave such an update half applied. The shim reuses the staged copy only when the SHA-256 of its actual contents matches the packaged backend; otherwise it atomically replaces the copy. An unreadable staged copy is replaced; an error reading the packaged backend still stops startup.
 
 The shim also patches upstream's worker socket reader so that it waits at EOF instead of spinning. Upstream's listener never yields once the loader closes the socket, so a stop that loses that race ends in SIGKILL after five seconds, and `_unload` and `_uninstall` never run ([upstream #975](https://github.com/SteamDeckHomebrew/decky-loader/issues/975), fixed by the open [#972](https://github.com/SteamDeckHomebrew/decky-loader/pull/972)). If upstream renames the reader, the patch does nothing.
 
 On upstream, the backend does not get `DECKY_AUTH_TOKEN`, `SERVER_HOST` or `SERVER_PORT`, and the `root` flag stays unsupported.
+
+The optional `tests/runtime/test_native_shim_upstream.py` test drives the official upstream `PluginWrapper` and `SandboxedPlugin` using the shim and the SDK example backend. Set `DECKY_UPSTREAM_ROOT` to a directory containing extracted `v3.2.10` and `v3.3.0` source trees, and set `DECKY_EXAMPLE_BACKEND` and `DECKY_EXAMPLE_UPDATED` to equal-size builds of `native_example.rs` that emit `example_event` and `updated_event`, respectively. With upstream's `setproctitle`, `aiohttp`, `certifi`, and `packaging` dependencies installed, run:
+
+```sh
+python3 -m unittest discover -s tests/runtime -p test_native_shim_upstream.py
+```
+
+The test exercises Linux fork and forkserver workers, the loader's normal socket connection retries, and recovery from a backend crash. Its PSS and latency samples are workstation measurements, not Steam Deck results.
 
 ## Validate an owned VM copy
 
