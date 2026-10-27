@@ -25,6 +25,7 @@ use std::{
     env, fs,
     future::Future,
     io::{self, Write},
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -257,8 +258,8 @@ impl Plugin {
     /// including during migration.
     ///
     /// With `DECKY_PLUGIN_HOOK=uninstall` it runs only the uninstall hook and
-    /// returns. The `main.py` shim for the upstream loader uses this, because
-    /// upstream tells it about an uninstall only after unload.
+    /// returns. The upstream shim's relay mode uses this because the Python
+    /// worker calls its uninstall hook after unloading the first backend.
     pub async fn run(self) -> io::Result<()> {
         set_process_name(&env::var("DECKY_PLUGIN_NAME").unwrap_or_default());
         if let Err(error) = init_logging() {
@@ -358,68 +359,99 @@ impl Plugin {
             let methods = Arc::new(methods);
             let connection = async {
                 let listener = UnixListener::bind(socket)?;
-                let (stream, _) = listener.accept().await?;
+                let mut stopping = false;
+                let stream = tokio::select! {
+                    biased;
+                    accepted = listener.accept() => Some(accepted?.0),
+                    _ = &mut stop => {
+                        stopping = true;
+                        match listener.into_std()?.accept() {
+                            Ok((stream, _)) => {
+                                stream.set_nonblocking(true)?;
+                                Some(tokio::net::UnixStream::from_std(stream)?)
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                };
+                let Some(stream) = stream else {
+                    return Ok(());
+                };
                 let (reader, writer) = stream.into_split();
+                let fd = reader.as_ref().as_raw_fd();
                 let writer = Arc::new(Mutex::new(writer));
                 link.send_replace(Link::Connected(Arc::clone(&writer)));
-                let mut lines = BufReader::new(reader).lines();
-                while let Some(line) = lines.next_line().await? {
-                    let mut message: Value = match serde_json::from_str(&line) {
-                        Ok(message) => message,
-                        Err(error) => {
-                            log::error!("Ignoring a message that is not JSON: {error}");
+                let incoming = async {
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Some(line) = lines.next_line().await? {
+                        let mut message: Value = match serde_json::from_str(&line) {
+                            Ok(message) => message,
+                            Err(error) => {
+                                log::error!("Ignoring a message that is not JSON: {error}");
+                                continue;
+                            }
+                        };
+                        if let Some(flag) = message.get("uninstall") {
+                            uninstalling.store(flag.as_bool() == Some(true), Ordering::Release);
                             continue;
                         }
-                    };
-                    if let Some(flag) = message.get("uninstall") {
-                        uninstalling.store(flag.as_bool() == Some(true), Ordering::Release);
-                        continue;
-                    }
-                    if message.get("type").and_then(Value::as_u64) != Some(0) {
-                        continue;
-                    }
-                    let id = message.get("id").cloned().unwrap_or(Value::Null);
-                    let name = message
-                        .get("method")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned();
-                    let args = match message.get_mut("args").map(Value::take) {
-                        Some(Value::Array(args)) => args,
-                        _ => Vec::new(),
-                    };
-                    let (methods, context, writer) =
-                        (Arc::clone(&methods), context.clone(), Arc::clone(&writer));
-                    tokio::spawn(async move {
-                        // The method is called and awaited in its own task, so a panic while it
-                        // builds or runs its future becomes an error reply and the caller is answered.
-                        let call = {
-                            let name = name.clone();
-                            tokio::spawn(async move {
-                                match methods.get(&name) {
-                                    Some(method) => method(context, args).await,
-                                    None => Err(format!("Plugin has no method {name}")),
-                                }
-                            })
-                        };
-                        let result = call
-                            .await
-                            .unwrap_or_else(|error| Err(format!("Method {name} failed: {error}")));
-                        let (success, res) = match result {
-                            Ok(reply) => (true, reply),
-                            Err(message) => (false, Reply::Value(Value::String(message))),
-                        };
-                        if let Err(error) = write_reply(&writer, &id, success, &res).await {
-                            log::error!("Could not answer {name}: {error}");
+                        if message.get("type").and_then(Value::as_u64) != Some(0) {
+                            continue;
                         }
-                    });
+                        let id = message.get("id").cloned().unwrap_or(Value::Null);
+                        let name = message
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let args = match message.get_mut("args").map(Value::take) {
+                            Some(Value::Array(args)) => args,
+                            _ => Vec::new(),
+                        };
+                        let (methods, context, writer) =
+                            (Arc::clone(&methods), context.clone(), Arc::clone(&writer));
+                        tokio::spawn(async move {
+                            // The method is called and awaited in its own task, so a panic while it
+                            // builds or runs its future becomes an error reply and the caller is answered.
+                            let call = {
+                                let name = name.clone();
+                                tokio::spawn(async move {
+                                    match methods.get(&name) {
+                                        Some(method) => method(context, args).await,
+                                        None => Err(format!("Plugin has no method {name}")),
+                                    }
+                                })
+                            };
+                            let result = call.await.unwrap_or_else(|error| {
+                                Err(format!("Method {name} failed: {error}"))
+                            });
+                            let (success, res) = match result {
+                                Ok(reply) => (true, reply),
+                                Err(message) => (false, Reply::Value(Value::String(message))),
+                            };
+                            if let Err(error) = write_reply(&writer, &id, success, &res).await {
+                                log::error!("Could not answer {name}: {error}");
+                            }
+                        });
+                    }
+                    Ok::<(), io::Error>(())
+                };
+                let mut incoming = std::pin::pin!(incoming);
+                if stopping {
+                    shutdown_read(fd)?;
+                    incoming.await
+                } else {
+                    tokio::select! {
+                        outcome = &mut incoming => outcome,
+                        _ = &mut stop => {
+                            shutdown_read(fd)?;
+                            incoming.await
+                        }
+                    }
                 }
-                Ok::<(), io::Error>(())
             };
-            tokio::select! {
-                outcome = connection => outcome,
-                _ = &mut stop => Ok(()),
-            }
+            connection.await
         };
         if let Err(error) = &outcome {
             log::error!("Decky connection failed: {error}");
@@ -450,6 +482,16 @@ impl Plugin {
         }
         let _ = fs::remove_file(socket);
         outcome
+    }
+}
+
+fn shutdown_read(fd: std::os::fd::RawFd) -> io::Result<()> {
+    // Linux keeps already-queued bytes readable after SHUT_RD and then returns EOF.
+    // SAFETY: the connection future keeps this socket open until the drain finishes.
+    if unsafe { libc::shutdown(fd, libc::SHUT_RD) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -785,6 +827,49 @@ mod tests {
             };
             assert_eq!(*hooks.lock().unwrap(), expected);
             assert!(!socket.exists(), "the socket file is removed on exit");
+        }
+    }
+
+    #[tokio::test]
+    async fn uninstall_message_is_processed_when_stop_is_ready_at_the_same_time() {
+        for _ in 0..30 {
+            let directory = TestDirectory::new();
+            let socket = directory.0.join("p.sock");
+            let hooks = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn({
+                let (socket, hooks) = (socket.clone(), Arc::clone(&hooks));
+                async move {
+                    Plugin::new()
+                        .on_unload({
+                            let hooks = Arc::clone(&hooks);
+                            move |_context| async move {
+                                hooks.lock().unwrap().push("unload");
+                                Ok(())
+                            }
+                        })
+                        .on_uninstall(move |_context| async move {
+                            hooks.lock().unwrap().push("uninstall");
+                            Ok(())
+                        })
+                        .serve(Env::default(), &socket, async {
+                            let _ = stopped.await;
+                        })
+                        .await
+                }
+            });
+            let mut stream = connect(&socket).await;
+            stream
+                .write_all(b"{\"uninstall\":false}\n{\"uninstall\":true}\n")
+                .await
+                .unwrap();
+            stop.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(*hooks.lock().unwrap(), ["unload", "uninstall"]);
         }
     }
 
