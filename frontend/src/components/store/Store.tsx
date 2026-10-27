@@ -151,9 +151,12 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
     return () => clearInterval(timer);
   }, []);
 
-  // Lists that expire while the page is open are downloaded again.
+  // Lists that expire while the page is open are downloaded again. After a failed load, only Refresh
+  // tries again: the old fetchedAt stays expired, so each failure would start the next load at once.
   useEffect(() => {
-    if (!refreshing && fetchedAt !== null && now - fetchedAt >= STORE_CACHE_MS) load(false);
+    if (!refreshing && storeError !== 'load_failed' && fetchedAt !== null && now - fetchedAt >= STORE_CACHE_MS) {
+      load(false);
+    }
   }, [now]);
 
   useEffect(() => {
