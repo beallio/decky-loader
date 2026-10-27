@@ -124,18 +124,44 @@ class NativeShimTests(unittest.TestCase):
             command = Path(f'/proc/{plugin._process.pid}/cmdline').read_bytes().split(b'\0')
             self.assertNotIn(str(packaged).encode(), command)
             self.assertEqual([p.name for p in (self.plugin_dir / 'data').iterdir()], ['.decky-native-backend'])
-            packaged.write_text(BACKEND.replace('mark("unload")', 'mark("updated")'))
+            staged = self.plugin_dir / 'data' / '.decky-native-backend'
+            staged_inode = staged.stat().st_ino
             await plugin._unload()
             await asyncio.wait_for(main, 5)
-            # The next start runs the updated file.
+
+            # Unchanged content reuses the executable instead of copying it.
+            restarted = self.shim.Plugin()
+            main = asyncio.create_task(restarted._main())
+            self.assertEqual(await restarted.echo(), [])
+            self.assertEqual(staged.stat().st_ino, staged_inode)
+            await restarted._unload()
+            await asyncio.wait_for(main, 5)
+
+            # Extracting over the same inode can preserve both size and mtime.
+            before = packaged.stat()
+            packaged.write_text(BACKEND.replace('mark("unload")', 'mark("update")'))
+            os.utime(packaged, ns=(before.st_atime_ns, before.st_mtime_ns))
+            self.assertEqual((packaged.stat().st_ino, packaged.stat().st_size, packaged.stat().st_mtime_ns),
+                             (before.st_ino, before.st_size, before.st_mtime_ns))
+            restarted = self.shim.Plugin()
+            main = asyncio.create_task(restarted._main())
+            self.assertEqual(await restarted.echo(), [])
+            self.assertNotEqual(staged.stat().st_ino, staged_inode)
+            await restarted._unload()
+            await asyncio.wait_for(main, 5)
+
+            # A tampered staged file is not trusted either.
+            staged.write_text(BACKEND)
             restarted = self.shim.Plugin()
             main = asyncio.create_task(restarted._main())
             self.assertEqual(await restarted.echo(), [])
             await restarted._unload()
             await asyncio.wait_for(main, 5)
+            self.assertEqual(staged.read_text(), packaged.read_text())
+            self.assertTrue(os.access(staged, os.X_OK))
 
         asyncio.run(scenario())
-        self.assertEqual(self.marks.read_text().split(), ['unload', 'updated'])
+        self.assertEqual(self.marks.read_text().split(), ['unload', 'unload', 'update', 'update'])
 
     def test_unparsable_reply_fails_pending_calls_instead_of_hanging(self):
         async def scenario():
