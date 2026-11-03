@@ -14,7 +14,7 @@ use uuid::Uuid;
 use zip::ZipArchive;
 
 use crate::{
-    backend::{Backend, RpcError},
+    backend::{Backend, RpcError, dedupe_names},
     platform,
     workers::WorkerError,
 };
@@ -1702,6 +1702,8 @@ fn reconcile_install_settings(
     was_registered: bool,
     was_installed: bool,
 ) {
+    // Any list read here can already hold duplicates; never persist them again.
+    dedupe_names(settings.get_mut("pluginOrder"));
     if was_registered {
         for key in SETTINGS_KEYS {
             if key != "pluginOrder" {
@@ -1709,7 +1711,13 @@ fn reconcile_install_settings(
             }
         }
     } else if !was_installed {
-        settings.get_mut("pluginOrder").push(name.to_owned());
+        let order = settings.get_mut("pluginOrder");
+        // The install may look fresh even though the name is already listed
+        // (for example when an earlier uninstall removed the files but not the
+        // name); appending again would duplicate it.
+        if !order.iter().any(|value| value == name) {
+            order.push(name.to_owned());
+        }
     }
 }
 
@@ -1922,6 +1930,35 @@ mod tests {
         assert_eq!(settings.get("hiddenPlugins"), ["before", "after"]);
         assert_eq!(settings.get("disabled_plugins"), ["before", "after"]);
 
+        reconcile_install_settings(&mut settings, "Fresh", false, false);
+        assert_eq!(
+            settings.get("pluginOrder"),
+            ["before", "Target", "after", "Fresh"]
+        );
+    }
+
+    #[test]
+    fn install_settings_never_duplicate_a_listed_name_and_heal_stored_duplicates() {
+        let mut settings = SettingsLists {
+            values: SETTINGS_KEYS
+                .into_iter()
+                .map(|key| (key, vec!["before".to_owned(), "Target".to_owned()]))
+                .collect(),
+        };
+        settings
+            .get_mut("pluginOrder")
+            .extend(["after".to_owned(), "Target".to_owned()]);
+
+        // An update keeps the first position and drops the stored duplicate.
+        reconcile_install_settings(&mut settings, "Target", true, true);
+        assert_eq!(settings.get("pluginOrder"), ["before", "Target", "after"]);
+
+        // An install that looks fresh must not append a name already listed.
+        reconcile_install_settings(&mut settings, "Target", false, false);
+        assert_eq!(settings.get("pluginOrder"), ["before", "Target", "after"]);
+
+        // A genuinely new name is still appended once.
+        reconcile_install_settings(&mut settings, "Fresh", false, false);
         reconcile_install_settings(&mut settings, "Fresh", false, false);
         assert_eq!(
             settings.get("pluginOrder"),

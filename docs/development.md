@@ -99,7 +99,7 @@ Failed plugin installs and uninstalls close their confirmation window and show a
 
 WebSocket error replies have two shapes: missing-route errors use `error.error`, and failures inside a route use `error.message`. The frontend reads both so that error notifications retain the backend's explanation.
 
-Replacing an installed plugin preserves its position in `pluginOrder`, for both normal and root plugins. Fresh installs append once; uninstall removes the entry. Installation still clears that plugin's frozen, hidden, and disabled flags, as before.
+Replacing an installed plugin preserves its position in `pluginOrder`, for both normal and root plugins. Fresh installs append once, and a name that is already listed is never appended again. On startup the stored order is deduplicated in first-occurrence order, so a list that already contains a plugin more than once heals. Uninstall removes the entry. Installation still clears that plugin's frozen, hidden, and disabled flags, as before.
 
 When a store row is removed, focus moves to that list's **Add store** button before the row disappears. This keeps controller navigation on the store controls.
 

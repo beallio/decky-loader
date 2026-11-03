@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use serde_json::{Map, Value, json, value::RawValue};
@@ -198,16 +198,32 @@ impl Backend {
     }
 
     pub(crate) async fn initialize_plugin_order(&self) -> Result<(), RpcError> {
-        if self.setting("pluginOrder", Value::Null).await.is_null() {
+        let stored = self.setting("pluginOrder", Value::Null).await;
+        let mut names: Vec<String> = if stored.is_null() {
             let plugins = self.registry.list().await;
-            let names = plugins
+            plugins
                 .as_array()
                 .expect("registry plugin list")
                 .iter()
-                .filter_map(|plugin| plugin.get("name"))
-                .cloned()
-                .collect();
-            self.set_setting("pluginOrder", Value::Array(names)).await?;
+                .filter_map(|plugin| plugin.get("name").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        } else {
+            let Some(names) = stored
+                .as_array()
+                .and_then(|values| values.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+            else {
+                // Leave a malformed value for the install path to report.
+                return Ok(());
+            };
+            names.into_iter().map(str::to_owned).collect()
+        };
+        // A stored list can already contain a plugin more than once; keep the
+        // first occurrence of each name so the setting heals on the next start.
+        dedupe_names(&mut names);
+        let normalized = Value::Array(names.into_iter().map(Value::String).collect());
+        if normalized != stored {
+            self.set_setting("pluginOrder", normalized).await?;
         }
         Ok(())
     }
@@ -363,6 +379,12 @@ pub(crate) fn exact(args: &[Value], expected: usize) -> Result<(), RpcError> {
     }
 }
 
+/// Keeps the first occurrence of each name and drops later duplicates.
+pub(crate) fn dedupe_names(names: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    names.retain(|name| seen.insert(name.clone()));
+}
+
 pub(crate) fn string(args: &[Value], index: usize) -> Result<&str, RpcError> {
     args.get(index)
         .and_then(Value::as_str)
@@ -374,5 +396,99 @@ fn missing_route(route: &str) -> RpcError {
         name: "RouteNotFoundError".into(),
         message: format!("Route {route} does not exist."),
         traceback: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestDirectory;
+
+    async fn test_backend(directory: &TestDirectory) -> (Arc<PluginRegistry>, Arc<Backend>) {
+        let plugin_root = directory.0.join("plugins");
+        tokio::fs::create_dir_all(&plugin_root).await.unwrap();
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let user = std::env::var("USER").expect("test account USER");
+        let registry = Arc::new(
+            PluginRegistry::start(
+                crate::workers::WorkerConfiguration {
+                    executable: std::env::current_exe().unwrap(),
+                    mode: crate::workers::WorkerMode::Exec,
+                    auth_token: "test-token".into(),
+                    server_host: "127.0.0.1".into(),
+                    server_port: 1339,
+                    chown_plugin_path: false,
+                    loader_version: "dev".into(),
+                },
+                plugin_root,
+                directory.0.clone(),
+                user.clone(),
+                crate::platform::effective_user_ids(),
+                events,
+                shutdown_rx,
+            )
+            .await
+            .unwrap(),
+        );
+        let backend = Arc::new(
+            Backend::new(
+                registry.clone(),
+                directory.0.clone(),
+                user,
+                directory.0.to_string_lossy().into_owned(),
+                "dev".into(),
+                "v3.2.10".into(),
+            )
+            .await
+            .unwrap(),
+        );
+        (registry, backend)
+    }
+
+    #[tokio::test]
+    async fn plugin_order_heals_stored_duplicates_on_startup() {
+        let directory = TestDirectory::new("decky-plugin-order");
+        let settings_directory = directory.0.join("settings");
+        std::fs::create_dir_all(&settings_directory).unwrap();
+        std::fs::write(
+            settings_directory.join("loader.json"),
+            r#"{"pluginOrder":["A","B","A","C","B"],"branch":1}"#,
+        )
+        .unwrap();
+        let (registry, backend) = test_backend(&directory).await;
+
+        backend.initialize_plugin_order().await.unwrap();
+        assert_eq!(
+            backend.setting("pluginOrder", json!([])).await,
+            json!(["A", "B", "C"])
+        );
+        let stored: Value =
+            serde_json::from_slice(&std::fs::read(settings_directory.join("loader.json")).unwrap())
+                .unwrap();
+        assert_eq!(stored["pluginOrder"], json!(["A", "B", "C"]));
+        assert_eq!(
+            stored["branch"],
+            json!(1),
+            "unrelated settings must survive"
+        );
+
+        // Starting again keeps the healed order and does not write it back again.
+        backend.initialize_plugin_order().await.unwrap();
+        assert_eq!(
+            backend.setting("pluginOrder", json!([])).await,
+            json!(["A", "B", "C"])
+        );
+        registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn plugin_order_defaults_to_registered_plugins_when_missing() {
+        let directory = TestDirectory::new("decky-plugin-order-default");
+        let (registry, backend) = test_backend(&directory).await;
+
+        backend.initialize_plugin_order().await.unwrap();
+        assert_eq!(backend.setting("pluginOrder", json!(null)).await, json!([]));
+        registry.shutdown().await;
     }
 }
