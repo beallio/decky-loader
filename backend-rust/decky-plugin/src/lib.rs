@@ -578,9 +578,10 @@ async fn write_reply(
 }
 
 /// Sends [`log`] records to a new file in `DECKY_PLUGIN_LOG_DIR` and to standard
-/// error, like the Python `decky.logger`, at level info. Older log files are
-/// removed so that five remain. [`Plugin::run`] calls this; call it yourself to
-/// log before `run`. Returns the log file path.
+/// error, like the Python `decky.logger`. The level comes from
+/// `DECKY_PLUGIN_LOG_LEVEL`, then `LOG_LEVEL`, and defaults to info. Older log
+/// files are removed so that five remain. [`Plugin::run`] calls this; call it
+/// yourself to log before `run`. Returns the log file path.
 pub fn init_logging() -> io::Result<PathBuf> {
     static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
     if let Some(path) = LOG_FILE.get() {
@@ -606,8 +607,34 @@ pub fn init_logging() -> io::Result<PathBuf> {
         file: std::sync::Mutex::new(file),
     }))
     .map_err(|error| io::Error::new(io::ErrorKind::AlreadyExists, error.to_string()))?;
-    log::set_max_level(log::LevelFilter::Info);
+    let plugin_level = env::var("DECKY_PLUGIN_LOG_LEVEL").ok();
+    let loader_level = env::var("LOG_LEVEL").ok();
+    log::set_max_level(configured_level(
+        plugin_level.as_deref(),
+        loader_level.as_deref(),
+    ));
     Ok(LOG_FILE.get_or_init(|| path).clone())
+}
+
+/// The backend's level: the plugin's own setting, then the loader's, then info.
+fn configured_level(plugin: Option<&str>, loader: Option<&str>) -> log::LevelFilter {
+    plugin
+        .into_iter()
+        .chain(loader)
+        .find(|value| !value.trim().is_empty())
+        .and_then(parse_level)
+        .unwrap_or(log::LevelFilter::Info)
+}
+
+/// Parses the loader's level names, case-insensitively; `CRITICAL` is `ERROR`.
+fn parse_level(value: &str) -> Option<log::LevelFilter> {
+    Some(match value.trim().to_ascii_uppercase().as_str() {
+        "CRITICAL" | "ERROR" => log::LevelFilter::Error,
+        "WARNING" | "WARN" => log::LevelFilter::Warn,
+        "INFO" => log::LevelFilter::Info,
+        "DEBUG" => log::LevelFilter::Debug,
+        _ => return None,
+    })
 }
 
 /// Keeps the `keep` newest `.log` files in `directory` and deletes the rest.
@@ -1072,6 +1099,45 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn log_level_names_match_the_loader_and_default_to_info() {
+        for (value, expected) in [
+            ("CRITICAL", log::LevelFilter::Error),
+            ("error", log::LevelFilter::Error),
+            ("WARNING", log::LevelFilter::Warn),
+            ("warn", log::LevelFilter::Warn),
+            ("Info", log::LevelFilter::Info),
+            ("DEBUG", log::LevelFilter::Debug),
+            ("debug ", log::LevelFilter::Debug),
+        ] {
+            assert_eq!(parse_level(value), Some(expected), "{value:?}");
+        }
+        assert_eq!(parse_level(""), None);
+        assert_eq!(parse_level("TRACE"), None);
+        assert_eq!(parse_level("nonsense"), None);
+    }
+
+    #[test]
+    fn the_plugin_level_wins_over_the_loader_level() {
+        assert_eq!(
+            configured_level(Some("DEBUG"), Some("WARNING")),
+            log::LevelFilter::Debug
+        );
+        assert_eq!(
+            configured_level(None, Some("warning")),
+            log::LevelFilter::Warn
+        );
+        assert_eq!(
+            configured_level(Some(" "), Some("warn")),
+            log::LevelFilter::Warn
+        );
+        assert_eq!(
+            configured_level(Some("nonsense"), Some("DEBUG")),
+            log::LevelFilter::Info
+        );
+        assert_eq!(configured_level(None, None), log::LevelFilter::Info);
     }
 
     #[test]

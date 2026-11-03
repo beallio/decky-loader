@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs::{self, File},
     io,
     os::fd::{AsFd, AsRawFd, OwnedFd},
@@ -3055,6 +3055,54 @@ async fn start_root_worker(
     Ok((supervisor, socket_path))
 }
 
+/// The environment a native backend sees, as the Python worker prepares it.
+fn native_backend_environment(
+    config: &WorkerLaunchConfig<'_>,
+    plugin: &PluginMetadata,
+    plugin_directory: &Path,
+    socket_path: &Path,
+    account_home: &Path,
+    loader_level: &str,
+) -> Vec<(&'static str, OsString)> {
+    let storage = |root: &str| config.homebrew.join(root).join(&plugin.directory);
+    vec![
+        ("HOME", account_home.as_os_str().to_owned()),
+        ("USER", config.user.into()),
+        ("DECKY_VERSION", config.loader_version.into()),
+        ("DECKY_USER", config.user.into()),
+        ("DECKY_USER_HOME", account_home.as_os_str().to_owned()),
+        ("DECKY_HOME", config.homebrew.as_os_str().to_owned()),
+        (
+            "DECKY_PLUGIN_SETTINGS_DIR",
+            storage("settings").into_os_string(),
+        ),
+        ("DECKY_PLUGIN_RUNTIME_DIR", storage("data").into_os_string()),
+        ("DECKY_PLUGIN_LOG_DIR", storage("logs").into_os_string()),
+        (
+            "DECKY_PLUGIN_LOG_LEVEL",
+            native_log_level(plugin.debug, loader_level).into(),
+        ),
+        ("DECKY_PLUGIN_DIR", plugin_directory.as_os_str().to_owned()),
+        ("DECKY_PLUGIN_NAME", plugin.name.clone().into()),
+        ("DECKY_PLUGIN_AUTHOR", plugin.author.clone().into()),
+        ("DECKY_PLUGIN_SOCKET", socket_path.as_os_str().to_owned()),
+        ("DECKY_AUTH_TOKEN", config.auth_token.into()),
+        ("SERVER_HOST", config.server_host.into()),
+        ("SERVER_PORT", config.server_port.to_string().into()),
+    ]
+}
+
+/// A `debug` plugin logs at `DEBUG`; the others follow the loader's own level.
+fn native_log_level(debug: bool, loader_level: &str) -> &str {
+    if debug {
+        "DEBUG"
+    } else if loader_level.trim().is_empty() {
+        "INFO"
+    } else {
+        loader_level
+    }
+}
+
 /// Starts a plugin's own executable instead of the Python worker. The supervisor
 /// does what the Python worker does before it imports `main.py`: it prepares the
 /// storage folders, sets the SDK environment and runs the plugin as the host user.
@@ -3079,27 +3127,19 @@ fn spawn_native_backend(
         .map_err(|error| failed(format!("could not prepare the plugin folders: {error}")))?;
 
     let plugin_directory = config.plugin_root.join(&plugin.directory);
-    let storage = |root: &str| config.homebrew.join(root).join(&plugin.directory);
+    let loader_level = std::env::var("LOG_LEVEL").unwrap_or_default();
     // Running the opened descriptor runs exactly the file that was checked above.
     let mut command = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()));
     command
         .arg0(plugin_directory.join(backend))
-        .env("HOME", &account.dir)
-        .env("USER", config.user)
-        .env("DECKY_VERSION", config.loader_version)
-        .env("DECKY_USER", config.user)
-        .env("DECKY_USER_HOME", &account.dir)
-        .env("DECKY_HOME", config.homebrew)
-        .env("DECKY_PLUGIN_SETTINGS_DIR", storage("settings"))
-        .env("DECKY_PLUGIN_RUNTIME_DIR", storage("data"))
-        .env("DECKY_PLUGIN_LOG_DIR", storage("logs"))
-        .env("DECKY_PLUGIN_DIR", &plugin_directory)
-        .env("DECKY_PLUGIN_NAME", &plugin.name)
-        .env("DECKY_PLUGIN_AUTHOR", &plugin.author)
-        .env("DECKY_PLUGIN_SOCKET", socket_path)
-        .env("DECKY_AUTH_TOKEN", config.auth_token)
-        .env("SERVER_HOST", config.server_host)
-        .env("SERVER_PORT", config.server_port.to_string())
+        .envs(native_backend_environment(
+            config,
+            plugin,
+            &plugin_directory,
+            socket_path,
+            Path::new(&account.dir),
+            &loader_level,
+        ))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -4023,6 +4063,66 @@ mod native_backend_tests {
             assert!(
                 metadata_error(&plugin).contains("relative path inside the plugin"),
                 "{backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_backends_get_the_debug_flag_as_the_log_level() {
+        let homebrew = TestDirectory::new("decky-native");
+        let plugin_root = homebrew.0.join("plugins");
+        let plugin = plugin_root.join("native");
+        let socket = plugin.join("worker.sock");
+        let config = WorkerLaunchConfig {
+            worker_executable: Path::new("/worker"),
+            worker_mode: WorkerMode::Exec,
+            fork_launcher: None,
+            root_host: None,
+            plugin_root: &plugin_root,
+            homebrew: &homebrew.0,
+            user: "user",
+            user_ids: (1000, 1000),
+            loader_version: "dev",
+            auth_token: "token",
+            server_host: "127.0.0.1",
+            server_port: 1339,
+            chown_plugin_path: false,
+            socket_directory: &homebrew.0,
+        };
+        let environment = |flags: &[&str], loader_level: &str| {
+            write_plugin(&plugin, json!("bin/backend"), flags);
+            let metadata = read_plugin_metadata(&plugin, &[]).unwrap();
+            native_backend_environment(
+                &config,
+                &metadata,
+                &plugin,
+                &socket,
+                Path::new("/home/user"),
+                loader_level,
+            )
+        };
+        let value = |environment: &[(&'static str, OsString)], key: &str| {
+            environment
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_str().unwrap().to_owned())
+        };
+        let debug = environment(&["debug"], "WARNING");
+        assert_eq!(
+            value(&debug, "DECKY_PLUGIN_LOG_LEVEL").as_deref(),
+            Some("DEBUG")
+        );
+        assert_eq!(
+            value(&debug, "DECKY_PLUGIN_SOCKET").as_deref(),
+            Some(socket.as_os_str().to_str().unwrap())
+        );
+        assert_eq!(value(&debug, "SERVER_PORT").as_deref(), Some("1339"));
+        for (loader_level, expected) in [("WARNING", "WARNING"), ("debug", "debug"), ("", "INFO")] {
+            let quiet = environment(&[], loader_level);
+            assert_eq!(
+                value(&quiet, "DECKY_PLUGIN_LOG_LEVEL").as_deref(),
+                Some(expected),
+                "loader level {loader_level:?}"
             );
         }
     }

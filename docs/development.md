@@ -168,7 +168,9 @@ The path must be relative and stay inside the plugin. The loader opens every par
 
 The loader does for the executable what the Python worker does before it imports `main.py`: it creates the `settings`, `data` and `logs` folders, sets the same `DECKY_*`, `HOME` and `USER` variables, runs it as the host user in its own process group, and stops it with SIGTERM and then SIGKILL after five seconds. The program listens on the Unix socket named by `DECKY_PLUGIN_SOCKET` and speaks the worker protocol: newline-delimited JSON calls (`type` 0), replies (`type` 1) and events (`type` 2), plus `{"uninstall":true}` before an uninstall stop.
 
-The `decky-plugin` crate implements all of this, including a log file in `DECKY_PLUGIN_LOG_DIR` that is named and pruned like the Python `decky.logger` file. It is licensed 0BSD, so a plugin that links it can use any license. `backend-rust/decky-plugin/examples/native_example.rs` is a complete backend. Frontend code does not change: `callable(name)` and `addEventListener(event, …)` work as they do with Python.
+The `decky-plugin` crate implements all of this, including a log file in `DECKY_PLUGIN_LOG_DIR` that is named and pruned like the Python `decky.logger` file. Its `init_logging` reads the level from `DECKY_PLUGIN_LOG_LEVEL`, then `LOG_LEVEL`, and defaults to `INFO`. It is licensed 0BSD, so a plugin that links it can use any license. `backend-rust/decky-plugin/examples/native_example.rs` is a complete backend. Frontend code does not change: `callable(name)` and `addEventListener(event, …)` work as they do with Python.
+
+The `debug` flag in `plugin.json` has two effects for a plugin this loader starts: a refresh of the plugin list reloads it instead of leaving the running backend in place, and its native backend gets `DECKY_PLUGIN_LOG_LEVEL=DEBUG`. Plugins without the flag get the loader's own `LOG_LEVEL`, which defaults to `INFO`.
 
 Limits:
 
