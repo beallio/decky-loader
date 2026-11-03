@@ -186,6 +186,13 @@ def validate(directory: Path, tag: str, source_commit: str, channel: str | None 
             'verified_source_files': len(source_hashes)}
 
 
+def release_notes(channel: str, source_commit: str, extra: str = '') -> str:
+    notes = (f'{channel.title()} Rust runtime release. '
+             f'SDK baseline {CONFIG["sdk"]["tag"]}; source {source_commit}.')
+    extra = extra.strip()
+    return f'{notes}\n\n{extra}' if extra else notes
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--artifact-dir', type=Path, required=True)
@@ -195,6 +202,8 @@ def main() -> int:
     parser.add_argument('--repository', help='GitHub owner/repository; required only for publication')
     parser.add_argument('--ref', help='Git ref; publication is permitted only from refs/heads/main')
     parser.add_argument('--publish', action='store_true', help='explicitly publish the validated Rust runtime release')
+    parser.add_argument('--notes-file', type=Path,
+                        help='optional Markdown file appended below the generated release notes')
     args = parser.parse_args()
     if args.publish and (not args.repository or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repository)):
         parser.error('--publish requires --repository owner/repository')
@@ -209,8 +218,8 @@ def main() -> int:
             assets = [args.artifact_dir / name for name in
                       (ASSET_NAME, ASSET_CHECKSUM_NAME, 'SHA256SUMS', 'build-result.json')]
             ensure_release_tag(args.repository, args.tag, args.source_commit)
-            notes = (f'{args.channel.title()} Rust runtime release. '
-                     f'SDK baseline {CONFIG["sdk"]["tag"]}; source {args.source_commit}.')
+            notes = release_notes(args.channel, args.source_commit,
+                                  args.notes_file.read_text() if args.notes_file else '')
             release_args = ['gh', 'release', 'create', args.tag, '--repo', args.repository,
                             '--verify-tag', '--title', args.tag, '--notes', notes]
             if args.channel == 'preview':

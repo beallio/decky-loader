@@ -102,6 +102,39 @@ class ReleaseIntegrityTests(unittest.TestCase):
         self.assertEqual(result['channel'], 'preview')
         self.assertFalse(result['published'])
 
+    def test_release_notes_keep_the_generated_line_and_append_optional_notes(self):
+        generated = 'Preview Rust runtime release. SDK baseline {}; source {}.'.format(
+            release.CONFIG['sdk']['tag'], self.commit)
+        self.assertEqual(release.release_notes('preview', self.commit), generated)
+        self.assertEqual(release.release_notes('preview', self.commit, '\n \n'), generated)
+        self.assertEqual(release.release_notes('preview', self.commit, '\n- fix\n'), generated + '\n\n- fix')
+
+    def test_cli_publishes_the_notes_file_below_the_generated_line(self):
+        self.write_bundle()
+        notes = self.root / 'notes.md'
+        notes.write_text('\n### Fixes\n\n- keep one plugin order entry per name\n\n')
+        generated = 'Preview Rust runtime release. SDK baseline {}; source {}.'.format(
+            release.CONFIG['sdk']['tag'], self.commit)
+        commands = []
+        real_run = subprocess.run
+
+        def run(command, **kwargs):
+            if command[0] != 'gh':
+                return real_run(command, **kwargs)
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch.object(sys, 'argv', [
+            'release.py', '--artifact-dir', str(self.root), '--tag', self.tag, '--channel', 'preview',
+            '--source-commit', self.commit, '--repository', 'beallio/decky-loader', '--ref', 'refs/heads/main',
+            '--publish', '--notes-file', str(notes),
+        ]), patch.object(release, 'existing_tag_commit', return_value=None), \
+                patch.object(release.subprocess, 'run', side_effect=run), redirect_stdout(io.StringIO()):
+            self.assertEqual(release.main(), 0)
+        create = next(command for command in commands if command[:3] == ['gh', 'release', 'create'])
+        self.assertEqual(create[create.index('--notes') + 1],
+                         generated + '\n\n### Fixes\n\n- keep one plugin order entry per name')
+
     def test_rejects_checksum_sidecar_that_does_not_identify_the_zip(self):
         self.write_bundle()
         (self.root / release.ASSET_CHECKSUM_NAME).write_text(f'{"0" * 64}  {release.ASSET_NAME}\n')

@@ -15,6 +15,11 @@ on:
         options:
           - stable
           - preview
+      release_notes:
+        description: Optional Markdown notes, appended below the generated release line
+        required: false
+        default: ""
+        type: string
       publish:
         description: Publish this release (requires the main branch)
         default: false
@@ -121,12 +126,15 @@ jobs:
           ARTIFACT_DIR: ${{ runner.temp }}/runtime-release
           RELEASE_TAG: ${{ inputs.release_tag }}
           RELEASE_CHANNEL: ${{ inputs.release_channel }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
           SOURCE_COMMIT: ${{ github.sha }}
           RELEASE_REPOSITORY: ${{ github.repository }}
           RELEASE_REF: ${{ github.ref }}
           PUBLISH: ${{ inputs.publish }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Untrusted input reaches the script as a file, never as shell text.
+          printf '%s\n' "$RELEASE_NOTES" > "$RUNNER_TEMP/release-notes.md"
           publish_args=()
           if [[ "$PUBLISH" == true ]]; then
             publish_args=(--publish --ref "$RELEASE_REF")
@@ -135,6 +143,7 @@ jobs:
             --artifact-dir "$ARTIFACT_DIR" \
             --tag "$RELEASE_TAG" \
             --channel "$RELEASE_CHANNEL" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
             --source-commit "$SOURCE_COMMIT" \
             --repository "$RELEASE_REPOSITORY" \
             "${publish_args[@]}"

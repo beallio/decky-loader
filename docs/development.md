@@ -229,6 +229,14 @@ The tag selects the channel, and the selected channel must agree with it:
 
 Publication is off by default and requires an explicit `--publish` selection from `refs/heads/main`. An existing tag must resolve to the artifact's exact source commit. Never publish to the official Python release feed.
 
+The workflow's optional `release_notes` input holds Markdown that is appended below the generated line (`Preview Rust runtime release. SDK baseline …; source …`). Locally, write the same text to a file and pass `--notes-file PATH`. Empty or whitespace-only notes leave the generated line alone. The workflow passes the input to the script through an environment variable and a file, never as shell text, so the notes cannot inject commands:
+
+```sh
+gh workflow run runtime-release.yml --repo beallio/decky-loader --ref main \
+  -f release_tag=v3.3.1-rust.1-rc.3 -f release_channel=preview -f publish=true \
+  -f release_notes="$(cat notes.md)"
+```
+
 The [Deck installer](../scripts/install-to-deck.sh) downloads the latest stable fork release by default, the newest preview with `--channel preview`, or one exact tag with `--version`. It checks the ZIP against the release's `.sha256` file. Offline installs use `--bundle ZIP --sha256 HASH --version TAG`.
 
 ## Upstream sync
