@@ -3062,7 +3062,6 @@ fn native_backend_environment(
     plugin_directory: &Path,
     socket_path: &Path,
     account_home: &Path,
-    loader_level: &str,
 ) -> Vec<(&'static str, OsString)> {
     let storage = |root: &str| config.homebrew.join(root).join(&plugin.directory);
     vec![
@@ -3080,7 +3079,7 @@ fn native_backend_environment(
         ("DECKY_PLUGIN_LOG_DIR", storage("logs").into_os_string()),
         (
             "DECKY_PLUGIN_LOG_LEVEL",
-            native_log_level(plugin.debug, loader_level).into(),
+            native_log_level(plugin.debug).into(),
         ),
         ("DECKY_PLUGIN_DIR", plugin_directory.as_os_str().to_owned()),
         ("DECKY_PLUGIN_NAME", plugin.name.clone().into()),
@@ -3092,15 +3091,12 @@ fn native_backend_environment(
     ]
 }
 
-/// A `debug` plugin logs at `DEBUG`; the others follow the loader's own level.
-fn native_log_level(debug: bool, loader_level: &str) -> &str {
-    if debug {
-        "DEBUG"
-    } else if loader_level.trim().is_empty() {
-        "INFO"
-    } else {
-        loader_level
-    }
+/// A `debug` plugin logs at `DEBUG`; every other plugin logs at `INFO`.
+///
+/// Only the flag switches it on, as for Python plugins, whose `decky.logger`
+/// stays at `INFO` whatever the loader's `LOG_LEVEL` is.
+fn native_log_level(debug: bool) -> &'static str {
+    if debug { "DEBUG" } else { "INFO" }
 }
 
 /// Starts a plugin's own executable instead of the Python worker. The supervisor
@@ -3127,7 +3123,6 @@ fn spawn_native_backend(
         .map_err(|error| failed(format!("could not prepare the plugin folders: {error}")))?;
 
     let plugin_directory = config.plugin_root.join(&plugin.directory);
-    let loader_level = std::env::var("LOG_LEVEL").unwrap_or_default();
     // Running the opened descriptor runs exactly the file that was checked above.
     let mut command = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()));
     command
@@ -3138,7 +3133,6 @@ fn spawn_native_backend(
             &plugin_directory,
             socket_path,
             Path::new(&account.dir),
-            &loader_level,
         ))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -4089,7 +4083,7 @@ mod native_backend_tests {
             chown_plugin_path: false,
             socket_directory: &homebrew.0,
         };
-        let environment = |flags: &[&str], loader_level: &str| {
+        let environment = |flags: &[&str]| {
             write_plugin(&plugin, json!("bin/backend"), flags);
             let metadata = read_plugin_metadata(&plugin, &[]).unwrap();
             native_backend_environment(
@@ -4098,7 +4092,6 @@ mod native_backend_tests {
                 &plugin,
                 &socket,
                 Path::new("/home/user"),
-                loader_level,
             )
         };
         let value = |environment: &[(&'static str, OsString)], key: &str| {
@@ -4107,7 +4100,7 @@ mod native_backend_tests {
                 .find(|(name, _)| *name == key)
                 .map(|(_, value)| value.to_str().unwrap().to_owned())
         };
-        let debug = environment(&["debug"], "WARNING");
+        let debug = environment(&["debug"]);
         assert_eq!(
             value(&debug, "DECKY_PLUGIN_LOG_LEVEL").as_deref(),
             Some("DEBUG")
@@ -4117,14 +4110,12 @@ mod native_backend_tests {
             Some(socket.as_os_str().to_str().unwrap())
         );
         assert_eq!(value(&debug, "SERVER_PORT").as_deref(), Some("1339"));
-        for (loader_level, expected) in [("WARNING", "WARNING"), ("debug", "debug"), ("", "INFO")] {
-            let quiet = environment(&[], loader_level);
-            assert_eq!(
-                value(&quiet, "DECKY_PLUGIN_LOG_LEVEL").as_deref(),
-                Some(expected),
-                "loader level {loader_level:?}"
-            );
-        }
+        // The loader's LOG_LEVEL is not forwarded at all, as for Python plugins.
+        let quiet = environment(&[]);
+        assert_eq!(
+            value(&quiet, "DECKY_PLUGIN_LOG_LEVEL").as_deref(),
+            Some("INFO")
+        );
     }
 
     #[test]

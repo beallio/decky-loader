@@ -579,9 +579,10 @@ async fn write_reply(
 
 /// Sends [`log`] records to a new file in `DECKY_PLUGIN_LOG_DIR` and to standard
 /// error, like the Python `decky.logger`. The level comes from
-/// `DECKY_PLUGIN_LOG_LEVEL`, then `LOG_LEVEL`, and defaults to info. Older log
-/// files are removed so that five remain. [`Plugin::run`] calls this; call it
-/// yourself to log before `run`. Returns the log file path.
+/// `DECKY_PLUGIN_LOG_LEVEL` and defaults to info; the loader's `LOG_LEVEL` only
+/// affects the loader's own logging. Older log files are removed so that five
+/// remain. [`Plugin::run`] calls this; call it yourself to log before `run`.
+/// Returns the log file path.
 pub fn init_logging() -> io::Result<PathBuf> {
     static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
     if let Some(path) = LOG_FILE.get() {
@@ -608,20 +609,13 @@ pub fn init_logging() -> io::Result<PathBuf> {
     }))
     .map_err(|error| io::Error::new(io::ErrorKind::AlreadyExists, error.to_string()))?;
     let plugin_level = env::var("DECKY_PLUGIN_LOG_LEVEL").ok();
-    let loader_level = env::var("LOG_LEVEL").ok();
-    log::set_max_level(configured_level(
-        plugin_level.as_deref(),
-        loader_level.as_deref(),
-    ));
+    log::set_max_level(configured_level(plugin_level.as_deref()));
     Ok(LOG_FILE.get_or_init(|| path).clone())
 }
 
-/// The backend's level: the plugin's own setting, then the loader's, then info.
-fn configured_level(plugin: Option<&str>, loader: Option<&str>) -> log::LevelFilter {
+/// The backend's level: the plugin's own setting, then info.
+fn configured_level(plugin: Option<&str>) -> log::LevelFilter {
     plugin
-        .into_iter()
-        .chain(loader)
-        .find(|value| !value.trim().is_empty())
         .and_then(parse_level)
         .unwrap_or(log::LevelFilter::Info)
 }
@@ -1120,24 +1114,12 @@ mod tests {
     }
 
     #[test]
-    fn the_plugin_level_wins_over_the_loader_level() {
-        assert_eq!(
-            configured_level(Some("DEBUG"), Some("WARNING")),
-            log::LevelFilter::Debug
-        );
-        assert_eq!(
-            configured_level(None, Some("warning")),
-            log::LevelFilter::Warn
-        );
-        assert_eq!(
-            configured_level(Some(" "), Some("warn")),
-            log::LevelFilter::Warn
-        );
-        assert_eq!(
-            configured_level(Some("nonsense"), Some("DEBUG")),
-            log::LevelFilter::Info
-        );
-        assert_eq!(configured_level(None, None), log::LevelFilter::Info);
+    fn only_the_plugin_level_sets_the_log_level() {
+        assert_eq!(configured_level(Some("DEBUG")), log::LevelFilter::Debug);
+        assert_eq!(configured_level(Some("warning")), log::LevelFilter::Warn);
+        assert_eq!(configured_level(Some(" ")), log::LevelFilter::Info);
+        assert_eq!(configured_level(Some("nonsense")), log::LevelFilter::Info);
+        assert_eq!(configured_level(None), log::LevelFilter::Info);
     }
 
     #[test]
