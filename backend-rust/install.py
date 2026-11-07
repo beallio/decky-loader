@@ -790,7 +790,7 @@ def _assert_no_system_instance(paths: dict[str, Any]) -> dict[str, str]:
     if load_state == 'not-found':
         if status is None or status.get('phase') == 'restored':
             return system
-        _fail('legacy migration state is incomplete; run restore-legacy-system before installing a user service')
+        _fail('the move from the official Decky did not finish; run install-to-deck.sh --restore-legacy before installing')
     if load_state == 'masked' and (
         status is not None
         and status.get('phase') in ('services-user-owned', 'installed', 'forgetting', 'forgotten')
@@ -799,8 +799,8 @@ def _assert_no_system_instance(paths: dict[str, Any]) -> dict[str, str]:
     ):
         return system
     _fail(
-        f'system service {paths["unit"].name} is present; run the explicit '
-        'migrate-legacy-system command before installing a user service'
+        f'the official Decky ({paths["unit"].name} system service) is installed; '
+        'add --migrate-legacy to the install-to-deck.sh command to move to this fork'
     )
 
 

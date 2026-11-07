@@ -347,7 +347,7 @@ class UserServiceInstallerTests(unittest.TestCase):
             with patch.object(installer, "_unit_properties", return_value={
                 "LoadState": "loaded", "ActiveState": "inactive", "MainPID": "0",
             }):
-                with self.assertRaisesRegex(installer.InstallerError, "migrate-legacy-system"):
+                with self.assertRaisesRegex(installer.InstallerError, "add --migrate-legacy"):
                     installer._assert_no_system_instance(paths)
 
     def test_masked_legacy_service_allows_user_scope_only_after_completed_migration(self):

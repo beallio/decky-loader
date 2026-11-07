@@ -1229,6 +1229,28 @@ PY
             --user-unit-directory "$unit_directory" \
             2>&1 | tee -a "${failure_log:-/dev/null}"
         legacy_helper=$(protected_legacy_helper) || fail 'Legacy migration did not preserve a safe protected restore helper'
+        # The official loader's saved update channel names its own releases; let this fork pick its default.
+        python3 - "$homebrew/settings/loader.json" <<'PY'
+import json
+import os
+import shutil
+import sys
+path = sys.argv[1]
+try:
+    with open(path, encoding='utf-8') as source:
+        settings = json.load(source)
+    if isinstance(settings, dict) and 'branch' in settings:
+        del settings['branch']
+        temporary = f'{path}.{os.getpid()}.tmp'
+        with open(temporary, 'w', encoding='utf-8') as target:
+            json.dump(settings, target, indent=4)
+        shutil.copymode(path, temporary)
+        os.replace(temporary, path)
+except FileNotFoundError:
+    pass
+except (OSError, ValueError) as error:
+    print(f'Note: the update channel was not reset ({error}); choose it in Decky settings.')
+PY
     fi
 
     restart_installer=$stage/bundle/install.py
