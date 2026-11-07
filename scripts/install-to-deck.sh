@@ -321,7 +321,7 @@ fetch_release_metadata() {
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
             --output "$work/release.json" "$release_api/releases/latest" \
-            || fail 'The fork has no published stable release yet; use --bundle with a verified ZIP or publish a stable release first'
+            || fail 'The fork has no published stable release yet; add --channel preview to install the newest preview'
     else
         local page count
         page=1
@@ -379,7 +379,7 @@ elif channel == 'preview':
 else:
     release = releases[0] if releases else None
     if release is None:
-        raise SystemExit('The fork has no published stable release yet; use --bundle with a verified ZIP or publish a stable release first')
+        raise SystemExit('The fork has no published stable release yet; add --channel preview to install the newest preview')
 
 tag = release.get('tag_name')
 if not isinstance(tag, str) or release.get('draft'):

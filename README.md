@@ -93,23 +93,23 @@ How we measured:
 
    ```sh
    cd ~/Downloads
-   bash install-to-deck.sh --check
-   bash install-to-deck.sh
+   bash install-to-deck.sh --check --channel preview
+   bash install-to-deck.sh --channel preview
    ```
 
-   The `--check` command only tests the download and your Deck. It changes nothing. The second command installs the latest stable version.
+   The `--check` command only tests the download and your Deck. It changes nothing. The second command installs the newest preview version. This fork has no stable version yet. When it has one, you can leave out `--channel preview`.
 4. Go back to Gaming Mode.
 
 You do not need a GitHub account or developer tools. Before each change, the script saves a copy of your `homebrew` folder (your plugins and settings) in `~/decky-user-backups`. It keeps the 3 newest copies and deletes older ones. To save the copies in a different folder, add `--backup-dir FOLDER`.
 
-To install a test version, add `--channel preview`. To install one specific version, add `--version` and the version name, for example `--version v3.2.10-rust.7`.
+To install one specific version, add `--version` and the version name, for example `--version v3.3.1-rust.1-rc.5`.
 
 ### If the official Decky is already installed
 
 The official Decky runs with the administrator account. To move to this fork, type:
 
 ```sh
-bash install-to-deck.sh --migrate-legacy
+bash install-to-deck.sh --migrate-legacy --channel preview
 ```
 
 The script asks for your password one time. If you do not have a password, type `passwd` first to make one. The script keeps a copy of the official Decky, so you can go back to it later.
@@ -164,7 +164,7 @@ If a store does not answer, the store page shows a message and the plugins from 
 Some plugins, for example PowerTools, need administrator (root) access. By default, these plugins do not run, and Decky shows a message for them. To let them run, type:
 
 ```sh
-bash install-to-deck.sh --enable-root-plugins
+bash install-to-deck.sh --enable-root-plugins --channel preview
 ```
 
 This installs the current version of this fork and asks for your password one time. Then it shows the installed plugins that need administrator access. Type `y` to let them run. Only these plugins run as administrator, in a separate background program. Decky and all other plugins still run with your `deck` account.
