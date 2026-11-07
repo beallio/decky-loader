@@ -1283,10 +1283,26 @@ PY
     installer_transaction_started=0
     legacy_migration_attempted=0
     printf 'Installation complete for %s as %s.\n' "$unit" "$user"
+    enable_cef_debugging
     if [[ $root_plugins == enable ]]; then
         enable_root_plugins
     fi
     exit 0
+}
+
+# Steam opens the CEF debugger that Decky injects through only if this flag exists when Steam starts.
+enable_cef_debugging() {
+    local steam created=0
+    [[ $HOME == /* ]] || fail 'HOME must be an absolute path'
+    for steam in "$HOME/.steam/steam" "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"; do
+        if [[ -d $steam && ! -e $steam/.cef-enable-remote-debugging ]]; then
+            touch -- "$steam/.cef-enable-remote-debugging"
+            created=1
+        fi
+    done
+    if (( created )); then
+        printf 'Turned on Steam remote debugging for Decky. Restart Steam or the Deck so that Decky shows.\n'
+    fi
 }
 
 enable_root_plugins() {

@@ -201,6 +201,7 @@ class InstallToDeckWrapperTests(unittest.TestCase):
         environment.update({
             'TMPDIR': str(self.root),
             'DECK_USER': self.account,
+            'HOME': str(self.root),
             'FAKE_BACKUP_DIR': str(self.backup),
             'FAKE_EVENTS': str(self.events),
             'FAKE_STATE': str(self.state),
@@ -241,6 +242,15 @@ class InstallToDeckWrapperTests(unittest.TestCase):
         self.assertFalse(self.sudo_log.exists(), 'ordinary installation must not invoke sudo')
         self.assertFalse(self.stage.exists(), 'owned staging directory should be removed')
         self.assertFalse(list((self.homebrew / 'services' / '.decky-user-deploy').rglob('failure.*')))
+
+    def test_install_turns_on_steam_remote_debugging(self):
+        steam = self.root / '.steam' / 'steam'
+        steam.mkdir(parents=True)
+        result = self.run_target()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue((steam / '.cef-enable-remote-debugging').is_file())
+        self.assertIn('Restart Steam', result.stdout)
+        self.assertFalse((self.root / '.var').exists(), 'absent Flatpak Steam must not be created')
 
     def test_check_with_migration_is_nonmutating_and_forwards_preflight(self):
         command = [

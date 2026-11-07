@@ -188,7 +188,7 @@ The `resources` part of the output shows how much CPU and memory Decky and each 
 
 ## Problems
 
-- **Decky does not show.** Restart the Deck. If Decky still does not show, run `--status`, then install again.
+- **Decky does not show.** Restart the Deck. If Decky still does not show, download the newest [install-to-deck.sh](scripts/install-to-deck.sh), install again, and restart the Deck. Scripts from before `v3.3.1-rust.1-rc.5` did not turn on Steam remote debugging, which Decky needs on a Deck that never had Decky.
 - **A plugin shows "This plugin needs root".** See [Plugins that need administrator access](#plugins-that-need-administrator-access).
 - **A plugin shows "Decky could not start".** The plugin did not start. Update or remove it in Decky's settings.
 - **An update in Decky stops or fails, and your version is `v3.2.10-rust.8-rc.1` to `rc.10`.** These versions cannot update themselves to `v3.3.0` or later. Run the install command one time with `--channel preview`. After that, updates in Decky work again.
