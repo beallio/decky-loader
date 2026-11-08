@@ -308,30 +308,35 @@ PY
 release_api='https://api.github.com/repos/beallio/decky-loader'
 asset_name='decky-loader-runtime-linux-x86_64.zip'
 
+# GitHub answers 403 or 429 when this network used its hourly API limit; say that instead of "not found".
+github_api() {
+    local url=$1 output=$2 message=$3 status
+    status=$(curl -q --silent --show-error --location --proto '=https' --proto-redir '=https' \
+        --header 'Accept: application/vnd.github+json' \
+        --header 'X-GitHub-Api-Version: 2022-11-28' \
+        --output "$output" --write-out '%{http_code}' "$url") \
+        || fail 'GitHub could not be reached; check the network connection and try again'
+    case $status in
+        2??) ;;
+        403|429) fail 'GitHub refused the request because this network used its hourly limit; wait up to one hour and try again' ;;
+        *) fail "$message" ;;
+    esac
+}
+
 fetch_release_metadata() {
     local requested=$1 channel=$2
     if [[ -n $requested ]]; then
-        curl -q --fail --location --proto '=https' --proto-redir '=https' \
-            --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            --output "$work/release.json" "$release_api/releases/tags/$requested" \
-            || fail "Published release $requested could not be found in beallio/decky-loader"
+        github_api "$release_api/releases/tags/$requested" "$work/release.json" \
+            "Published release $requested could not be found in beallio/decky-loader"
     elif [[ $channel == stable ]]; then
-        curl -q --fail --location --proto '=https' --proto-redir '=https' \
-            --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            --output "$work/release.json" "$release_api/releases/latest" \
-            || fail 'The fork has no published stable release yet; add --channel preview to install the newest preview'
+        github_api "$release_api/releases/latest" "$work/release.json" \
+            'The fork has no published stable release yet; add --channel preview to install the newest preview'
     else
         local page count
         page=1
         while :; do
-            curl -q --fail --location --proto '=https' --proto-redir '=https' \
-                --header 'Accept: application/vnd.github+json' \
-                --header 'X-GitHub-Api-Version: 2022-11-28' \
-                --output "$work/releases-$page.json" \
-                "$release_api/releases?per_page=100&page=$page" \
-                || fail 'The public preview release list could not be downloaded'
+            github_api "$release_api/releases?per_page=100&page=$page" "$work/releases-$page.json" \
+                'The public preview release list could not be downloaded'
             count=$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); print(len(value) if isinstance(value,list) else 0)' "$work/releases-$page.json")
             (( count < 100 )) && break
             (( page += 1 ))

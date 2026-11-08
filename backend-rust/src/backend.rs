@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use serde_json::{Map, Value, json, value::RawValue};
@@ -98,6 +98,23 @@ pub struct Backend {
     utilities: Utilities,
 }
 
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+// Matches the 300 s that upstream's aiohttp session allows a stalled server; idle-based, so long streams keep working.
+const HTTP_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The shared client for plugin fetches, CEF discovery and loader updates.
+pub(crate) fn http_client(version: &str) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(format!("Decky/{version} (https://decky.xyz)"))
+        .no_proxy()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(HTTP_READ_IDLE_TIMEOUT)
+        .build()
+}
+
 impl Backend {
     pub async fn new(
         registry: Arc<PluginRegistry>,
@@ -119,13 +136,7 @@ impl Backend {
             Err(error) => return Err(error.into()),
         };
         let config = RuntimeConfig::default();
-        let client = reqwest::Client::builder()
-            .user_agent(format!("Decky/{version} (https://decky.xyz)"))
-            .no_proxy()
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .build()?;
+        let client = http_client(&version)?;
         let cef = Cef::new(client.clone(), config.cef_url.clone());
         Ok(Self {
             registry,
@@ -490,5 +501,54 @@ mod tests {
         backend.initialize_plugin_order().await.unwrap();
         assert_eq!(backend.setting("pluginOrder", json!(null)).await, json!([]));
         registry.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_client_ends_a_stalled_request_but_not_a_slow_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 1024];
+                    let read = socket.read(&mut request).await.unwrap();
+                    if !request[..read].starts_with(b"GET /stall") {
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\n")
+                            .await
+                            .unwrap();
+                        for byte in [b"a", b"b", b"c"] {
+                            tokio::time::sleep(Duration::from_secs(200)).await;
+                            socket.write_all(byte).await.unwrap();
+                        }
+                    }
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let client = http_client("test").unwrap();
+
+        let started = tokio::time::Instant::now();
+        let error = client
+            .get(format!("http://{address}/stall"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout(), "{error}");
+        assert!(started.elapsed() >= HTTP_READ_IDLE_TIMEOUT);
+
+        let started = tokio::time::Instant::now();
+        let response = client
+            .get(format!("http://{address}/slow"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.text().await.unwrap(), "abc");
+        assert!(
+            started.elapsed() > HTTP_READ_IDLE_TIMEOUT,
+            "a stream that keeps sending must outlive the idle limit"
+        );
     }
 }

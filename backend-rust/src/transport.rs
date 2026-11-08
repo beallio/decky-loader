@@ -870,6 +870,7 @@ async fn proxy_fetch(
         .await
     {
         Ok(response) => response,
+        Err(error) if error.is_timeout() => return StatusCode::GATEWAY_TIMEOUT.into_response(),
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
 

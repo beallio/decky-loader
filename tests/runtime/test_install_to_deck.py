@@ -252,6 +252,19 @@ class InstallToDeckWrapperTests(unittest.TestCase):
         self.assertIn('Restart Steam', result.stdout)
         self.assertFalse((self.root / '.var').exists(), 'absent Flatpak Steam must not be created')
 
+    def test_github_rate_limit_is_reported_instead_of_a_missing_release(self):
+        curl = self.fake_bin / 'curl'
+        curl.write_text('#!/bin/sh\nprintf 403\n', encoding='utf-8')
+        curl.chmod(0o755)
+        result = subprocess.run(
+            ['bash', str(WRAPPER), '--check', '--version', 'v3.3.1-rust.1-rc.6'],
+            cwd=REPOSITORY, env=self.environment(), text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('hourly limit', result.stdout)
+        self.assertNotIn('could not be found', result.stdout)
+
     def test_check_with_migration_is_nonmutating_and_forwards_preflight(self):
         command = [
             'bash', str(WRAPPER), '--check', '--migrate-legacy', '--bundle', str(self.bundle),

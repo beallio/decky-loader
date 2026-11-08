@@ -32,6 +32,9 @@ uuid = { version = "1", features = ["v4"] }
 unicode-casefold = "0.2"
 zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2-zlib-rs", "bzip2", "lzma"] }
 
+[dev-dependencies]
+tokio = { version = "1.54", features = ["test-util"] }
+
 [profile.dev]
 debug = 0
 incremental = false
