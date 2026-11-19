@@ -2,6 +2,13 @@
 
 Decky Loader adds plugins to the Steam Deck's Gaming Mode. Plugins can [restyle menus](https://github.com/suchmememanyskill/SDH-CssLoader), [change system sounds](https://github.com/EMERALD0874/SDH-AudioLoader), [adjust colors](https://github.com/libvibrant/vibrantDeck), and more.
 
+
+> [!IMPORTANT]
+> **Works with newer Steam Beta updates.** Newer Steam Client Beta updates changed how Gaming Mode is built, which stops the official Decky Loader from starting. This fork adapts automatically so Decky and most plugins keep working on both Steam Stable and Steam Beta, with no extra steps.
+>
+> With Steam Deck `publicbeta` `1795048523` (changelist `11255874`), released Nov. 18, 2026, Valve migrated `steamui` from Webpack to Vite + Rolldown + LightningCSS. This resulted in a rare change to nearly all CSS class names, and most React components and internal stores moving from stable Webpack module IDs to minified chunk bindings.  Certain plugins may not work on Beta if they have not updated to accommodate this migration.
+
+
 This is a modified copy (a "fork") of Decky Loader. It looks and works like the normal Decky, and your current plugins still work. The difference is the part that runs in the background: this fork replaces it with a smaller, faster program written in the Rust programming language. It also runs with your normal `deck` account, not with the administrator (root) account.
 
 This is not the official Decky Loader. For the official version, go to [SteamDeckHomebrew/decky-loader](https://github.com/SteamDeckHomebrew/decky-loader).
