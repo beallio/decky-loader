@@ -67,22 +67,21 @@ Implemented in `backend-rust/src/cef.rs`, `backend-rust/src/vite_esm.rs`, and `b
      }));
      ```
    - Zero modification to Steam's files on disk and zero line-number shifts in stack traces.
-4. **Compatibility layer (`vite_esm.rs`):**
-   - `globalThis.__DECKY_ESM_REG__` registers each chunk box under `"esm:<chunk>"` and each plain non-React object export under `"esm:<chunk>:<var>"` (skipping React `$$typeof` objects, DOM nodes, `window`, and `document`).
+4. **Compatibility layer (`vite_esm.rs`, `frontend/src/index.ts`):**
+   - `globalThis.__DECKY_ESM_REG__` registers each chunk box under `"esm:<chunk>"` and each plain non-React object export under `"esm:<chunk>:<var>"` (skipping React `$$typeof` objects, DOM nodes, `window`, and `document`), and mirrors late arrivals directly into `window.DFL?.modules` once `window.DFL` is initialized (with a startup backfill in `frontend/src/index.ts` covering the brief window between `initModuleCache()` and `window.DFL` assignment).
    - Exposes a `window.webpackChunksteamui` compatibility proxy backed by `globalThis.__DECKY_ESM__` so `@decky/ui` and existing plugins work without rewriting their loader bootstrap.
    - Wraps `Function.prototype.toString` (with a `WeakMap` cache) to normalize Oxc's simple backtick literals (`` `foo` `` → `"foo"`) and `let{` → `const{` so existing `toString().includes(...)` finders keep matching.
 
 ### Known limitations & tracked follow-ups
 
-These real limitations are tracked in the `beallio/decky-loader` Vite ESM follow-up issue:
+These remaining limitations are tracked in [`beallio/decky-loader#6`](https://github.com/beallio/decky-loader/issues/6):
 
-1. **Lazy-loaded Vite chunks after initial Decky boot:** Late dynamic chunks (e.g., Settings, Properties, Media, Store routes loaded on first navigation) register themselves into `globalThis.__DECKY_ESM__` when they execute, **but** `@decky/ui`'s `webpack.js` snapshots `Object.keys(webpackRequire.m)` into its static `modules` Map only once at startup. Syncing late `__DECKY_ESM_REG__` arrivals into `window.DFL.modules` (or exposing a live search helper) is needed if plugins want `findModule*` to discover lazy route chunks automatically.
-2. **`library.js` entry-chunk bindings:** Because `library.js` is pinned back to `steamloopback.host` to avoid double-evaluation, its own ~259 top-level declarations are not instrumented. Currently harmless (all loader/`@decky/ui`/`decky-extras` targets live in imported chunks), but must be monitored if Valve ever moves a target directly into `library.js`.
-3. **Future Rolldown `const` / `class` top-level bindings:** Rolldown currently emits `0` top-level `class` and only `const __vite__mapDeps`. If a future Rolldown release emits top-level `const` or `class` declarations, `extract_top_level_mutable_names` should emit read-only `get X(){return X}` descriptors so discovery keeps working without throwing `TypeError` on assignment.
-4. **CSP resilience:** If Valve adds a strict `Content-Security-Policy` to `steamloopback.host` blocking inline `<script type="importmap">` or `http://localhost:1337`, `cef.rs` will need `Page.setBypassCSP({ enabled: true })` (or a fallback transport).
-5. **Eagerly captured references:** Assigning through a live `var` setter updates subsequent callers of that module-scoped binding, not references already copied into lookup `Map`s or passed into `React.memo(...)`/`React.forwardRef(...)` before the footer ran. Those still require patching `.type`/`.render` or a wrapper/fiber approach.
-6. **Non-standard Steam install paths:** `resolve_steamui_root` checks `$STEAM_DIR` plus standard `~/.local/share/Steam`, `~/.steam/{root,steam}`, and Flatpak paths. Custom install locations require `STEAM_DIR` unless process-path discovery is added.
-7. **Retiring `viteCompatDeckyUi()` Rollup fallbacks:** Tracked automatically by [`beallio/steamui-watch#38`](https://github.com/beallio/steamui-watch/issues/38) (`Upstream @decky/ui Vite compatibility tracker`). Once unmodified upstream `@decky/ui` passes on Vite `publicbeta`, the Rollup fallbacks in `frontend/rollup.config.js` can be removed.
+1. **`library.js` entry-chunk bindings:** Because `library.js` is pinned back to `steamloopback.host` to avoid double-evaluation, its own ~259 top-level declarations are not instrumented. Currently harmless (all loader/`@decky/ui`/`decky-extras` targets live in imported chunks), but must be monitored if Valve ever moves a target directly into `library.js`.
+2. **Future Rolldown `const` / `class` top-level bindings:** Rolldown currently emits `0` top-level `class` and only `const __vite__mapDeps`. If a future Rolldown release emits top-level `const` or `class` declarations, `extract_top_level_mutable_names` should emit read-only `get X(){return X}` descriptors so discovery keeps working without throwing `TypeError` on assignment.
+3. **CSP resilience:** If Valve adds a strict `Content-Security-Policy` to `steamloopback.host` blocking inline `<script type="importmap">` or `http://localhost:1337`, `cef.rs` will need `Page.setBypassCSP({ enabled: true })` (or a fallback transport).
+4. **Eagerly captured references:** Assigning through a live `var` setter updates subsequent callers of that module-scoped binding, not references already copied into lookup `Map`s or passed into `React.memo(...)`/`React.forwardRef(...)` before the footer ran. Those still require patching `.type`/`.render` or a wrapper/fiber approach.
+5. **Non-standard Steam install paths:** `resolve_steamui_root` checks `$STEAM_DIR` plus standard `~/.local/share/Steam`, `~/.steam/{root,steam}`, and Flatpak paths. Custom install locations require `STEAM_DIR` unless process-path discovery is added.
+6. **Retiring `viteCompatDeckyUi()` Rollup fallbacks:** Tracked automatically by [`beallio/steamui-watch#38`](https://github.com/beallio/steamui-watch/issues/38) (`Upstream @decky/ui Vite compatibility tracker`). Once unmodified upstream `@decky/ui` passes on Vite `publicbeta`, the Rollup fallbacks in `frontend/rollup.config.js` can be removed.
 
 ---
 

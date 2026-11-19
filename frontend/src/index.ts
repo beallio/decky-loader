@@ -57,6 +57,13 @@ const isSteamAppInitialized = () => {
       QuickAccessTab: { ...DFL.QuickAccessTab, Music: DFL.QuickAccessTab.Soundtrack },
     }),
   );
+  // Fork: backfill any Vite ESM chunks registered between initModuleCache() and window.DFL setup.
+  const viteEsm = (globalThis as { __DECKY_ESM__?: unknown }).__DECKY_ESM__;
+  if (viteEsm instanceof Map && window.DFL.modules instanceof Map) {
+    for (const [id, mod] of viteEsm) {
+      if (!window.DFL.modules.has(id)) window.DFL.modules.set(id, mod);
+    }
+  }
   console.debug('[Decky:Boot] Authenticating with Decky backend...');
   window.deckyAuthToken = await fetch('http://127.0.0.1:1337/auth/token').then((r) => r.text());
   console.debug('[Decky:Boot] Connecting to Decky backend...');

@@ -48,8 +48,15 @@ const VITE_ESM_SHIM_TEMPLATE: &str = r#"(() => {
 
   const esm = (globalThis.__DECKY_ESM__ = new Map());
   const seenObjs = new WeakSet();
+  const regEntry = (id, val) => {
+    esm.set(id, val);
+    try {
+      const mods = window.DFL?.modules;
+      if (mods && typeof mods.set === "function") mods.set(id, val);
+    } catch {}
+  };
   globalThis.__DECKY_ESM_REG__ = (chunkId, box) => {
-    esm.set("esm:" + chunkId, box);
+    regEntry("esm:" + chunkId, box);
     for (const k of Object.keys(box)) {
       let v;
       try { v = box[k]; } catch { continue; }
@@ -60,7 +67,7 @@ const VITE_ESM_SHIM_TEMPLATE: &str = r#"(() => {
       const proto = Object.getPrototypeOf(v);
       if (proto === Object.prototype || proto === null || v[Symbol.toStringTag] === "Module") {
         seenObjs.add(v);
-        esm.set("esm:" + chunkId + ":" + k, v);
+        regEntry("esm:" + chunkId + ":" + k, v);
       }
     }
   };
@@ -756,5 +763,6 @@ export { a as A, topFn as B };
         assert!(shim.contains("http://localhost:1337/steamui/"));
         assert!(shim.contains("http://localhost:1337/steamui/library.js?contenthash=CVZWwsCP"));
         assert!(shim.contains("https://steamloopback.host/library.js?contenthash=CVZWwsCP"));
+        assert!(shim.contains("window.DFL?.modules"));
     }
 }
