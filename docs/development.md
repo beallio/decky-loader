@@ -1,6 +1,6 @@
 # Development
 
-This guide covers the source layout, local checks, complete runtime builds, and isolated validation. For installation and everyday use, see the [README](../README.md). Plugin authors can start with the [plugin template](https://github.com/SteamDeckHomebrew/decky-plugin-template) and the [development wiki](https://wiki.deckbrew.xyz/en/loader-dev/development).
+This guide covers the source layout, local checks, complete runtime builds, and isolated validation. For installation and everyday use, see the [README](../README.md). Plugin authors can start with the [plugin template](https://github.com/SteamDeckHomebrew/decky-plugin-template).
 
 ## Repository layout
 
@@ -275,3 +275,13 @@ The loader sets `window.DFL` to its own copy of `@decky/ui`, and plugins read th
 | `QuickAccessTab.Music` (7) | renamed `Soundtrack` in `globals/stores/steamuistore/menu.js` |
 
 `window.DFL` is a frozen module namespace, and some exports are `let` bindings that change later (`modules`, `Navigation`). Do not copy it with spread; add the aliases on an object that has the namespace as its prototype. When the locked version changes, compare its root exports and enum members with the previous version and update the aliases.
+
+### Newer SteamUI (Vite / Rolldown) compatibility
+
+Steam Deck `publicbeta` builds starting at `1795048523` (`CLSTAMP` `11255874`) replaced Webpack with Vite + Rolldown ES modules, removing `window.webpackChunksteamui` and tree-shaking ~85% of CSS class-name objects out of JavaScript.
+
+- **Detection and Stable isolation (`backend-rust/src/cef.rs`):** `SharedJSContext` is treated as Vite only when `script[type="module"][src*="library.js"]` is present. SteamOS Stable uses classic `<script defer src="/library.js">`, so Stable skips the Vite shim, import map, `/steamui/` route, and page reload completely.
+- **ESM import map and `/steamui/{*path}` proxy (`backend-rust/src/vite_esm.rs`, `backend-rust/src/transport.rs`):** SteamOS CEF serves `https://steamloopback.host/*` through a custom in-process resource handler that bypasses CDP `Fetch.enable`. On Vite pages, `cef.rs` installs a pre-document shim (`Page.addScriptToEvaluateOnNewDocument`) that injects a `<script type="importmap">` mapping `https://steamloopback.host/` to `http://localhost:1337/steamui/` while pinning `http://localhost:1337/steamui/library.js?...` back to `https://steamloopback.host/library.js?...` so `library.js` and its React Contexts are never instantiated twice. `cef.rs` then reloads `SharedJSContext` once if `window.__DECKY_ESM__` is empty.
+- **Module registration and caching:** `transport.rs` serves `.js` files from Steam's local `steamui/` directory with an appended live getter/setter footer for every top-level mutable `var`/`let`/`function` declaration (computed in parallel with `spawn_blocking` and cached by `(path, size, mtime)`). Non-JS requests (CSS, `/custom_fonts/clientui.uifont`, images) return `302 Found` to `https://steamloopback.host/{path}`. The shim exposes `globalThis.__DECKY_ESM__` through a `window.webpackChunksteamui` compatibility proxy (skipping React `$$typeof` objects so `forwardRef`/`memo` components are not duplicated as module namespaces) and normalizes simple Oxc template literals and `let{` destructuring in `Function.prototype.toString`.
+- **Frontend Webpack-first fallbacks (`frontend/rollup.config.js`, `frontend/src/errorboundary-hook.tsx`, `frontend/src/components/modals/DropdownMultiselect.tsx`):** `@decky/ui` finders whose Webpack CSS class modules were inlined away (`IconsModule`, `PanelSection`, `PanelSectionRow`, `Field`, `ControlsList`, `DialogHeader`, `Marquee`, `SimpleModal`, `ProgressBar`, `ProgressBarWithInfo`, `Spinner`, `Tabs`) try their original Webpack finder first and fall back to structural/function-signature finders only when the Webpack lookup misses. `staticClasses` and `gamepadDialogClasses` fall back to `{}`, and `errorboundary-hook.tsx` accepts Oxc's `||=` assignment form.
+- **For plugin authors:** Avoid unguarded `Object.values(findModule(...))` calls against Steam CSS class modules, which may return `undefined` on Vite builds. Guard optional class maps with `?? {}` and prefer semantic/component finders over CSS class-name keys.

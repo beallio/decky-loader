@@ -61,6 +61,9 @@ SDK_OVERLAYS = (
     'frontend/src/components/settings/pages/developer/index.tsx',
     'frontend/src/components/settings/pages/testing/index.tsx',
     'frontend/src/index.ts',
+    'frontend/rollup.config.js',
+    'frontend/src/errorboundary-hook.tsx',
+    'frontend/src/components/modals/DropdownMultiselect.tsx',
 )
 SDK_REMOVALS = (
     'frontend/src/steamfixes/README.md',
