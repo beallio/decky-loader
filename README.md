@@ -1,6 +1,6 @@
 # Decky Loader (Rust fork)
 
-Decky Loader adds plugins to the Steam Deck's Gaming Mode. Plugins can [restyle menus](https://github.com/suchmememanyskill/SDH-CssLoader), [change system sounds](https://github.com/EMERALD0874/SDH-AudioLoader), [adjust colors](https://github.com/libvibrant/vibrantDeck), and [do much more](https://plugins.deckbrew.xyz/).
+Decky Loader adds plugins to the Steam Deck's Gaming Mode. Plugins can [restyle menus](https://github.com/suchmememanyskill/SDH-CssLoader), [change system sounds](https://github.com/EMERALD0874/SDH-AudioLoader), [adjust colors](https://github.com/libvibrant/vibrantDeck), and more.
 
 This is a modified copy (a "fork") of Decky Loader. It looks and works like the normal Decky, and your current plugins still work. The difference is the part that runs in the background: this fork replaces it with a smaller, faster program written in the Rust programming language. It also runs with your normal `deck` account, not with the administrator (root) account.
 
@@ -11,6 +11,7 @@ This is not the official Decky Loader. For the official version, go to [SteamDec
 These features are not in the official Decky Loader:
 
 - **Faster and lighter.** Decky starts and stops faster and uses less memory and CPU. See [Speed and memory](#speed-and-memory).
+- **Works with newer Steam Beta updates.** Newer Steam Client Beta updates changed how Gaming Mode is built, which stops the official Decky Loader from starting. This fork adapts automatically so Decky and most plugins keep working on both Steam Stable and Steam Beta, with no extra steps.
 - **No administrator access by default.** Decky and your plugins run with your normal `deck` account, not as administrator. Plugins can still read and change your account's files, so install only plugins that you trust.
 - **Safer administrator plugins.** Plugins that need administrator access run only if you turn them on. Before each install or update of such a plugin, Decky shows a warning and asks for your password. See [Plugins that need administrator access](#plugins-that-need-administrator-access).
 - **More than one plugin store.** The store page shows plugins from several stores at the same time, in the order that you choose. The [Decky Extended](https://decky-extended-plugins.beallio.com/) store is included by default.
@@ -191,6 +192,7 @@ The `resources` part of the output shows how much CPU and memory Decky and each 
 - **Decky does not show.** Restart the Deck. If Decky still does not show, download the newest [install-to-deck.sh](scripts/install-to-deck.sh), install again, and restart the Deck. Scripts from before `v3.3.1-rust.1-rc.5` did not turn on Steam remote debugging, which Decky needs on a Deck that never had Decky.
 - **A plugin shows "This plugin needs root".** See [Plugins that need administrator access](#plugins-that-need-administrator-access).
 - **A plugin shows "Decky could not start".** The plugin did not start. Update or remove it in Decky's settings.
+- **A plugin shows an error after switching to Steam Beta.** Newer Steam Beta updates changed parts of Gaming Mode's styling that a few older plugins expect. Decky keeps running so your other plugins still work; update that plugin when its author releases a fix, or switch back to Steam Stable if you need it right away.
 - **An update in Decky stops or fails, and your version is `v3.2.10-rust.8-rc.1` to `rc.10`.** These versions cannot update themselves to `v3.3.0` or later. Run the install command one time with `--channel preview`. After that, updates in Decky work again.
 - **An update in Decky fails with "bundle requires a frozen CPython 3.11 worker".** Versions up to `v3.3.0-rust.1-rc.12` cannot update themselves to a version that uses Python 3.14. Run the install command one time with `--channel preview`. After that, updates in Decky work again.
 - **A plugin stopped working after an update to a version with Python 3.14.** This fork now uses Python 3.14.8, the same as the official Decky `v3.3.0`. A few plugins include files made only for Python 3.11. Ask the plugin's author for a version that works with the official Decky `v3.3.0`.
@@ -219,6 +221,8 @@ text = native.dumps({"name": "Deck", "values": [1, 2, 3]})
 For normal JSON data, `native.dumps` gives the same text as Python's `json.dumps` with its default settings. The only option it accepts is `ensure_ascii=False`. It is available only in this fork. If your plugin also supports the official Decky, check for it with `hasattr(decky, "native")`.
 
 A plugin can also have a backend written in Rust (or another compiled language) instead of `main.py`. This plugin does not need Python. It works only in this fork. See [Native plugin backends](docs/development.md#native-plugin-backends).
+
+On newer Steam Client Beta builds, Decky automatically bridges plugins to Steam's updated interface, though some internal Steam style names are no longer present in JavaScript. If your plugin reads Steam style maps directly, check that they exist before reading from them. See the [development guide](docs/development.md#newer-steamui-vite--rolldown-compatibility) for details.
 
 To build or change this fork, see the [development guide](docs/development.md).
 

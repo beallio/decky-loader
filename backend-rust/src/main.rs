@@ -12,6 +12,7 @@ mod test_support;
 mod transport;
 mod updater;
 mod utilities;
+mod vite_esm;
 mod workers;
 
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};

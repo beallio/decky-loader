@@ -16,8 +16,8 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{
-        HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, USER_AGENT},
+        HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri,
+        header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION, ORIGIN, USER_AGENT},
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -33,7 +33,10 @@ use tokio::{
     sync::{Mutex, broadcast, mpsc, oneshot},
 };
 
-use crate::backend::{Backend, RpcError};
+use crate::{
+    backend::{Backend, RpcError},
+    vite_esm,
+};
 
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(20);
@@ -71,6 +74,8 @@ fn prune_pending_calls(pending: &mut PendingCalls, live_ids: &HashSet<i64>) {
     pending.retain(|call_id, _| live_ids.contains(call_id));
 }
 
+type SteamUiFooterCache = HashMap<(PathBuf, u64, u128), Arc<String>>;
+
 #[derive(Clone)]
 struct AppState {
     token: Arc<str>,
@@ -84,6 +89,7 @@ struct AppState {
     next_connection_id: Arc<AtomicU64>,
     http_client: Client,
     catalog_client: Client,
+    steamui_cache: Arc<Mutex<SteamUiFooterCache>>,
 }
 
 #[derive(Default)]
@@ -137,6 +143,7 @@ pub async fn serve(
         next_connection_id: Arc::new(AtomicU64::new(1)),
         http_client,
         catalog_client: catalog_client(CATALOG_TIMEOUT)?,
+        steamui_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let mut event_receiver = events.subscribe();
@@ -177,6 +184,7 @@ pub async fn serve(
         .route("/auth/token", get(auth_token))
         .route("/ws", get(websocket))
         .route("/frontend/{*path}", get(frontend_asset))
+        .route("/steamui/{*path}", get(steamui_asset))
         .route("/static/{*path}", get(static_asset))
         .route("/locales/{*path}", get(locale_asset))
         .route(
@@ -384,6 +392,7 @@ async fn csrf_middleware(
         || path.starts_with("/static/")
         || path.starts_with("/steam_resource/")
         || path.starts_with("/frontend/")
+        || path.starts_with("/steamui/")
         || path == "/fetch"
         || path == "/ws"
         || is_plugin_public_path(path);
@@ -672,6 +681,102 @@ async fn frontend_asset(
     AxumPath(path): AxumPath<String>,
 ) -> Response {
     serve_file(&state.assets, &path, Some("no-cache"), None).await
+}
+
+fn resolve_steamui_root(user_home: &str) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(steam_dir) = std::env::var("STEAM_DIR") {
+        candidates.push(PathBuf::from(steam_dir).join("steamui"));
+    }
+    let home = PathBuf::from(user_home);
+    candidates.push(home.join(".local/share/Steam/steamui"));
+    candidates.push(home.join(".steam/root/steamui"));
+    candidates.push(home.join(".steam/steam/steamui"));
+    candidates.push(home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam/steamui"));
+    candidates
+        .into_iter()
+        .find(|dir| dir.join("library.js").is_file() || dir.join("index.html").is_file())
+}
+
+async fn steamui_asset(
+    State(state): State<AppState>,
+    AxumPath(path): AxumPath<String>,
+    uri: Uri,
+) -> Response {
+    if !is_safe_relative_path(&path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !path.ends_with(".js") {
+        let location = match uri.query() {
+            Some(query) if !query.is_empty() => {
+                format!("https://steamloopback.host/{path}?{query}")
+            }
+            _ => format!("https://steamloopback.host/{path}"),
+        };
+        let Ok(value) = HeaderValue::from_str(&location) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        let mut response = StatusCode::FOUND.into_response();
+        response.headers_mut().insert(LOCATION, value);
+        return response;
+    }
+
+    let Some(root) = resolve_steamui_root(&state.backend.user_home) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(file) = resolve_file(&root, &path).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(metadata) = tokio::fs::metadata(&file).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mtime_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let cache_key = (file.clone(), metadata.len(), mtime_nanos);
+
+    let Ok(bytes) = tokio::fs::read(&file).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let cached_footer = { state.steamui_cache.lock().await.get(&cache_key).cloned() };
+    let footer = if let Some(footer) = cached_footer {
+        footer
+    } else {
+        let chunk_id = path.rsplit('/').next().unwrap_or(&path).to_owned();
+        let source = String::from_utf8_lossy(&bytes).into_owned();
+        let computed = tokio::task::spawn_blocking(move || {
+            vite_esm::compute_registration_footer(&chunk_id, &source)
+        })
+        .await
+        .unwrap_or_default();
+        let arc = Arc::new(computed);
+        state
+            .steamui_cache
+            .lock()
+            .await
+            .insert(cache_key, arc.clone());
+        arc
+    };
+
+    let mut body = Vec::with_capacity(bytes.len() + footer.len());
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(footer.as_bytes());
+    let len = body.len();
+    let mut response = Response::new(Body::from(body));
+    if let Ok(val) = HeaderValue::from_str(&len.to_string()) {
+        response.headers_mut().insert(CONTENT_LENGTH, val);
+    }
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/javascript; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
 }
 
 async fn static_asset(State(state): State<AppState>, AxumPath(path): AxumPath<String>) -> Response {
@@ -1431,6 +1536,7 @@ mod tests {
             next_connection_id: Arc::new(AtomicU64::new(2)),
             http_client: Client::new(),
             catalog_client: catalog_client(CATALOG_TIMEOUT).unwrap(),
+            steamui_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         handle_client_message(
@@ -1504,5 +1610,80 @@ mod tests {
         assert!(!is_safe_relative_path("assets/../../outside"));
         assert!(!is_safe_relative_path("/etc/passwd"));
         assert!(!is_safe_relative_path("assets\\..\\outside"));
+    }
+
+    #[tokio::test]
+    async fn steamui_asset_instruments_js_and_redirects_non_js() {
+        let directory = TestDirectory::new("decky-steamui-test");
+        let steamui_dir = directory.0.join(".local/share/Steam/steamui");
+        tokio::fs::create_dir_all(&steamui_dir).await.unwrap();
+        tokio::fs::write(steamui_dir.join("library.js"), "import './chunk.js';")
+            .await
+            .unwrap();
+        tokio::fs::write(steamui_dir.join("chunk.js"), "var p4=1;function Q2(){}")
+            .await
+            .unwrap();
+
+        let (registry, mut backend) = test_backend(&directory).await;
+        // Override user_home to point to our temp directory
+        let mut backend_owned =
+            Arc::try_unwrap(backend).unwrap_or_else(|_| panic!("unique backend"));
+        backend_owned.user_home = directory.0.to_string_lossy().into_owned();
+        backend = Arc::new(backend_owned);
+
+        let state = AppState {
+            token: Arc::from("test-token"),
+            assets: Arc::new(directory.0.clone()),
+            locales: Arc::new(directory.0.clone()),
+            backend,
+            user_agent: HeaderValue::from_static("Decky/dev"),
+            pending: Arc::new(Mutex::new(PendingCalls::new())),
+            sockets: Arc::new(Mutex::new(SocketRegistry::default())),
+            socket_lifecycle: Arc::new(Mutex::new(())),
+            next_connection_id: Arc::new(AtomicU64::new(1)),
+            http_client: Client::new(),
+            catalog_client: catalog_client(CATALOG_TIMEOUT).unwrap(),
+            steamui_cache: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        // 1. JS chunk gets instrumented with registration footer
+        let resp = steamui_asset(
+            State(state.clone()),
+            AxumPath("chunk.js".to_owned()),
+            Uri::from_static("/steamui/chunk.js?contenthash=abc"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("__DECKY_ESM_REG__"));
+        assert!(text.contains("get p4(){return p4}"));
+        assert!(text.contains("get Q2(){return Q2}"));
+
+        // 2. Non-JS asset redirects back to steamloopback.host preserving query
+        let css_resp = steamui_asset(
+            State(state.clone()),
+            AxumPath("css/chunk.css".to_owned()),
+            Uri::from_static("/steamui/css/chunk.css?contenthash=xyz"),
+        )
+        .await;
+        assert_eq!(css_resp.status(), StatusCode::FOUND);
+        assert_eq!(
+            css_resp.headers().get(LOCATION).unwrap(),
+            "https://steamloopback.host/css/chunk.css?contenthash=xyz"
+        );
+
+        // 3. Traversal is rejected
+        let bad_resp = steamui_asset(
+            State(state),
+            AxumPath("../secret.js".to_owned()),
+            Uri::from_static("/steamui/../secret.js"),
+        )
+        .await;
+        assert_eq!(bad_resp.status(), StatusCode::NOT_FOUND);
+
+        registry.shutdown().await;
     }
 }

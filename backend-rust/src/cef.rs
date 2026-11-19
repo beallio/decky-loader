@@ -12,7 +12,10 @@ use tokio::{
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
-use crate::backend::{Backend, RpcError};
+use crate::{
+    backend::{Backend, RpcError},
+    vite_esm,
+};
 
 const SHARED_CONTEXT_NAMES: &[&str] = &[
     "SharedJSContext",
@@ -446,17 +449,40 @@ async fn inject_and_listen(
         "fallback.js"
     };
     let code = injection_script(script, backend.loader_version());
-    let result = session
-        .request(
-            "Runtime.evaluate",
-            json!({"expression":code,"userGesture":true,"awaitPromise":false}),
-        )
-        .await?;
-    if let Some(error) = result.get("exceptionDetails") {
-        return Err(RpcError::failure(error.to_string()));
+    let vite_library_src = vite_library_src(session).await?;
+    let is_vite = vite_library_src.is_some();
+    let mut needs_inject_after_reload = false;
+    if let Some(lib_src) = vite_library_src {
+        let shim = vite_esm::build_esm_shim(&lib_src);
+        session
+            .request(
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({"source": shim}),
+            )
+            .await?;
+        if !has_esm_registry(session).await? {
+            eprintln!(
+                "Vite/Rolldown SteamUI detected ({lib_src}); enabling ESM importmap hook and reloading SharedJSContext"
+            );
+            session
+                .request("Page.reload", json!({"ignoreCache": true}))
+                .await?;
+            needs_inject_after_reload = true;
+        }
     }
-    if crash_count > 2 {
-        return Ok(InjectionExit::Fallback);
+    if !needs_inject_after_reload {
+        let result = session
+            .request(
+                "Runtime.evaluate",
+                json!({"expression":code,"userGesture":true,"awaitPromise":false}),
+            )
+            .await?;
+        if let Some(error) = result.get("exceptionDetails") {
+            return Err(RpcError::failure(error.to_string()));
+        }
+        if crash_count > 2 {
+            return Ok(InjectionExit::Fallback);
+        }
     }
     loop {
         let event = tokio::select! {
@@ -468,6 +494,10 @@ async fn inject_and_listen(
                 return Err(RpcError::failure("CEF requested debugger detachment"));
             }
             Some("Page.domContentEventFired") if !has_loader(session).await? => {
+                if is_vite {
+                    let count = esm_registry_size(session).await.unwrap_or(0);
+                    eprintln!("Vite ESM hook ready on DOMContentLoaded: {count} registry entries");
+                }
                 let result = session
                     .request(
                         "Runtime.evaluate",
@@ -477,10 +507,45 @@ async fn inject_and_listen(
                 if let Some(error) = result.get("exceptionDetails") {
                     return Err(RpcError::failure(error.to_string()));
                 }
+                if crash_count > 2 {
+                    return Ok(InjectionExit::Fallback);
+                }
             }
             _ => {}
         }
     }
+}
+
+async fn vite_library_src(session: &mut Session) -> Result<Option<String>, RpcError> {
+    let result = session
+        .request(
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.querySelector('script[type=\"module\"][src*=\"library.js\"]')?.getAttribute('src') || null",
+                "userGesture": true,
+                "awaitPromise": false
+            }),
+        )
+        .await?;
+    Ok(result["result"]["value"].as_str().map(str::to_owned))
+}
+
+async fn has_esm_registry(session: &mut Session) -> Result<bool, RpcError> {
+    Ok(esm_registry_size(session).await? > 0)
+}
+
+async fn esm_registry_size(session: &mut Session) -> Result<u64, RpcError> {
+    let result = session
+        .request(
+            "Runtime.evaluate",
+            json!({
+                "expression": "(window.__DECKY_ESM__ && window.__DECKY_ESM__.size) || 0",
+                "userGesture": true,
+                "awaitPromise": false
+            }),
+        )
+        .await?;
+    Ok(result["result"]["value"].as_u64().unwrap_or(0))
 }
 
 async fn has_loader(session: &mut Session) -> Result<bool, RpcError> {
