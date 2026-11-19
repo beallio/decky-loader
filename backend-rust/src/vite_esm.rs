@@ -53,7 +53,7 @@ const VITE_ESM_SHIM_TEMPLATE: &str = r#"(() => {
     for (const k of Object.keys(box)) {
       let v;
       try { v = box[k]; } catch { continue; }
-      if (!v || typeof v !== "object" || Array.isArray(v) || v === window || v === document) continue;
+      if (!v || typeof v !== "object" || Array.isArray(v) || v === window || v === document || v.$$typeof) continue;
       if (typeof Node === "function" && v instanceof Node) continue;
       if (typeof EventTarget === "function" && v instanceof EventTarget) continue;
       if (seenObjs.has(v)) continue;
