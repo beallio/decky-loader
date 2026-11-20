@@ -1074,7 +1074,11 @@ target_action() {
     legacy_record="$legacy_root/status.json"
     legacy_helper="$legacy_root/helper/install.py"
     sudo_args=(sudo -n)
-    if [[ $non_interactive != true && -t 0 && -t 1 ]]; then sudo_args=(sudo); fi
+    if [[ $non_interactive != true && -t 0 && -t 1 ]]; then
+        sudo_args=(sudo)
+    elif [[ -n ${SUDO_ASKPASS:-} ]]; then
+        sudo_args=(sudo -A)
+    fi
     stage_owned=0
     partial_archive=''
     kit_partial=''
