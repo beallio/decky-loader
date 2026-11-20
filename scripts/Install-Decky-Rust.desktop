@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Install Decky (Rust)
+Comment=Install, update, or manage Decky Loader (Rust fork)
+Icon=system-software-install
+Type=Application
+Categories=Utility;
+Terminal=false
+StartupNotify=true
+Exec=bash -c "t=\\$(mktemp -d); trap 'rm -rf -- \\"\\$t\\"' EXIT; if curl -fsSL https://raw.githubusercontent.com/beallio/decky-loader/main/scripts/install-gui.sh -o \\"\\$t/install-gui.sh\\"; then bash \\"\\$t/install-gui.sh\\"; else kdialog --error 'Could not download the Decky Loader (Rust) installer. Check your internet connection and try again.' 2>/dev/null || zenity --error --no-markup --text='Could not download the Decky Loader (Rust) installer. Check your internet connection and try again.' 2>/dev/null; fi"
