@@ -30,8 +30,8 @@ function viteCompatDeckyUi() {
       if (norm.endsWith('/@decky/ui/dist/components/Panel.js')) {
         return `import { findModuleDetailsByExport, findModuleExport } from '../webpack';
 const [mod, panelSection] = findModuleDetailsByExport((e) => e.toString?.()?.includes('.PanelSection'));
-export const PanelSection = panelSection || findModuleExport((e) => typeof e === 'function' && /const\\{title:/.test(e.toString()) && e.toString().includes('e.spinner&&'));
-export const PanelSectionRow = (mod && Object.values(mod).filter((exp) => !exp?.toString?.()?.includes('.PanelSection'))[0]) || (({ children, ...rest }) => window.SP_REACT.createElement('div', rest, children));`;
+export const PanelSection = panelSection || findModuleExport((e) => typeof e === 'function' && /const\\{title:\\w+,children:\\w+\\}=/.test(e.toString()) && e.toString().includes('.spinner'));
+export const PanelSectionRow = (mod && Object.values(mod).filter((exp) => !exp?.toString?.()?.includes('.PanelSection'))[0]) || (({ children, style, ...rest }) => window.SP_REACT.createElement('div', { ...rest, style: { padding: '4px 0', ...style } }, children));`;
       }
       if (norm.endsWith('/@decky/ui/dist/components/Field.js')) {
         return (
@@ -45,7 +45,7 @@ export const PanelSectionRow = (mod && Object.values(mod).filter((exp) => !exp?.
       if (norm.endsWith('/@decky/ui/dist/components/ControlsList.js')) {
         return code.replace(
           "e.toString?.().includes('().ControlsListOuterPanel'));",
-          "e.toString?.().includes('().ControlsListOuterPanel')) || findModuleExport((e) => typeof e === 'function' && e.toString().includes('itemMaxSize') && e.toString().includes('e.alignItems') && e.toString().includes('\"gamepad\"'));",
+          "e.toString?.().includes('().ControlsListOuterPanel')) || findModuleExport((e) => typeof e === 'function' && e.toString().includes('itemMaxSize') && e.toString().includes('.alignItems') && e.toString().includes('\"gamepad\"'));",
         );
       }
       if (norm.endsWith('/@decky/ui/dist/components/Dialog.js')) {
@@ -88,14 +88,35 @@ export const PanelSectionRow = (mod && Object.values(mod).filter((exp) => !exp?.
       if (norm.endsWith('/@decky/ui/dist/components/Tabs.js')) {
         return code.replace(
           'export const Tabs = tabsModule && Object.values(tabsModule).find((e) => e?.type?.toString?.()?.includes("(function()"));',
-          'export const Tabs = (tabsModule && Object.values(tabsModule).find((e) => e?.type?.toString?.()?.includes("(function()"))) || findModuleExport((e) => typeof e === "function" && e.toString().includes(\'role:"tablist"\') && e.toString().includes(\'"aria-orientation":"horizontal"\'));',
+          'export const Tabs = (tabsModule && Object.values(tabsModule).find((e) => e?.type?.toString?.()?.includes("(function()"))) || findModuleExport((e) => typeof e === "function" && e.toString().includes("canBeHeaderBackground:") && e.toString().includes("cancelSkipTabHeader:"));',
         ).replace(
           "import { findModuleByExport } from '../webpack';",
           "import { findModuleByExport, findModuleExport } from '../webpack';",
         );
       }
       if (norm.endsWith('/@decky/ui/dist/utils/static-classes.js')) {
-        return code.replace(/findClassModule\(([^;\n]+)\);/g, '(findClassModule($1) || {});');
+        const guarded = code.replace(/findClassModule\(([^;\n]+)\);/g, '(findClassModule($1) || {});');
+        return (
+          `import { findModuleExport as __deckyFindExport } from '../webpack';\n` +
+          guarded +
+          `\nif (!quickAccessMenuClasses.Title) {
+  try {
+    const _titleComp = __deckyFindExport((v) => typeof v === 'function' && v.toString().includes('children:') && /\\.locId\\)\\}/.test(v.toString()) && v.toString().length < 250);
+    const _cls = _titleComp?.({ locId: '#QuickAccess_Tab_Settings_Title' })?.props?.className;
+    if (typeof _cls === 'string' && _cls) quickAccessMenuClasses.Title = _cls;
+  } catch {}
+}
+if (!quickAccessControlsClasses.PanelSection) {
+  try {
+    const _sec = __deckyFindExport((v) => typeof v === 'function' && /const\\{title:\\w+,children:\\w+\\}=/.test(v.toString()) && v.toString().includes('.spinner'));
+    const _tree = _sec?.({ title: 'Decky' });
+    const _ps = _tree?.props?.className;
+    const _pst = _tree?.props?.children?.[0]?.props?.className;
+    if (typeof _ps === 'string' && _ps) quickAccessControlsClasses.PanelSection = _ps;
+    if (typeof _pst === 'string' && _pst) quickAccessControlsClasses.PanelSectionTitle = _pst;
+  } catch {}
+}\n`
+        );
       }
       return null;
     },
