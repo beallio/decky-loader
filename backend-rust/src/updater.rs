@@ -565,11 +565,24 @@ fn rust_testing_artifact(artifacts: &[Value]) -> Option<&Value> {
     })
 }
 
+fn release_timestamp(release: &Value) -> Option<&str> {
+    release
+        .get("published_at")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            release
+                .get("created_at")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+}
+
 fn filter_releases(releases: Vec<Value>, branch: i64) -> Result<Vec<Value>, RpcError> {
     if branch != 0 && branch != 1 {
         return Err(RpcError::invalid("no valid release branch found"));
     }
-    Ok(releases
+    let mut filtered: Vec<Value> = releases
         .into_iter()
         .filter(|release| {
             let Some(tag) = release.get("tag_name").and_then(Value::as_str) else {
@@ -586,7 +599,18 @@ fn filter_releases(releases: Vec<Value>, branch: i64) -> Result<Vec<Value>, RpcE
                     && !tag.contains("-pre")
                     && !tag.contains("-rc"))
         })
-        .collect())
+        .collect();
+    if filtered
+        .iter()
+        .any(|release| release_timestamp(release).is_some())
+    {
+        filtered.sort_by(|left, right| {
+            release_timestamp(right)
+                .unwrap_or_default()
+                .cmp(release_timestamp(left).unwrap_or_default())
+        });
+    }
+    Ok(filtered)
 }
 
 fn github_url(backend: &Backend, endpoint: &str) -> Result<Url, RpcError> {
@@ -1185,6 +1209,47 @@ mod tests {
                 "v3.2.11-pre1",
                 "v3.2.11-rust.2-rc.1",
                 "v3.2.9"
+            ]
+        );
+    }
+
+    #[test]
+    fn release_discovery_orders_same_day_rc10_ahead_of_rc9_when_github_sorts_tags_lexicographically()
+     {
+        let releases = vec![
+            json!({
+                "tag_name": "v3.3.1-rust.1-rc.9",
+                "prerelease": true,
+                "created_at": "2026-11-20T02:41:57Z",
+                "published_at": "2026-11-20T02:46:59Z",
+                "assets": [rust_asset()]
+            }),
+            json!({
+                "tag_name": "v3.3.1-rust.1-rc.10",
+                "prerelease": true,
+                "created_at": "2026-11-20T06:59:05Z",
+                "published_at": "2026-11-20T07:04:17Z",
+                "assets": [rust_asset()]
+            }),
+            json!({
+                "tag_name": "v3.3.1-rust.1-rc.8",
+                "prerelease": true,
+                "created_at": "2026-11-19T13:45:27Z",
+                "published_at": "2026-11-19T13:51:40Z",
+                "assets": [rust_asset()]
+            }),
+        ];
+
+        let prerelease = filter_releases(releases, 1).expect("prerelease branch is valid");
+        assert_eq!(
+            prerelease
+                .iter()
+                .map(|release| release["tag_name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "v3.3.1-rust.1-rc.10",
+                "v3.3.1-rust.1-rc.9",
+                "v3.3.1-rust.1-rc.8"
             ]
         );
     }
