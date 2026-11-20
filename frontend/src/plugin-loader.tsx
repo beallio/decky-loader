@@ -91,6 +91,7 @@ class PluginLoader extends Logger {
 
   private loaderUpdateToast?: ToastNotification;
   private pluginUpdateToast?: ToastNotification;
+  private pendingDirectInstall?: (requestId: string) => void;
 
   constructor() {
     super(PluginLoader.name);
@@ -314,6 +315,16 @@ class PluginLoader extends Logger {
     }
   }
 
+  public consumeNextInstallPrompt(): Promise<string> {
+    return new Promise<string>((resolve) => {
+      this.pendingDirectInstall = resolve;
+    });
+  }
+
+  public clearPendingDirectInstall() {
+    this.pendingDirectInstall = undefined;
+  }
+
   public addPluginInstallPrompt(
     artifact: string,
     version: string,
@@ -321,6 +332,12 @@ class PluginLoader extends Logger {
     hash: string,
     install_type: number,
   ) {
+    if (this.pendingDirectInstall) {
+      const resolve = this.pendingDirectInstall;
+      this.pendingDirectInstall = undefined;
+      resolve(request_id);
+      return;
+    }
     showModal(
       <PluginInstallModal
         artifact={artifact}

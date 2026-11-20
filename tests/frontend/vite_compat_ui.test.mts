@@ -220,3 +220,21 @@ test('frontend UI hygiene invariants hold (no Webpack numeric IDs, WarnThirdPart
     'Updater.tsx must guard gamepadDialogClasses.FieldLeftColumn instead of injecting .undefined on Vite',
   );
 });
+
+test('Install Plugin from URL uses a modal triggered by Enter URL and only closes on successful install', () => {
+  const locales = JSON.parse(readFileSync(join(REPO, 'backend/decky_loader/locales/en-US.json'), 'utf8'));
+  assert.equal(locales.SettingsDeveloperIndex?.third_party_plugins?.button_url, 'Enter URL');
+
+  const developerPage = readFileSync(
+    join(FRONTEND_SRC, 'components/settings/pages/developer/index.tsx'),
+    'utf8',
+  );
+  assert.match(developerPage, /SettingsDeveloperIndex\.third_party_plugins\.button_url/);
+  assert.match(developerPage, /showModal\s*\(\s*<\w+/);
+  assert.match(developerPage, /bCloseAfterOK:\s*false/);
+  assert.match(developerPage, /await\s+installFromURL\(/);
+
+  const storeSrc = readFileSync(join(FRONTEND_SRC, 'store.tsx'), 'utf8');
+  assert.match(storeSrc, /consumeNextInstallPrompt/);
+  assert.match(storeSrc, /utilities\/confirm_plugin_install/);
+});
