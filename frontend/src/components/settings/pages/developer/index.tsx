@@ -6,8 +6,7 @@ import {
   Field,
   Navigation,
   TextField,
-  Toggle,
-  showModal,
+  ToggleField,
 } from '@decky/ui';
 import { useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -15,11 +14,10 @@ import { FaFileArchive, FaLink, FaReact, FaSteamSymbol, FaTerminal } from 'react
 
 import { setShouldConnectToReactDevTools, setShowValveInternal } from '../../../../developer';
 import { installFromURL } from '../../../../store';
-import { WarnThirdPartyType } from '../../../../utils/globalTypes';
 import { useSetting } from '../../../../utils/hooks/useSetting';
 import { getSetting } from '../../../../utils/settings';
+import { UI_COLORS } from '../../../../utils/uiStyles';
 import { FileSelectionType } from '../../../modals/filepicker';
-import WarnThirdParty from '../../../modals/WarnThirdParty';
 import RemoteDebuggingSettings from '../general/RemoteDebugging';
 
 const getTabID = DeckyBackend.callable<[name: string], string>('utilities/get_tab_id');
@@ -28,8 +26,6 @@ export default function DeveloperSettings() {
   const [enableValveInternal, setEnableValveInternal] = useSetting<boolean>('developer.valve_internal', false);
   const [reactDevtoolsEnabled, setReactDevtoolsEnabled] = useSetting<boolean>('developer.rdt.enabled', false);
   const [reactDevtoolsIP, setReactDevtoolsIP] = useSetting<string>('developer.rdt.ip', '');
-  const [acceptedWarning, setAcceptedWarning] = useSetting<boolean>('developer.warn.third_party', false);
-  const waitTime = acceptedWarning ? 0 : 5;
   const [pluginURL, setPluginURL] = useState('');
   const textRef = useRef<HTMLDivElement>(null);
   const { t } = useTranslation();
@@ -67,21 +63,7 @@ export default function DeveloperSettings() {
           label={t('SettingsDeveloperIndex.third_party_plugins.label_zip')}
           icon={<FaFileArchive style={{ display: 'block' }} />}
         >
-          <DialogButton
-            onClick={() => {
-              showModal(
-                <WarnThirdParty
-                  type={WarnThirdPartyType.ZIP}
-                  onOK={() => {
-                    setAcceptedWarning(true);
-                    installFromZip();
-                  }}
-                  onCancel={() => {}}
-                  seconds={waitTime}
-                />,
-              );
-            }}
-          >
+          <DialogButton onClick={installFromZip}>
             {t('SettingsDeveloperIndex.third_party_plugins.button_zip')}
           </DialogButton>
         </Field>
@@ -98,23 +80,13 @@ export default function DeveloperSettings() {
         >
           <DialogButton
             disabled={pluginURL.length == 0}
-            onClick={() =>
-              showModal(
-                <WarnThirdParty
-                  type={WarnThirdPartyType.ZIP}
-                  onOK={() => {
-                    setAcceptedWarning(true);
-                    if (/^https?:\/\//.test(pluginURL)) {
-                      installFromURL(pluginURL);
-                    } else {
-                      installFromURL('https://' + pluginURL);
-                    }
-                  }}
-                  onCancel={() => {}}
-                  seconds={waitTime}
-                />,
-              )
-            }
+            onClick={() => {
+              if (/^https?:\/\//.test(pluginURL)) {
+                installFromURL(pluginURL);
+              } else {
+                installFromURL('https://' + pluginURL);
+              }
+            }}
           >
             {t('SettingsDeveloperIndex.third_party_plugins.button_install')}
           </DialogButton>
@@ -144,25 +116,22 @@ export default function DeveloperSettings() {
           </DialogButton>
         </Field>
         <RemoteDebuggingSettings />
-        <Field
+        <ToggleField
           label={t('SettingsDeveloperIndex.valve_internal.label')}
           description={
             <span style={{ whiteSpace: 'pre-line' }}>
               {t('SettingsDeveloperIndex.valve_internal.desc1')}{' '}
-              <span style={{ color: 'red' }}>{t('SettingsDeveloperIndex.valve_internal.desc2')}</span>
+              <span style={{ color: UI_COLORS.danger }}>{t('SettingsDeveloperIndex.valve_internal.desc2')}</span>
             </span>
           }
           icon={<FaSteamSymbol style={{ display: 'block' }} />}
-        >
-          <Toggle
-            value={enableValveInternal}
-            onChange={(toggleValue) => {
-              setEnableValveInternal(toggleValue);
-              setShowValveInternal(toggleValue);
-            }}
-          />
-        </Field>
-        <Field
+          checked={enableValveInternal}
+          onChange={(toggleValue) => {
+            setEnableValveInternal(toggleValue);
+            setShowValveInternal(toggleValue);
+          }}
+        />
+        <ToggleField
           label={t('SettingsDeveloperIndex.react_devtools.label')}
           description={
             <>
@@ -179,16 +148,12 @@ export default function DeveloperSettings() {
             </>
           }
           icon={<FaReact style={{ display: 'block' }} />}
-        >
-          <Toggle
-            value={reactDevtoolsEnabled}
-            // disabled={reactDevtoolsIP == ''}
-            onChange={(toggleValue) => {
-              setReactDevtoolsEnabled(toggleValue);
-              setShouldConnectToReactDevTools(toggleValue);
-            }}
-          />
-        </Field>
+          checked={reactDevtoolsEnabled}
+          onChange={(toggleValue) => {
+            setReactDevtoolsEnabled(toggleValue);
+            setShouldConnectToReactDevTools(toggleValue);
+          }}
+        />
       </DialogControlsSection>
     </DialogBody>
   );

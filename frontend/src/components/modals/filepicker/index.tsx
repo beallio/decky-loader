@@ -2,6 +2,7 @@ import {
   ControlsList,
   DialogBody,
   DialogButton,
+  DialogButtonPrimary,
   DialogControlsSection,
   DialogFooter,
   Dropdown,
@@ -349,33 +350,31 @@ const FilePicker: FunctionComponent<FilePickerProps> = ({
           </Focusable>
         </DialogControlsSection>
       </DialogBody>
-      {!loading && error === FileErrorTypes.None && (
+      {((!loading && error === FileErrorTypes.None) || page * max < listing.total) && (
         <DialogFooter>
-          <DialogButton
-            className="Primary"
-            style={{ marginTop: '10px', alignSelf: 'flex-end' }}
-            onClick={() => {
-              onSubmit({ path, realpath: listing.realpath });
-              closeModal?.();
-            }}
-          >
-            {fileSelType === FileSelectionType.FILE
-              ? t('FilePickerIndex.file.select')
-              : t('FilePickerIndex.folder.select')}
-          </DialogButton>
-        </DialogFooter>
-      )}
-      {page * max < listing.total && (
-        <DialogFooter>
-          <DialogButton
-            className="Primary"
-            style={{ marginTop: '10px', alignSelf: 'flex-end' }}
-            onClick={() => {
-              setPage(page + 1);
-            }}
-          >
-            {t('FilePickerIndex.folder.show_more')}
-          </DialogButton>
+          <Focusable style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '10px' }}>
+            {page * max < listing.total && (
+              <DialogButton
+                onClick={() => {
+                  setPage(page + 1);
+                }}
+              >
+                {t('FilePickerIndex.folder.show_more')}
+              </DialogButton>
+            )}
+            {!loading && error === FileErrorTypes.None && (
+              <DialogButtonPrimary
+                onClick={() => {
+                  onSubmit({ path, realpath: listing.realpath });
+                  closeModal?.();
+                }}
+              >
+                {fileSelType === FileSelectionType.FILE
+                  ? t('FilePickerIndex.file.select')
+                  : t('FilePickerIndex.folder.select')}
+              </DialogButtonPrimary>
+            )}
+          </Focusable>
         </DialogFooter>
       )}
     </>

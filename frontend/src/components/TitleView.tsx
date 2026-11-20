@@ -4,13 +4,17 @@ import { useTranslation } from 'react-i18next';
 import { BsGearFill } from 'react-icons/bs';
 import { FaArrowLeft, FaStore } from 'react-icons/fa';
 
+import { COMPACT_ICON_BUTTON_STYLE } from '../utils/uiStyles';
 import { useDeckyState } from './DeckyState';
 
 const titleStyles: CSSProperties = {
   display: 'flex',
+  alignItems: 'center',
+  gap: '8px',
   paddingRight: '16px',
   position: 'sticky',
   top: '0px',
+  ...(staticClasses.Title ? {} : { paddingLeft: '16px', minHeight: '40px', fontSize: '20px', fontWeight: 700 }),
 };
 
 const TitleView: FC = () => {
@@ -32,18 +36,18 @@ const TitleView: FC = () => {
       <Focusable style={titleStyles} className={staticClasses.Title}>
         <div style={{ marginRight: 'auto', flex: 0.9 }}>Decky</div>
         <DialogButton
-          style={{ height: '28px', width: '40px', minWidth: 0, padding: '10px 12px' }}
+          style={COMPACT_ICON_BUTTON_STYLE}
           onClick={onStoreClick}
           onOKActionDescription={t('TitleView.decky_store_desc')}
         >
-          <FaStore style={{ marginTop: '-4px', display: 'block' }} />
+          <FaStore style={{ display: 'block' }} />
         </DialogButton>
         <DialogButton
-          style={{ height: '28px', width: '40px', minWidth: 0, padding: '10px 12px' }}
+          style={COMPACT_ICON_BUTTON_STYLE}
           onClick={onSettingsClick}
           onOKActionDescription={t('TitleView.settings_desc')}
         >
-          <BsGearFill style={{ marginTop: '-4px', display: 'block' }} />
+          <BsGearFill style={{ display: 'block' }} />
         </DialogButton>
       </Focusable>
     );
@@ -51,11 +55,8 @@ const TitleView: FC = () => {
 
   return (
     <Focusable className={staticClasses.Title} style={titleStyles}>
-      <DialogButton
-        style={{ height: '28px', width: '40px', minWidth: 0, padding: '10px 12px' }}
-        onClick={closeActivePlugin}
-      >
-        <FaArrowLeft style={{ marginTop: '-4px', display: 'block' }} />
+      <DialogButton style={COMPACT_ICON_BUTTON_STYLE} onClick={closeActivePlugin}>
+        <FaArrowLeft style={{ display: 'block' }} />
       </DialogButton>
       {activePlugin?.titleView || <div style={{ flex: 0.9 }}>{activePlugin.name}</div>}
     </Focusable>

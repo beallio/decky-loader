@@ -64,6 +64,18 @@ SDK_OVERLAYS = (
     'frontend/rollup.config.js',
     'frontend/src/errorboundary-hook.tsx',
     'frontend/src/components/modals/DropdownMultiselect.tsx',
+    'frontend/src/components/Markdown.tsx',
+    'frontend/src/components/NotificationBadge.tsx',
+    'frontend/src/components/PluginView.tsx',
+    'frontend/src/components/TitleView.tsx',
+    'frontend/src/components/Toast.tsx',
+    'frontend/src/components/modals/PluginDisableModal.tsx',
+    'frontend/src/components/patchnotes/InlinePatchNotes.tsx',
+    'frontend/src/components/settings/pages/general/NotificationSettings.tsx',
+    'frontend/src/components/settings/pages/general/index.tsx',
+    'frontend/src/components/settings/pages/plugin_list/PluginListLabel.tsx',
+    'frontend/src/utils/TranslationHelper.tsx',
+    'frontend/src/utils/uiStyles.ts',
 )
 SDK_REMOVALS = (
     'frontend/src/steamfixes/README.md',
@@ -72,6 +84,8 @@ SDK_REMOVALS = (
     'frontend/src/steamfixes/socket.ts',
     'backend/decky_loader/localplatform/localplatformmac.py',
     'backend/decky_loader/localplatform/localplatformwin.py',
+    'frontend/src/components/modals/WarnThirdParty.tsx',
+    'frontend/src/utils/globalTypes.ts',
 )
 
 

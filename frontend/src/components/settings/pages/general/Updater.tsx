@@ -54,12 +54,11 @@ function PatchNotesModal({ versionInfo, closeModal }: { versionInfo: VerInfo | n
             <Focusable
               onCancelButton={closeModal}
               style={{
-                marginTop: '40px',
-                height: 'calc( 100% - 40px )',
+                height: 'calc(100% - 70px)',
                 overflowY: 'scroll',
                 display: 'flex',
                 justifyContent: 'center',
-                margin: '30px',
+                margin: '40px 30px 30px',
                 padding: '0 15px',
                 backgroundColor: 'rgba(37, 40, 46, 0.5)',
               }}
@@ -193,11 +192,9 @@ export default function UpdaterSettings() {
         ) : (
           <div id="decky-hide-left">
             <style>
-              {`
-              #decky-hide-left .${gamepadDialogClasses.FieldLeftColumn} {
-                display: none;
-              }
-              `}
+              {gamepadDialogClasses.FieldLeftColumn
+                ? `#decky-hide-left .${gamepadDialogClasses.FieldLeftColumn} { display: none; }`
+                : `#decky-hide-left > div > div > div:first-child:empty { display: none; }`}
             </style>
             <ProgressBarWithInfo
               layout="inline"
@@ -220,7 +217,7 @@ export default function UpdaterSettings() {
           )}
           onClick={showPatchNotes}
         >
-          <Suspense fallback={<Spinner style={{ width: '24', height: '24' }} />}>
+          <Suspense fallback={<Spinner width="24px" height="24px" />}>
             <MarkdownRenderer>{versionInfo?.remote.body}</MarkdownRenderer>
           </Suspense>
         </InlinePatchNotes>

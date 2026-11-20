@@ -1,8 +1,11 @@
 import {
   DialogButton,
+  DialogLabel,
+  DialogSubHeader,
   Dropdown,
   DropdownOption,
   Focusable,
+  Navigation,
   SingleDropdownOption,
   SteamSpinner,
   Tabs,
@@ -28,9 +31,13 @@ import {
   tagGroups,
 } from '../../storeSources';
 import { getSetting, setSetting } from '../../utils/settings';
+import { UI_COLORS } from '../../utils/uiStyles';
 import { useDeckyState } from '../DeckyState';
 import ExternalLink from '../ExternalLink';
 import PluginCard from './PluginCard';
+
+const REPO_URL = 'https://github.com/beallio/decky-loader';
+const REPO_LABEL = 'github.com/beallio/decky-loader';
 
 const logger = new Logger('Store');
 
@@ -64,7 +71,26 @@ const StorePage: FC<{}> = () => {
               title: t('Store.store_tabs.title'),
               content: <BrowseTab setPluginCount={setPluginCount} />,
               id: 'browse',
-              renderTabAddon: () => <span className={TabCount}>{pluginCount}</span>,
+              renderTabAddon: () =>
+                pluginCount !== null ? (
+                  <span
+                    className={TabCount}
+                    style={
+                      TabCount
+                        ? undefined
+                        : {
+                            marginLeft: '6px',
+                            padding: '1px 6px',
+                            borderRadius: '10px',
+                            fontSize: '12px',
+                            background: 'rgba(255, 255, 255, 0.12)',
+                            color: UI_COLORS.textSub,
+                          }
+                    }
+                  >
+                    {pluginCount}
+                  </span>
+                ) : null,
             },
             {
               title: t('Store.store_tabs.about'),
@@ -87,8 +113,10 @@ const ERROR_BANNER = {
   marginRight: '20px',
   marginBottom: '20px',
   padding: '8px 12px',
-  background: 'rgba(255, 0, 0, 0.067)',
-  border: '2px solid rgba(255, 0, 0, 0.467)',
+  color: UI_COLORS.danger,
+  background: UI_COLORS.dangerBg,
+  border: `2px solid ${UI_COLORS.dangerBorder}`,
+  borderRadius: '4px',
 };
 
 const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }> = ({ setPluginCount }) => {
@@ -239,13 +267,15 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
     allLabel: string = t('Store.store_filter.all_plugins'),
   ) => (
     <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-      <span className="DialogLabel">{label}</span>
+      <DialogLabel>{label}</DialogLabel>
       <Dropdown
         menuLabel={label}
         rgOptions={[{ data: '', label: allLabel }, ...options]}
         selectedOption={activeFilters[key]}
         onChange={({ data }) => setFilters({ ...filters, [key]: data })}
-        renderButtonValue={(value) => (activeFilters[key] ? <span style={{ color: '#1a9fff' }}>{value}</span> : value)}
+        renderButtonValue={(value) =>
+          activeFilters[key] ? <span style={{ color: UI_COLORS.accentBlue }}>{value}</span> : value
+        }
       />
     </div>
   );
@@ -283,7 +313,7 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
         {/* Two rows of three: six columns cut the dropdown labels at the Deck's width. */}
         <Focusable style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px' }}>
           <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-            <span className="DialogLabel">{t('Store.store_sort.label')}</span>
+            <DialogLabel>{t('Store.store_sort.label')}</DialogLabel>
             <Dropdown
               menuLabel={t('Store.store_sort.label') as string}
               rgOptions={dropdownSortOptions}
@@ -307,7 +337,7 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
           ])}
         </Focusable>
         <Focusable style={{ display: 'flex', alignItems: 'center', gap: '8px', minHeight: '32px' }}>
-          <span style={{ flexGrow: 1, fontSize: '14px', color: '#8b929a' }}>
+          <span style={{ flexGrow: 1, fontSize: '14px', color: UI_COLORS.textSub }}>
             {pluginList &&
               shownPlugins &&
               (filtering
@@ -334,7 +364,7 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
           </DialogButton>
         </Focusable>
         {fetchedAt !== null && (
-          <span style={{ marginTop: '-6px', textAlign: 'right', fontSize: '12px', color: '#8b929a' }}>
+          <span style={{ marginTop: '-6px', textAlign: 'right', fontSize: '12px', color: UI_COLORS.textSub }}>
             {t('Store.store_cache.age', { when: relativeTime(fetchedAt - now) })}
             {' · '}
             {t('Store.store_cache.next', { when: relativeTime(Math.max(fetchedAt + STORE_CACHE_MS - now, 0)) })}
@@ -351,22 +381,25 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
             marginRight: '20px',
             marginBottom: '20px',
             padding: '8px 36px',
-            background: 'rgba(255, 255, 0, 0.067)',
+            color: UI_COLORS.warning,
+            background: UI_COLORS.warningBg,
             textAlign: 'center',
-            border: '2px solid rgba(255, 255, 0, 0.467)',
+            border: `2px solid ${UI_COLORS.warningBorder}`,
+            borderRadius: '4px',
           }}
         >
           <h2 style={{ margin: 0 }}>{t('Store.store_testing_warning.label')}</h2>
-          <span>
+          <span style={{ color: UI_COLORS.textPrimary }}>
             {`${t('Store.store_testing_warning.desc')} `}
             <ExternalLink
-              href="https://decky.xyz/testing"
+              href={REPO_URL}
               target="_blank"
               style={{
-                textDecoration: 'none',
+                color: UI_COLORS.accentBlueHi,
+                textDecoration: 'underline',
               }}
             >
-              decky.xyz/testing
+              {REPO_LABEL}
             </ExternalLink>
           </span>
         </div>
@@ -379,9 +412,10 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
             marginRight: '20px',
             marginBottom: '20px',
             padding: '8px 12px',
-            color: '#fee75c',
-            background: 'rgba(254, 231, 92, 0.08)',
-            border: '2px solid rgba(254, 231, 92, 0.45)',
+            color: UI_COLORS.warning,
+            background: UI_COLORS.warningBg,
+            border: `2px solid ${UI_COLORS.warningBorder}`,
+            borderRadius: '4px',
           }}
         >
           {/* React escapes the text; i18next escaping would show "/" as "&#x2F;". */}
@@ -412,7 +446,9 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
             </div>
           )
         ) : shownPlugins.length === 0 ? (
-          <div style={{ margin: '40px 20px', textAlign: 'center', color: '#8b929a' }}>{t('Store.store_no_match')}</div>
+          <div style={{ margin: '40px 20px', textAlign: 'center', color: UI_COLORS.textSub }}>
+            {t('Store.store_no_match')}
+          </div>
         ) : (
           shownPlugins.map((plugin: MergedStorePlugin) => (
             <PluginCard
@@ -431,19 +467,14 @@ const AboutTab: FC<{}> = () => {
   const { t } = useTranslation();
 
   return (
-    <div
+    <Focusable
       style={{
         display: 'flex',
         flexDirection: 'column',
+        gap: '8px',
+        margin: '0 20px 20px',
       }}
     >
-      <style>{`
-              .deckyStoreAboutHeader {
-                font-size: 24px;
-                font-weight: 600;
-                margin-top: 20px;
-              }
-            `}</style>
       <img
         src={logo}
         style={{
@@ -452,24 +483,31 @@ const AboutTab: FC<{}> = () => {
           alignSelf: 'center',
         }}
       />
-      <span className="deckyStoreAboutHeader">Testing</span>
-      <span>
+      <DialogSubHeader style={{ marginTop: '12px' }}>{t('SettingsIndex.testing_title')}</DialogSubHeader>
+      <span style={{ color: UI_COLORS.textBody }}>
         {t('Store.store_testing_cta')}{' '}
-        <ExternalLink
-          href="https://decky.xyz/testing"
-          target="_blank"
-          style={{
-            textDecoration: 'none',
-          }}
+        <Focusable
+          style={{ display: 'inline' }}
+          onActivate={() => Navigation.NavigateToExternalWeb(REPO_URL)}
+          onOKButton={() => Navigation.NavigateToExternalWeb(REPO_URL)}
         >
-          decky.xyz/testing
-        </ExternalLink>
+          <ExternalLink
+            href={REPO_URL}
+            target="_blank"
+            style={{
+              color: UI_COLORS.accentBlueHi,
+              textDecoration: 'underline',
+            }}
+          >
+            {REPO_LABEL}
+          </ExternalLink>
+        </Focusable>
       </span>
-      <span className="deckyStoreAboutHeader">{t('Store.store_contrib.label')}</span>
-      <span>{t('Store.store_contrib.desc')}</span>
-      <span className="deckyStoreAboutHeader">{t('Store.store_source.label')}</span>
-      <span>{t('Store.store_source.desc')}</span>
-    </div>
+      <DialogSubHeader style={{ marginTop: '12px' }}>{t('Store.store_contrib.label')}</DialogSubHeader>
+      <span style={{ color: UI_COLORS.textBody }}>{t('Store.store_contrib.desc')}</span>
+      <DialogSubHeader style={{ marginTop: '12px' }}>{t('Store.store_source.label')}</DialogSubHeader>
+      <span style={{ color: UI_COLORS.textBody }}>{t('Store.store_source.desc')}</span>
+    </Focusable>
   );
 };
 
