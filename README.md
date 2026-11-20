@@ -31,9 +31,9 @@ This is an independent fork of [SteamDeckHomebrew/decky-loader](https://github.c
 
 ## Install in 3 steps
 
-[![Download Decky Loader Installer](docs/images/download_button.svg)](https://raw.githubusercontent.com/beallio/decky-loader/main/scripts/Install-Decky-Rust.desktop)
+<a href="https://raw.githubusercontent.com/beallio/decky-loader/main/scripts/Install-Decky-Rust.desktop"><img src="docs/images/download_button.svg" alt="Download Decky Loader Installer" width="180" height="32"></a>
 
-*(Right-click **Download** -> **Save Link As...** to save `Install-Decky-Rust.desktop`.)*
+*(Right-click **Download Installer** -> **Save Link As...** to save `Install-Decky-Rust.desktop`.)*
 
 1. Switch to **Desktop Mode** (on Steam Deck: **Steam -> Power -> Switch to Desktop**).
 2. Double-click **`Install-Decky-Rust.desktop`** (click **Continue / Trust and Launch** if prompted).
