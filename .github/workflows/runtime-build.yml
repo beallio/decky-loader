@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ github.token }}
-      CANDIDATE_VERSION: ${{ inputs.release_version || 'dev' }}
+      CANDIDATE_VERSION: ${{ inputs.release_version || (github.event_name == 'pull_request' && format('PR-{0}', github.event.pull_request.number)) || 'dev' }}
     steps:
       - name: Use the runner temporary directory
         run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
@@ -108,9 +108,9 @@ jobs:
 
       - name: Build the complete pinned candidate
         run: |
-          # Releases compile from a clean target; dev candidates reuse the cached one.
+          # Releases compile from a clean target; dev and PR candidates reuse the cached one.
           target=()
-          if [[ $CANDIDATE_VERSION == dev ]]; then
+          if [[ $CANDIDATE_VERSION == dev || $CANDIDATE_VERSION == PR-* ]]; then
             target=(--cargo-target-dir "$GITHUB_WORKSPACE/backend-rust/target")
           fi
           python3 scripts/runtime/build.py \

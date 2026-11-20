@@ -18,6 +18,14 @@ class CleanReleaseBuildTest(unittest.TestCase):
                 build.build(Path(temporary) / "out", "v3.3.0-rust.1-rc.8", None, Path(temporary) / "target")
             capture.assert_not_called()
 
+    def test_dev_and_pr_versions_allow_a_reused_cargo_target(self):
+        self.assertTrue(build.is_reusable_target_version("dev"))
+        self.assertTrue(build.is_reusable_target_version("PR-12"))
+        self.assertFalse(build.is_reusable_target_version("PR-"))
+        self.assertFalse(build.is_reusable_target_version("PR-abc"))
+        self.assertFalse(build.is_reusable_target_version("v3.3.1-rust.1-rc.9"))
+        self.assertFalse(build.is_reusable_target_version("v3.3.1-rust.1"))
+
 
 if __name__ == "__main__":
     unittest.main()

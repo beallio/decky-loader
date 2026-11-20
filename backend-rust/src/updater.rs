@@ -166,18 +166,19 @@ impl Updater {
 
     async fn version_info(&self, backend: &Backend) -> Value {
         let versions = self.versions.read().await;
-        let release = backend.version.as_str() != "unknown" && backend.version.as_str() != "dev";
+        let version = backend.version.as_str();
+        let (updatable, git_branch) = version_update_identity(version);
         json!({
-            "current": backend.version.as_str(),
+            "current": version,
             "sdk_version": backend.sdk_version.as_str(),
             "remote": versions.remote,
             "all": versions.all,
-            "updatable": release,
+            "updatable": updatable,
             // The frontend shows an "unsupported installation" warning unless this is true.
             "supported": true,
             "repo": backend.config.release_repository.trim_matches('/'),
-            // Releases are published from main; development builds are marked like upstream's.
-            "gitBranch": if release { "main" } else { "dirty" },
+            // Releases are published from main; PR and development builds show their branch/state.
+            "gitBranch": git_branch,
         })
     }
 
@@ -304,13 +305,7 @@ impl Updater {
             .ok_or_else(|| {
                 RpcError::failure("GitHub workflow runs response has no workflow_runs array")
             })?;
-        let run_id = workflows
-            .iter()
-            .find(|workflow| {
-                workflow.get("name").and_then(Value::as_str) == Some("Runtime Builder")
-            })
-            .and_then(|workflow| workflow.get("id"))
-            .and_then(Value::as_u64)
+        let run_id = select_testing_workflow_run_id(workflows)
             .ok_or_else(|| RpcError::failure("Workflow run not found."))?;
 
         let path = format!("actions/runs/{run_id}/artifacts");
@@ -367,7 +362,7 @@ impl Updater {
         verify_testing_bundle_digest(&bundle_archive, &checksum).await?;
         let bundle = temporary.reserve_directory("bundle").await?;
         extract_bundle_archive(bundle_archive, bundle.clone()).await?;
-        let version = bundle_release_version(&bundle).await?;
+        let version = stamp_testing_bundle_version(&bundle, pr_id).await?;
         queue_install_bundle(backend, &bundle, &version)
             .await
             .map_err(|error| {
@@ -428,6 +423,61 @@ async fn bundle_release_version(bundle: &Path) -> Result<String, RpcError> {
         .filter(|version| !version.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| RpcError::failure("Rust bundle metadata has no release_version"))
+}
+
+async fn stamp_testing_bundle_version(bundle: &Path, pr_id: u64) -> Result<String, RpcError> {
+    let version = bundle_release_version(bundle).await?;
+    if version != "dev" {
+        return Ok(version);
+    }
+    let path = bundle.join("bundle.json");
+    let raw = tokio::fs::read(&path)
+        .await
+        .map_err(|error| io_failure("reading testing bundle metadata", error))?;
+    let mut metadata: Value = serde_json::from_slice(&raw)
+        .map_err(|error| RpcError::failure(format!("invalid Rust bundle metadata: {error}")))?;
+    let stamped = format!("PR-{pr_id}");
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("release_version".to_owned(), Value::String(stamped.clone()));
+    }
+    let mut serialized = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| RpcError::failure(format!("serializing Rust bundle metadata: {error}")))?;
+    serialized.push(b'\n');
+    tokio::fs::write(&path, serialized)
+        .await
+        .map_err(|error| io_failure("updating testing bundle metadata", error))?;
+    Ok(stamped)
+}
+
+fn select_testing_workflow_run_id(workflows: &[Value]) -> Option<u64> {
+    let runtime_builder_runs = || {
+        workflows.iter().filter(|workflow| {
+            workflow.get("name").and_then(Value::as_str) == Some("Runtime Builder")
+        })
+    };
+    runtime_builder_runs()
+        .find(|workflow| workflow.get("event").and_then(Value::as_str) == Some("pull_request"))
+        .or_else(|| runtime_builder_runs().next())
+        .and_then(|workflow| workflow.get("id"))
+        .and_then(Value::as_u64)
+}
+
+pub(crate) fn is_testing_pr_version(version: &str) -> bool {
+    version.strip_prefix("PR-").is_some_and(|number| {
+        !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn version_update_identity(version: &str) -> (bool, &str) {
+    let updatable = version != "unknown";
+    let git_branch = if is_testing_pr_version(version) {
+        version
+    } else if version == "unknown" || version == "dev" {
+        "dirty"
+    } else {
+        "main"
+    };
+    (updatable, git_branch)
 }
 
 impl Default for Updater {
@@ -1014,9 +1064,11 @@ fn io_failure(operation: &str, error: io::Error) -> RpcError {
 mod tests {
     use super::{
         RUST_BUNDLE_ASSET, RUST_CHECKSUM_ASSET, RUST_TESTING_ARTIFACT, bundle_release_version,
-        default_branch, filter_releases, parse_checksum_sidecar, resolve_branch, rust_bundle_asset,
-        rust_checksum_asset, rust_testing_artifact, secure_staging_directory, testing_bundle_paths,
-        verify_bundle_digest, verify_testing_bundle_digest,
+        default_branch, filter_releases, is_testing_pr_version, parse_checksum_sidecar,
+        resolve_branch, rust_bundle_asset, rust_checksum_asset, rust_testing_artifact,
+        secure_staging_directory, select_testing_workflow_run_id, stamp_testing_bundle_version,
+        testing_bundle_paths, verify_bundle_digest, verify_testing_bundle_digest,
+        version_update_identity,
     };
     use crate::backend::RpcError;
     use serde_json::{Value, json};
@@ -1223,7 +1275,43 @@ mod tests {
         fs::write(bundle.join("bundle.json"), br#"{"release_version":"dev"}"#).unwrap();
 
         assert_eq!(bundle_release_version(&bundle).await.unwrap(), "dev");
+        assert_eq!(
+            stamp_testing_bundle_version(&bundle, 42).await.unwrap(),
+            "PR-42"
+        );
+        assert_eq!(bundle_release_version(&bundle).await.unwrap(), "PR-42");
+        assert_eq!(
+            stamp_testing_bundle_version(&bundle, 99).await.unwrap(),
+            "PR-42"
+        );
         fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn testing_workflow_selection_prefers_pull_request_runs_and_falls_back_to_push() {
+        let workflows = vec![
+            json!({"id": 10, "name": "Lint", "event": "pull_request"}),
+            json!({"id": 11, "name": "Runtime Builder", "event": "push"}),
+            json!({"id": 12, "name": "Runtime Builder", "event": "pull_request"}),
+        ];
+        assert_eq!(select_testing_workflow_run_id(&workflows), Some(12));
+        assert_eq!(select_testing_workflow_run_id(&workflows[..2]), Some(11));
+        assert_eq!(select_testing_workflow_run_id(&workflows[..1]), None);
+    }
+
+    #[test]
+    fn pr_and_dev_versions_remain_updatable_when_switching_back_to_release_channels() {
+        assert!(is_testing_pr_version("PR-12"));
+        assert!(!is_testing_pr_version("PR-"));
+        assert!(!is_testing_pr_version("PR-abc"));
+        assert!(!is_testing_pr_version("dev"));
+        assert_eq!(
+            version_update_identity("v3.3.1-rust.1-rc.9"),
+            (true, "main")
+        );
+        assert_eq!(version_update_identity("PR-12"), (true, "PR-12"));
+        assert_eq!(version_update_identity("dev"), (true, "dirty"));
+        assert_eq!(version_update_identity("unknown"), (false, "dirty"));
     }
 
     #[test]
