@@ -1,14 +1,17 @@
 import {
+  ConfirmModal,
   DialogBody,
   DialogButton,
   DialogControlsSection,
   DialogControlsSectionHeader,
   Field,
   Navigation,
+  QuickAccessTab,
   TextField,
   ToggleField,
+  showModal,
 } from '@decky/ui';
-import { useRef, useState } from 'react';
+import { FC, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { FaFileArchive, FaLink, FaReact, FaSteamSymbol, FaTerminal } from 'react-icons/fa';
 
@@ -18,15 +21,82 @@ import { useSetting } from '../../../../utils/hooks/useSetting';
 import { getSetting } from '../../../../utils/settings';
 import { UI_COLORS } from '../../../../utils/uiStyles';
 import { FileSelectionType } from '../../../modals/filepicker';
+import PluginInstallProgress from '../../../modals/PluginInstallProgress';
 import RemoteDebuggingSettings from '../general/RemoteDebugging';
 
 const getTabID = DeckyBackend.callable<[name: string], string>('utilities/get_tab_id');
+
+const PluginURLModal: FC<{ closeModal?(): void }> = ({ closeModal }) => {
+  const { t } = useTranslation();
+  const [url, setURL] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [percentage, setPercentage] = useState(0);
+  const [downloadInfo, setDownloadInfo] = useState<string | null>(null);
+  const trimmed = url.trim();
+  const valid = trimmed.length > 0 && !/\s/.test(trimmed);
+
+  useEffect(() => {
+    function updateDownloadState(percent: number, transText: string | undefined, transInfo: Record<string, string>) {
+      setPercentage(percent);
+      setDownloadInfo(transText === undefined ? null : t(transText, transInfo));
+    }
+    DeckyBackend.addEventListener('loader/plugin_download_info', updateDownloadState);
+    return () => {
+      DeckyBackend.removeEventListener('loader/plugin_download_info', updateDownloadState);
+    };
+  }, [t]);
+
+  return (
+    <ConfirmModal
+      strTitle={t('SettingsDeveloperIndex.third_party_plugins.label_url')}
+      strOKButtonText={
+        loading
+          ? t('PluginInstallModal.install.button_processing')
+          : t('SettingsDeveloperIndex.third_party_plugins.button_install')
+      }
+      bOKDisabled={!valid || loading}
+      bCancelDisabled={loading}
+      closeModal={closeModal}
+      {...({ bCloseAfterOK: false } as any)}
+      onOK={async () => {
+        const targetURL = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+        const splitURL = targetURL.replace(/\/+$/, '').split('/');
+        const artifact = splitURL[splitURL.length - 1]?.replace(/\.zip$/i, '') || targetURL;
+        setLoading(true);
+        setPercentage(0);
+        setDownloadInfo(null);
+        try {
+          await installFromURL(targetURL);
+        } catch (e) {
+          setLoading(false);
+          setPercentage(0);
+          setDownloadInfo(null);
+          DeckyPluginLoader.toaster.toast({
+            title: t('PluginInstallModal.failed', { artifact }),
+            body: e instanceof Error ? e.message : String(e),
+          });
+          return;
+        }
+        closeModal?.();
+        setTimeout(() => Navigation.OpenQuickAccessMenu(QuickAccessTab.Decky), 250);
+        setTimeout(() => DeckyPluginLoader.checkPluginUpdates(), 1000);
+      }}
+    >
+      <TextField
+        label={t('SettingsDeveloperIndex.third_party_plugins.label_desc')}
+        value={url}
+        disabled={loading}
+        onChange={(e) => setURL(e?.target.value ?? '')}
+      />
+      {loading && <PluginInstallProgress percentage={percentage} operationText={downloadInfo} />}
+    </ConfirmModal>
+  );
+};
 
 export default function DeveloperSettings() {
   const [enableValveInternal, setEnableValveInternal] = useSetting<boolean>('developer.valve_internal', false);
   const [reactDevtoolsEnabled, setReactDevtoolsEnabled] = useSetting<boolean>('developer.rdt.enabled', false);
   const [reactDevtoolsIP, setReactDevtoolsIP] = useSetting<string>('developer.rdt.ip', '');
-  const [pluginURL, setPluginURL] = useState('');
   const textRef = useRef<HTMLDivElement>(null);
   const { t } = useTranslation();
 
@@ -69,26 +139,10 @@ export default function DeveloperSettings() {
         </Field>
         <Field
           label={t('SettingsDeveloperIndex.third_party_plugins.label_url')}
-          description={
-            <TextField
-              label={t('SettingsDeveloperIndex.third_party_plugins.label_desc')}
-              value={pluginURL}
-              onChange={(e) => setPluginURL(e?.target.value)}
-            />
-          }
           icon={<FaLink style={{ display: 'block' }} />}
         >
-          <DialogButton
-            disabled={pluginURL.length == 0}
-            onClick={() => {
-              if (/^https?:\/\//.test(pluginURL)) {
-                installFromURL(pluginURL);
-              } else {
-                installFromURL('https://' + pluginURL);
-              }
-            }}
-          >
-            {t('SettingsDeveloperIndex.third_party_plugins.button_install')}
+          <DialogButton onClick={() => showModal(<PluginURLModal />)}>
+            {t('SettingsDeveloperIndex.third_party_plugins.button_url')}
           </DialogButton>
         </Field>
       </DialogControlsSection>

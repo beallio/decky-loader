@@ -231,6 +231,7 @@
         },
         "third_party_plugins": {
             "button_install": "Install",
+            "button_url": "Enter URL",
             "button_zip": "Browse",
             "header": "Third-Party Plugins",
             "label_desc": "URL",

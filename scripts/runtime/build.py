@@ -62,9 +62,15 @@ def source_snapshot(destination: Path) -> dict[str, str]:
     }
 
 
+def is_reusable_target_version(release_version: str) -> bool:
+    return release_version == 'dev' or (
+        release_version.startswith('PR-') and release_version[3:].isdigit()
+    )
+
+
 def build(output: Path, release_version: str, python_archive: Path | None,
           cargo_target_dir: Path | None = None) -> dict[str, object]:
-    if cargo_target_dir is not None and release_version != 'dev':
+    if cargo_target_dir is not None and not is_reusable_target_version(release_version):
         raise ValueError('a release build must compile from a clean target directory; omit --cargo-target-dir')
     if platform.system() != 'Linux' or platform.machine() != 'x86_64':
         raise RuntimeError('this build targets Linux x86-64 only')

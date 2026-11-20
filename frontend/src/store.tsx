@@ -231,8 +231,21 @@ function versionsFromPluginList(plugins: StorePlugin[]): UpdateEndpointVersions 
 }
 
 export async function installFromURL(url: string) {
-  const splitURL = url.split('/');
-  await installPlugin(url, splitURL[splitURL.length - 1].replace('.zip', ''));
+  const splitURL = url.replace(/\/+$/, '').split('/');
+  const artifact = splitURL[splitURL.length - 1]?.replace(/\.zip$/i, '') || url;
+  if (url.startsWith('file://')) {
+    await installPlugin(url, artifact);
+    return;
+  }
+  const promptPromise = DeckyPluginLoader.consumeNextInstallPrompt();
+  try {
+    await installPlugin(url, artifact);
+  } catch (e) {
+    DeckyPluginLoader.clearPendingDirectInstall();
+    throw e;
+  }
+  const requestId = await promptPromise;
+  await DeckyBackend.call<[string]>('utilities/confirm_plugin_install', requestId);
 }
 
 export async function requestPluginInstall(plugin: string, selectedVer: StorePluginVersion, installType: InstallType) {
