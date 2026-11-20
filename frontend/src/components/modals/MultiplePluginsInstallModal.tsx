@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { FaCheck, FaDownload } from 'react-icons/fa';
 
 import { DisabledPlugin, InstallType, InstallTypeTranslationMapping } from '../../plugin';
+import { UI_COLORS } from '../../utils/uiStyles';
 import PluginInstallProgress from './PluginInstallProgress';
 
 interface MultiplePluginsInstallModalProps {
@@ -138,7 +139,7 @@ const MultiplePluginsInstallModal: FC<MultiplePluginsInstallModalProps> = ({
                   {(pluginsCompleted.includes(name) && <FaCheck />) || (name === pluginInProgress && <FaDownload />)}
                 </span>
                 {hash === 'False' && (
-                  <div style={{ color: 'red', paddingLeft: '10px' }}>{t('PluginInstallModal.no_hash')}</div>
+                  <div style={{ color: UI_COLORS.danger, paddingLeft: '10px' }}>{t('PluginInstallModal.no_hash')}</div>
                 )}
               </li>
             );

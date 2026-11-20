@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { FaExclamationTriangle } from 'react-icons/fa';
 
 import { InstallType } from '../../plugin';
+import { UI_COLORS } from '../../utils/uiStyles';
 
 interface RootPluginConfirmModalProps {
   name: string;
@@ -76,8 +77,9 @@ const RootPluginConfirmModal: FC<RootPluginConfirmModalProps> = ({
       onOK={() => answer(password)}
       onCancel={() => answer(null)}
       strTitle={
-        <div>
-          <FaExclamationTriangle /> {t('RootPluginConfirm.title', { name })}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <FaExclamationTriangle style={{ color: UI_COLORS.warning, flexShrink: 0 }} />
+          {t('RootPluginConfirm.title', { name })}
         </div>
       }
       strOKButtonText={
@@ -87,7 +89,7 @@ const RootPluginConfirmModal: FC<RootPluginConfirmModalProps> = ({
       }
       strCancelButtonText={t('RootPluginConfirm.button_cancel')}
     >
-      <div style={{ color: 'red' }}>{t('RootPluginConfirm.desc', { name, version })}</div>
+      <div style={{ color: UI_COLORS.danger }}>{t('RootPluginConfirm.desc', { name, version })}</div>
       <div style={{ marginTop: '0.5em' }}>{t('RootPluginConfirm.source', { host: artifactHost })}</div>
       <ToggleField
         label={t('RootPluginConfirm.acknowledge', { name })}

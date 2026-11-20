@@ -2,6 +2,7 @@ import {
   DialogBody,
   DialogButton,
   DialogControlsSection,
+  DialogControlsSectionHeader,
   Field,
   Focusable,
   NavEntryPositionPreferences,
@@ -14,6 +15,7 @@ import { useTranslation } from 'react-i18next';
 import { FaDownload, FaFlask, FaInfo } from 'react-icons/fa';
 
 import { setSetting } from '../../../../utils/settings';
+import { ICON_BUTTON_STYLE, UI_COLORS } from '../../../../utils/uiStyles';
 import { UpdateBranch } from '../general/BranchSelect';
 
 interface TestingVersion {
@@ -67,7 +69,7 @@ export default function TestingVersionList() {
   if (testingVersions.length === 0) {
     return (
       <DialogBody>
-        <p>No open PRs found</p>
+        <p>{t('Testing.no_prs', { defaultValue: 'No open PRs found' })}</p>
       </DialogBody>
     );
   }
@@ -76,7 +78,7 @@ export default function TestingVersionList() {
     <DialogBody>
       {updateProgress !== null && <ProgressBar nProgress={updateProgress} indeterminate={reloading} />}
       <DialogControlsSection>
-        <h4>{t('Testing.header')}</h4>
+        <DialogControlsSectionHeader>{t('Testing.header')}</DialogControlsSectionHeader>
         <ul style={{ listStyleType: 'none', padding: '0' }}>
           {testingVersions.map((version) => {
             return (
@@ -85,18 +87,25 @@ export default function TestingVersionList() {
                   label={
                     <>
                       {version.name}{' '}
-                      <span style={{ opacity: '50%', whiteSpace: 'nowrap', marginLeft: 'auto', alignSelf: 'center' }}>
+                      <span
+                        style={{
+                          color: UI_COLORS.textSub,
+                          whiteSpace: 'nowrap',
+                          marginLeft: 'auto',
+                          alignSelf: 'center',
+                        }}
+                      >
                         {'#' + version.id}
                       </span>
                     </>
                   }
                 >
                   <Focusable
-                    style={{ height: '40px', marginLeft: 'auto', display: 'flex' }}
+                    style={{ height: '40px', marginLeft: 'auto', display: 'flex', gap: '8px' }}
                     navEntryPreferPosition={NavEntryPositionPreferences.MAINTAIN_X}
                   >
                     <DialogButton
-                      style={{ height: '40px', minWidth: '60px', marginRight: '10px' }}
+                      style={{ height: '40px', minWidth: '60px' }}
                       onClick={async () => {
                         const downloadToast = DeckyPluginLoader.toaster.toast({
                           title: t('Testing.start_download_toast', { id: version.id }),
@@ -132,18 +141,10 @@ export default function TestingVersionList() {
                       </div>
                     </DialogButton>
                     <DialogButton
-                      style={{
-                        height: '40px',
-                        width: '40px',
-                        padding: '10px 12px',
-                        minWidth: '40px',
-                        display: 'flex',
-                        flexDirection: 'column',
-                        justifyContent: 'center',
-                      }}
+                      style={ICON_BUTTON_STYLE}
                       onClick={() => Navigation.NavigateToExternalWeb(version.link)}
                     >
-                      <FaInfo />
+                      <FaInfo style={{ display: 'block' }} />
                     </DialogButton>
                   </Focusable>
                 </Field>

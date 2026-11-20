@@ -7,7 +7,7 @@ import {
   ReorderableEntry,
   ReorderableList,
   TextField,
-  Toggle,
+  ToggleField,
   showModal,
 } from '@decky/ui';
 import { FC, useEffect, useRef, useState } from 'react';
@@ -16,6 +16,7 @@ import { FaEdit, FaPlus, FaTrash } from 'react-icons/fa';
 
 import { getStoreSettings, saveStoreSettings } from '../../../../store';
 import { StoreSettings, storeLabel } from '../../../../storeSources';
+import { ICON_BUTTON_STYLE, UI_COLORS } from '../../../../utils/uiStyles';
 
 // Fork: an ordered list of stores (higher stores win) and a separate pre-release list,
 // instead of the single Default/Testing/Custom choice. Adding a store shows no warning.
@@ -48,19 +49,17 @@ const StoreURLModal: FC<{
 
 type StoreEntryData = { url: string; onEdit(): void; onRemove?(): void };
 
-const iconButton = { minWidth: '40px', width: '40px', padding: '10px 12px' };
-
 function StoreInteractables({ entry }: { entry: ReorderableEntry<StoreEntryData> }) {
   if (!entry.data) return null;
   const { onEdit, onRemove } = entry.data;
   return (
-    <Focusable navEntryPreferPosition={NavEntryPositionPreferences.MAINTAIN_X} style={{ display: 'flex', gap: '6px' }}>
-      <DialogButton style={iconButton} onClick={onEdit} onOKButton={onEdit}>
-        <FaEdit />
+    <Focusable navEntryPreferPosition={NavEntryPositionPreferences.MAINTAIN_X} style={{ display: 'flex', gap: '8px' }}>
+      <DialogButton style={ICON_BUTTON_STYLE} onClick={onEdit} onOKButton={onEdit}>
+        <FaEdit style={{ display: 'block' }} />
       </DialogButton>
       {onRemove && (
-        <DialogButton style={iconButton} onClick={onRemove} onOKButton={onRemove}>
-          <FaTrash />
+        <DialogButton style={ICON_BUTTON_STYLE} onClick={onRemove} onOKButton={onRemove}>
+          <FaTrash style={{ display: 'block' }} />
         </DialogButton>
       )}
     </Focusable>
@@ -84,7 +83,7 @@ const StoreList: FC<{
     label: (
       <div>
         {storeLabel(url)}
-        <div style={{ fontSize: '12px', color: '#969696', overflowWrap: 'anywhere' }}>{url}</div>
+        <div style={{ fontSize: '12px', color: UI_COLORS.textSub, overflowWrap: 'anywhere' }}>{url}</div>
       </div>
     ),
     position,
@@ -116,7 +115,7 @@ const StoreList: FC<{
         </DialogButton>
       </Field>
       {/* Fork: the first store row touched the field above; match the 6px gap between rows and add a divider. */}
-      <div style={{ marginTop: '6px', paddingTop: '6px', borderTop: '1px solid #3a4652' }}>
+      <div style={{ marginTop: '6px', paddingTop: '6px', borderTop: `1px solid ${UI_COLORS.border}` }}>
         <ReorderableList<StoreEntryData>
           entries={entries}
           onSave={(saved) => onChange(saved.map((entry) => entry.data!.url))}
@@ -155,9 +154,12 @@ const StoreSelect: FC<{}> = () => {
         minimum={1}
         onChange={(stores) => update({ stores })}
       />
-      <Field label={t('StoreSelect.prereleases.label')} description={t('StoreSelect.prereleases.desc')}>
-        <Toggle value={settings.includePrereleases} onChange={(includePrereleases) => update({ includePrereleases })} />
-      </Field>
+      <ToggleField
+        label={t('StoreSelect.prereleases.label')}
+        description={t('StoreSelect.prereleases.desc')}
+        checked={settings.includePrereleases}
+        onChange={(includePrereleases) => update({ includePrereleases })}
+      />
       {settings.includePrereleases && (
         <StoreList
           label={t('StoreSelect.prerelease_stores.label')}

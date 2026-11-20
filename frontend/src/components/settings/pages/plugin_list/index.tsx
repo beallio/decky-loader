@@ -24,6 +24,7 @@ import {
 } from '../../../../store';
 import { useSetting } from '../../../../utils/hooks/useSetting';
 import { getPluginDisplayName } from '../../../../utils/pluginHelpers';
+import { ICON_BUTTON_STYLE } from '../../../../utils/uiStyles';
 import { useDeckyState } from '../../../DeckyState';
 import PluginListLabel from './PluginListLabel';
 
@@ -122,10 +123,10 @@ function PluginInteractables(props: { entry: ReorderableEntry<PluginTableData> }
   };
 
   return (
-    <Focusable navEntryPreferPosition={NavEntryPositionPreferences.MAINTAIN_X} style={{ display: 'flex' }}>
+    <Focusable navEntryPreferPosition={NavEntryPositionPreferences.MAINTAIN_X} style={{ display: 'flex', gap: '8px' }}>
       {update ? (
         <DialogButton
-          style={{ height: '40px', minWidth: '60px', marginRight: '10px' }}
+          style={{ height: '40px', minWidth: '60px' }}
           onClick={() => requestPluginInstall(name, update, InstallType.UPDATE)}
           onOKButton={() => requestPluginInstall(name, update, InstallType.UPDATE)}
         >
@@ -136,7 +137,7 @@ function PluginInteractables(props: { entry: ReorderableEntry<PluginTableData> }
         </DialogButton>
       ) : (
         <DialogButton
-          style={{ height: '40px', minWidth: '60px', marginRight: '10px' }}
+          style={{ height: '40px', minWidth: '60px' }}
           onClick={() => reinstallPlugin(name, version)}
           onOKButton={() => reinstallPlugin(name, version)}
         >
@@ -146,20 +147,8 @@ function PluginInteractables(props: { entry: ReorderableEntry<PluginTableData> }
           </div>
         </DialogButton>
       )}
-      <DialogButton
-        style={{
-          height: '40px',
-          width: '40px',
-          padding: '10px 12px',
-          minWidth: '40px',
-          display: 'flex',
-          flexDirection: 'column',
-          justifyContent: 'center',
-        }}
-        onClick={showCtxMenu}
-        onOKButton={showCtxMenu}
-      >
-        <FaEllipsisH />
+      <DialogButton style={ICON_BUTTON_STYLE} onClick={showCtxMenu} onOKButton={showCtxMenu}>
+        <FaEllipsisH style={{ display: 'block' }} />
       </DialogButton>
     </Focusable>
   );
@@ -238,9 +227,9 @@ export default function PluginList({ isDeveloper }: { isDeveloper: boolean }) {
 
   if (installedPlugins.length === 0) {
     return (
-      <div>
+      <DialogBody>
         <p>{t('PluginListIndex.no_plugin')}</p>
-      </div>
+      </DialogBody>
     );
   }
 
@@ -257,28 +246,28 @@ export default function PluginList({ isDeveloper }: { isDeveloper: boolean }) {
   return (
     <DialogBody>
       {updates && updates.size > 0 && (
-        <DialogButton
-          onClick={() =>
-            requestMultiplePluginInstalls(
-              [...updates.entries()].map(([plugin, selectedVer]) => ({
-                installType: InstallType.UPDATE,
-                plugin,
-                selectedVer,
-              })),
-            )
-          }
-          style={{
-            position: 'absolute',
-            top: '57px',
-            right: '2.8vw',
-            width: 'auto',
-            display: 'flex',
-            alignItems: 'center',
-          }}
-        >
-          {t('PluginListIndex.update_all', { count: updates.size })}
-          <FaDownload style={{ paddingLeft: '1rem' }} />
-        </DialogButton>
+        <Focusable style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '12px' }}>
+          <DialogButton
+            onClick={() =>
+              requestMultiplePluginInstalls(
+                [...updates.entries()].map(([plugin, selectedVer]) => ({
+                  installType: InstallType.UPDATE,
+                  plugin,
+                  selectedVer,
+                })),
+              )
+            }
+            style={{
+              width: 'auto',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+            }}
+          >
+            {t('PluginListIndex.update_all', { count: updates.size })}
+            <FaDownload style={{ display: 'block' }} />
+          </DialogButton>
+        </Focusable>
       )}
       <DialogControlsSection style={{ marginTop: 0 }}>
         <ReorderableList<PluginTableData>

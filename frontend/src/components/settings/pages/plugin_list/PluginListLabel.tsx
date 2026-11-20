@@ -2,6 +2,8 @@ import { FC } from 'react';
 import { useTranslation } from 'react-i18next';
 import { FaBan, FaEyeSlash, FaLock } from 'react-icons/fa';
 
+import { UI_COLORS } from '../../../../utils/uiStyles';
+
 interface PluginListLabelProps {
   frozen: boolean;
   hidden: boolean;
@@ -19,7 +21,7 @@ const PluginListLabel: FC<PluginListLabelProps> = ({ name, frozen, hidden, versi
         {version && (
           <>
             {' - '}
-            <span style={{ color: frozen ? '#67707b' : 'inherit' }}>
+            <span style={{ color: frozen ? UI_COLORS.textMuted : 'inherit' }}>
               {frozen && (
                 <>
                   <FaLock />{' '}
@@ -34,10 +36,10 @@ const PluginListLabel: FC<PluginListLabelProps> = ({ name, frozen, hidden, versi
         <div
           style={{
             fontSize: '0.8rem',
-            color: '#dcdedf',
+            color: UI_COLORS.textPrimary,
             display: 'flex',
             alignItems: 'center',
-            gap: '10px',
+            gap: '8px',
           }}
         >
           <FaEyeSlash />
@@ -48,10 +50,10 @@ const PluginListLabel: FC<PluginListLabelProps> = ({ name, frozen, hidden, versi
         <div
           style={{
             fontSize: '0.8rem',
-            color: '#dcdedf',
+            color: UI_COLORS.textPrimary,
             display: 'flex',
             alignItems: 'center',
-            gap: '10px',
+            gap: '8px',
           }}
         >
           <FaBan />

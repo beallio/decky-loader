@@ -3,6 +3,8 @@ import { FC } from 'react';
 import { useTranslation } from 'react-i18next';
 import { FaExclamationTriangle } from 'react-icons/fa';
 
+import { UI_COLORS } from '../../utils/uiStyles';
+
 interface RootInfoModalProps {
   closeModal?(): void;
 }
@@ -17,7 +19,7 @@ const RootInfoModal: FC<RootInfoModalProps> = ({ closeModal }) => {
       closeModal={closeModal}
       strTitle={
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <FaExclamationTriangle style={{ color: '#fee75c' }} />
+          <FaExclamationTriangle style={{ color: UI_COLORS.warning, flexShrink: 0 }} />
           {t('RootInfoModal.title')}
         </div>
       }

@@ -1,7 +1,9 @@
-import { Focusable, Navigation, findClass, findClassByName } from '@decky/ui';
+import { Focusable, Navigation, findClassByName } from '@decky/ui';
 import { FunctionComponent, useRef } from 'react';
 import ReactMarkdown, { Options as ReactMarkdownOptions } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+
+import { UI_COLORS } from '../utils/uiStyles';
 
 interface MarkdownProps extends ReactMarkdownOptions {
   onDismiss?: () => void;
@@ -9,7 +11,6 @@ interface MarkdownProps extends ReactMarkdownOptions {
 
 const Markdown: FunctionComponent<MarkdownProps> = (props) => {
   const eventDetailsBodyClassName = findClassByName('EventDetailsBody') || undefined;
-  const eventLinkClassName = findClass('43088', 'Link');
 
   return (
     <Focusable>
@@ -31,7 +32,11 @@ const Markdown: FunctionComponent<MarkdownProps> = (props) => {
                 focusClassName="steam-focus"
                 className={eventDetailsBodyClassName}
               >
-                <a ref={aRef} {...nodeProps.node.properties} className={eventLinkClassName}>
+                <a
+                  ref={aRef}
+                  {...nodeProps.node.properties}
+                  style={{ color: UI_COLORS.accentBlueHi, textDecoration: 'underline' }}
+                >
                   {nodeProps.children}
                 </a>
               </Focusable>

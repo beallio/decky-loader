@@ -582,7 +582,14 @@ class PluginLoader extends Logger {
       const TheError: FC<{}> = () => (
         <PanelSection>
           <PanelSectionRow>
-            <div className={quickAccessMenuClasses.FriendsTitle} style={{ display: 'flex', justifyContent: 'center' }}>
+            <div
+              className={quickAccessMenuClasses.FriendsTitle}
+              style={{
+                display: 'flex',
+                justifyContent: 'center',
+                ...(quickAccessMenuClasses.FriendsTitle ? {} : { fontSize: '16px', fontWeight: 600 }),
+              }}
+            >
               <TranslationHelper transClass={TranslationClass.PLUGIN_LOADER} transText="error" />
             </div>
           </PanelSectionRow>
@@ -592,7 +599,10 @@ class PluginLoader extends Logger {
             </pre>
           </PanelSectionRow>
           <PanelSectionRow>
-            <div className={quickAccessMenuClasses.Text}>
+            <div
+              className={quickAccessMenuClasses.Text}
+              style={quickAccessMenuClasses.Text ? undefined : { fontSize: '13px', opacity: 0.85 }}
+            >
               <TranslationHelper
                 transClass={TranslationClass.PLUGIN_LOADER}
                 transText={backendError ? 'plugin_backend_error' : 'plugin_error_uninstall'}

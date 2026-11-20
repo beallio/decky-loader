@@ -3,6 +3,7 @@ import { FC, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { InstallType, InstallTypeTranslationMapping } from '../../plugin';
+import { UI_COLORS } from '../../utils/uiStyles';
 import PluginInstallProgress from './PluginInstallProgress';
 
 interface PluginInstallModalProps {
@@ -129,7 +130,7 @@ const PluginInstallModal: FC<PluginInstallModalProps> = ({
           disabled ? `${description} ${t('PluginInstallModal.disabled')}` : description
         }
       </div>
-      {hash == 'False' && <span style={{ color: 'red' }}>{t('PluginInstallModal.no_hash')}</span>}
+      {hash == 'False' && <span style={{ color: UI_COLORS.danger }}>{t('PluginInstallModal.no_hash')}</span>}
       {loading && <PluginInstallProgress percentage={percentage} operationText={downloadInfo} />}
     </ConfirmModal>
   );

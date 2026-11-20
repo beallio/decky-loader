@@ -3,6 +3,7 @@ import { FC, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { FaBan, FaEyeSlash } from 'react-icons/fa';
 
+import { UI_COLORS } from '../utils/uiStyles';
 import { useDeckyState } from './DeckyState';
 import NotificationBadge from './NotificationBadge';
 import { useQuickAccessVisible } from './QuickAccessVisibleState';
@@ -68,28 +69,30 @@ const PluginView: FC = () => {
               </ButtonItem>
             </PanelSectionRow>
           ))}
-          <div
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              position: 'absolute',
-              justifyContent: 'center',
-              padding: '5px 0px',
-            }}
-          >
-            {numberOfHidden > 0 && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '0.8rem' }}>
-                <FaEyeSlash />
-                <div>{t('PluginView.hidden', { count: numberOfHidden })}</div>
-              </div>
-            )}
-            {disabledPlugins.length > 0 && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '0.8rem' }}>
-                <FaBan />
-                <div>{t('PluginView.disabled', { count: disabledPlugins.length })}</div>
-              </div>
-            )}
-          </div>
+          {(numberOfHidden > 0 || disabledPlugins.length > 0) && (
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '4px',
+                padding: '8px 0',
+                color: UI_COLORS.textSub,
+              }}
+            >
+              {numberOfHidden > 0 && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.8rem' }}>
+                  <FaEyeSlash />
+                  <div>{t('PluginView.hidden', { count: numberOfHidden })}</div>
+                </div>
+              )}
+              {disabledPlugins.length > 0 && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.8rem' }}>
+                  <FaBan />
+                  <div>{t('PluginView.disabled', { count: disabledPlugins.length })}</div>
+                </div>
+              )}
+            </div>
+          )}
         </PanelSection>
       </div>
     </>

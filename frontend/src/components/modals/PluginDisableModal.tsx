@@ -1,5 +1,6 @@
 import { ConfirmModal, Spinner } from '@decky/ui';
 import { FC, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 
 import { disablePlugin } from '../../plugin';
 
@@ -13,12 +14,21 @@ interface PluginDisableModalProps {
 
 const PluginDisableModal: FC<PluginDisableModalProps> = ({ name, title, buttonText, description, closeModal }) => {
   const [disabling, setDisabling] = useState<boolean>(false);
+  const { t } = useTranslation();
   return (
     <ConfirmModal
       closeModal={closeModal}
       onOK={async () => {
         setDisabling(true);
-        await disablePlugin(name);
+        try {
+          await disablePlugin(name);
+        } catch (e) {
+          // Fork: a failed disable kept the modal open with both buttons disabled.
+          DeckyPluginLoader.toaster.toast({
+            title: t('PluginDisableModal.failed', { name, defaultValue: `Could not disable ${name}` }),
+            body: e instanceof Error ? e.message : String(e),
+          });
+        }
         closeModal?.();
       }}
       bOKDisabled={disabling}

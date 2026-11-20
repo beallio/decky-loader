@@ -2,12 +2,10 @@ import { FC } from 'react';
 import { Translation } from 'react-i18next';
 
 import Logger from '../logger';
-import { WarnThirdPartyType } from './globalTypes';
 
 export enum TranslationClass {
   PLUGIN_LOADER = 'PluginLoader',
   DEVELOPER = 'Developer',
-  WARN_THIRD_PARTY = 'WarnThirdParty',
 }
 
 interface TranslationHelperProps {
@@ -15,17 +13,11 @@ interface TranslationHelperProps {
   transText: string;
   i18nArgs?: {};
   installType?: number;
-  warnType?: WarnThirdPartyType;
 }
 
 const logger = new Logger('TranslationHelper');
 
-const TranslationHelper: FC<TranslationHelperProps> = ({
-  transClass,
-  transText,
-  i18nArgs = null,
-  warnType = WarnThirdPartyType.REPO,
-}) => {
+const TranslationHelper: FC<TranslationHelperProps> = ({ transClass, transText, i18nArgs = null }) => {
   return (
     <Translation>
       {(t, {}) => {
@@ -38,25 +30,6 @@ const TranslationHelper: FC<TranslationHelperProps> = ({
             return i18nArgs
               ? t(TranslationClass.DEVELOPER + '.' + transText, i18nArgs)
               : t(TranslationClass.DEVELOPER + '.' + transText);
-          //Handle different messages in different class cases
-          case TranslationClass.WARN_THIRD_PARTY:
-            //Needed only for title and description
-            if (!transText.startsWith('button')) {
-              switch (warnType) {
-                case WarnThirdPartyType.REPO:
-                  return i18nArgs
-                    ? t(TranslationClass.WARN_THIRD_PARTY + '.' + transText + '_repo', i18nArgs)
-                    : t(TranslationClass.WARN_THIRD_PARTY + '.' + transText + '_repo');
-                case WarnThirdPartyType.ZIP:
-                  return i18nArgs
-                    ? t(TranslationClass.WARN_THIRD_PARTY + '.' + transText + '_zip', i18nArgs)
-                    : t(TranslationClass.WARN_THIRD_PARTY + '.' + transText + '_zip');
-              }
-            } else {
-              return i18nArgs
-                ? t(TranslationClass.WARN_THIRD_PARTY + '.' + transText, i18nArgs)
-                : t(TranslationClass.WARN_THIRD_PARTY + '.' + transText);
-            }
           default:
             logger.error('We should never fall in the default case!');
             return '';

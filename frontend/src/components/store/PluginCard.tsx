@@ -26,6 +26,7 @@ import {
 import { DisabledPlugin, InstallType, Plugin } from '../../plugin';
 import { requestPluginInstall } from '../../store';
 import { MergedStorePlugin, storeLabel } from '../../storeSources';
+import { UI_COLORS } from '../../utils/uiStyles';
 import RootInfoModal from '../modals/RootInfoModal';
 
 interface PluginCardProps {
@@ -92,11 +93,12 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
       <div
         className="deckyStoreCardInfo"
         style={{
-          width: 'calc(100% - 320px)', // The calc is here so that the info section doesn't expand into the image
+          flex: 1,
+          minWidth: 0,
           display: 'flex',
           flexDirection: 'column',
           justifyContent: 'space-between',
-          marginLeft: '1em',
+          marginLeft: '16px',
           gap: '10px',
         }}
       >
@@ -119,14 +121,16 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
             style={{
               marginRight: 'auto',
               fontSize: '1em',
+              maxWidth: '100%',
+              overflowWrap: 'anywhere',
             }}
           >
             {storePlugin.author}
-            <span style={{ marginLeft: '8px', fontSize: '12px', color: '#969696', whiteSpace: 'nowrap' }}>
+            <span style={{ marginLeft: '8px', fontSize: '12px', color: UI_COLORS.textSub, whiteSpace: 'nowrap' }}>
               {storeLabel(storePlugin.store)}
             </span>
             {!isNaN(updated.getTime()) && (
-              <span style={{ marginLeft: '8px', fontSize: '12px', color: '#1a9fff', whiteSpace: 'nowrap' }}>
+              <span style={{ marginLeft: '8px', fontSize: '12px', color: UI_COLORS.accentBlue, whiteSpace: 'nowrap' }}>
                 {/* React escapes the text; i18next escaping would show "/" in some date formats as "&#x2F;". */}
                 {t('PluginCard.plugin_updated', {
                   date: updated.toLocaleDateString(undefined, { dateStyle: 'medium' }),
@@ -139,7 +143,7 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
             className="deckyStoreCardDescription"
             style={{
               fontSize: '13px',
-              color: '#969696',
+              color: UI_COLORS.textSub,
               WebkitLineClamp: root ? '2' : '3',
               WebkitBoxOrient: 'vertical',
               overflow: 'hidden',
@@ -150,7 +154,7 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
               storePlugin.description
             ) : (
               <span>
-                <i style={{ color: '#666' }}>{t('PluginCard.plugin_no_desc')}</i>
+                <i style={{ color: UI_COLORS.textMuted }}>{t('PluginCard.plugin_no_desc')}</i>
               </span>
             )}
           </span>
@@ -165,9 +169,9 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
                 padding: '4px 4px 4px 10px',
                 fontSize: '13px',
                 fontWeight: 'bold',
-                color: '#fee75c',
-                background: 'rgba(254, 231, 92, 0.12)',
-                border: '1px solid rgba(254, 231, 92, 0.5)',
+                color: UI_COLORS.warning,
+                background: UI_COLORS.warningBg,
+                border: `1px solid ${UI_COLORS.warningBorder}`,
                 borderRadius: '4px',
               }}
             >
@@ -175,7 +179,7 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
               <span style={{ flexGrow: 1 }}>{t('PluginCard.plugin_full_access')}</span>
               <DialogButton
                 aria-label={t('PluginCard.plugin_full_access_info')}
-                style={{ width: 'auto', minWidth: 0, height: '26px', padding: '0 10px', color: '#fee75c' }}
+                style={{ width: 'auto', minWidth: 0, height: '26px', padding: '0 10px', color: UI_COLORS.warning }}
                 onClick={() => showModal(<RootInfoModal />)}
               >
                 <FaInfoCircle style={{ display: 'block' }} />
@@ -185,7 +189,7 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
           {storePlugin.shadowedByFailedStore && (
             <div
               className="deckyStoreCardDescription"
-              style={{ fontSize: '13px', color: '#e5a50a', marginTop: 'auto' }}
+              style={{ fontSize: '13px', color: UI_COLORS.warning, marginTop: 'auto' }}
             >
               <i>{t('PluginCard.plugin_store_shadowed')}</i>
             </div>
@@ -194,7 +198,7 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
         <div className="deckyStoreCardButtonRow">
           <PanelSectionRow>
             <Focusable
-              style={{ display: 'flex', gap: '5px', padding: 0 }}
+              style={{ display: 'flex', gap: '8px', padding: 0 }}
               navEntryPreferPosition={NavEntryPositionPreferences.MAINTAIN_X}
             >
               <div
@@ -260,7 +264,7 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
                         <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
                           {version.name}
                           {version.store && (version.store !== storePlugin.store || version.prerelease) && (
-                            <span style={{ fontSize: '11px', color: '#969696' }}>
+                            <span style={{ fontSize: '11px', color: UI_COLORS.textSub }}>
                               {version.prerelease ? t('PluginCard.plugin_prerelease') : storeLabel(version.store)}
                             </span>
                           )}

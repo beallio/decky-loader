@@ -93,6 +93,9 @@
         "plugin_updated": "Updated {{date}}",
         "plugin_version_label": "Plugin Version"
     },
+    "PluginDisableModal": {
+        "failed": "Could not disable {{name}}"
+    },
     "PluginInstallModal": {
         "close": "Close",
         "disabled": "The plugin will be re-enabled after installation",
@@ -374,6 +377,7 @@
         "error": "Error Installing PR",
         "header": "The following versions of Decky Loader are built from open third-party Pull Requests. The Decky Loader team has not verified their functionality or security, and they may be outdated.",
         "loading": "Loading open Pull Requests...",
+        "no_prs": "No open PRs found",
         "start_download_toast": "Downloading PR #{{id}}"
     },
     "TitleView": {
