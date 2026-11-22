@@ -26,10 +26,11 @@ That individual plugin failed to start cleanly, while Decky itself stayed online
 
 ## A plugin shows an error after switching to Steam Beta
 
-Newer Steam Client Beta builds migrated Gaming Mode's UI to Vite + Rolldown + LightningCSS and changed internal CSS class names and module bindings. While Decky automatically bridges plugins and keeps your other plugins running, a few older plugins expect older Steam style names.
+Steam Beta builds changed how Gaming Mode is built. Valve's change renamed almost all CSS class names and moved most React components and internal stores. Some plugins expect the old names.
 
-- Wait for the plugin author to release a Steam Beta update (check **Update plugins** in Decky Settings), **or**
-- Switch back to **Steam Stable** in Steam Settings -> **System** if you need that plugin immediately.
+- Decky itself works on Steam Stable and Steam Beta. No extra steps are needed.
+- A plugin may need an update from its author for Steam Beta. Open Decky settings -> **Plugins**, then select **Update plugins**.
+- If you need that plugin now, switch back to **Steam Stable** in Steam Settings -> **System**.
 
 ---
 
