@@ -135,7 +135,9 @@
     },
     "PluginListIndex": {
         "disable": "Disable",
+        "disable_all": "Disable all",
         "enable": "Enable",
+        "enable_all": "Enable all",
         "freeze": "Freeze updates",
         "hide": "Quick access: Hide",
         "no_plugin": "No plugins installed!",
@@ -264,6 +266,9 @@
         "other": {
             "header": "Other"
         },
+        "plugin_stores": {
+            "header": "Plugin stores"
+        },
         "sort_plugins": {
             "label": "Sort plugins alphabetically"
         },
@@ -369,14 +374,14 @@
         },
         "stores": {
             "desc": "When two stores have the same plugin, the higher store provides it. Press X to change the order.",
-            "label": "Plugin stores"
+            "label": "Stable Plugin Stores"
         },
         "url_label": "Store URL or GitHub repository (https://github.com/owner/repo)"
     },
     "Testing": {
         "download": "Download",
         "error": "Error Installing PR",
-        "header": "The following versions of Decky Loader are built from open third-party Pull Requests. The Decky Loader team has not verified their functionality or security, and they may be outdated.",
+        "header": "The following versions of Decky Loader are built from open third-party Pull Requests. They have not verified their functionality or security, and they may be outdated.",
         "loading": "Loading open Pull Requests...",
         "no_prs": "No open PRs found",
         "start_download_toast": "Downloading PR #{{id}}"
