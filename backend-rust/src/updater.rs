@@ -179,6 +179,7 @@ impl Updater {
             "repo": backend.config.release_repository.trim_matches('/'),
             // Releases are published from main; PR and development builds show their branch/state.
             "gitBranch": git_branch,
+            "gitPR": git_pr(version),
         })
     }
 
@@ -466,6 +467,12 @@ pub(crate) fn is_testing_pr_version(version: &str) -> bool {
     version.strip_prefix("PR-").is_some_and(|number| {
         !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
     })
+}
+
+fn git_pr(version: &str) -> Option<&str> {
+    version
+        .strip_prefix("PR-")
+        .filter(|_| is_testing_pr_version(version))
 }
 
 fn version_update_identity(version: &str) -> (bool, &str) {
@@ -1088,7 +1095,7 @@ fn io_failure(operation: &str, error: io::Error) -> RpcError {
 mod tests {
     use super::{
         RUST_BUNDLE_ASSET, RUST_CHECKSUM_ASSET, RUST_TESTING_ARTIFACT, bundle_release_version,
-        default_branch, filter_releases, is_testing_pr_version, parse_checksum_sidecar,
+        default_branch, filter_releases, git_pr, is_testing_pr_version, parse_checksum_sidecar,
         resolve_branch, rust_bundle_asset, rust_checksum_asset, rust_testing_artifact,
         secure_staging_directory, select_testing_workflow_run_id, stamp_testing_bundle_version,
         testing_bundle_paths, verify_bundle_digest, verify_testing_bundle_digest,
@@ -1377,6 +1384,15 @@ mod tests {
         assert_eq!(version_update_identity("PR-12"), (true, "PR-12"));
         assert_eq!(version_update_identity("dev"), (true, "dirty"));
         assert_eq!(version_update_identity("unknown"), (false, "dirty"));
+    }
+
+    #[test]
+    fn only_testing_versions_report_a_pull_request_number() {
+        assert_eq!(git_pr("PR-12"), Some("12"));
+        assert_eq!(git_pr("PR-"), None);
+        assert_eq!(git_pr("PR-abc"), None);
+        assert_eq!(git_pr("dev"), None);
+        assert_eq!(git_pr("v4.0.0-pre1"), None);
     }
 
     #[test]

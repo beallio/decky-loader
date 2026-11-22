@@ -732,7 +732,7 @@ impl Utilities {
                      enumerable: true,\n\
                      configurable: true,\n\
                      get: function() {{\n\
-                         return (GamepadNavTree?.m_context?.m_controller || FocusNavController)?.m_ActiveContext?.ActiveWindow || window;\n\
+                         return (window?.GamepadNavTree?.m_context?.m_controller || window?.FocusNavController)?.m_ActiveContext?.ActiveWindow || window;\n\
                      }}\n\
                  }});\n\
                  {source}\n\
