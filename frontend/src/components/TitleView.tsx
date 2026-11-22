@@ -14,7 +14,6 @@ const titleStyles: CSSProperties = {
   paddingRight: '16px',
   position: 'sticky',
   top: '0px',
-  ...(staticClasses.Title ? {} : { paddingLeft: '16px', minHeight: '40px', fontSize: '20px', fontWeight: 700 }),
 };
 
 const TitleView: FC = () => {

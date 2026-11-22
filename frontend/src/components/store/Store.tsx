@@ -10,7 +10,7 @@ import {
   SteamSpinner,
   Tabs,
   TextField,
-  findModule,
+  tabsClasses,
 } from '@decky/ui';
 import { Dispatch, FC, SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -44,11 +44,6 @@ const logger = new Logger('Store');
 const StorePage: FC<{}> = () => {
   const [currentTabRoute, setCurrentTabRoute] = useState<string>('browse');
   const [pluginCount, setPluginCount] = useState<number | null>(null);
-  const { TabCount } =
-    findModule((m) => {
-      if (m?.TabCount && m?.TabTitle) return true;
-      return false;
-    }) || {};
 
   const { t } = useTranslation();
 
@@ -72,25 +67,7 @@ const StorePage: FC<{}> = () => {
               content: <BrowseTab setPluginCount={setPluginCount} />,
               id: 'browse',
               renderTabAddon: () =>
-                pluginCount !== null ? (
-                  <span
-                    className={TabCount}
-                    style={
-                      TabCount
-                        ? undefined
-                        : {
-                            marginLeft: '6px',
-                            padding: '1px 6px',
-                            borderRadius: '10px',
-                            fontSize: '12px',
-                            background: 'rgba(255, 255, 255, 0.12)',
-                            color: UI_COLORS.textSub,
-                          }
-                    }
-                  >
-                    {pluginCount}
-                  </span>
-                ) : null,
+                pluginCount !== null ? <span className={tabsClasses.TabCount}>{pluginCount}</span> : null,
             },
             {
               title: t('Store.store_tabs.about'),

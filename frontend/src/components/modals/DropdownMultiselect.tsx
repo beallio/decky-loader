@@ -14,8 +14,7 @@ import { useTranslation } from 'react-i18next';
 import { FaChevronDown } from 'react-icons/fa';
 
 // TODO add to dfl
-const dropDownControlButtonClasses =
-  findModule((m: Module) => m?.DropDownControlButton && m?.['duration-app-launch']) || {};
+const dropDownControlButtonClasses = findModule((m: Module) => m?.DropDownControlButton && m?.['duration-app-launch']);
 
 const DropdownMultiselectItem: FC<
   {

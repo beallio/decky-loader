@@ -12,9 +12,9 @@
   "uv": "0.12.24",
   "pyinstaller": "6.22.3",
   "sdk": {
-    "tag": "v3.3.1",
-    "commit": "ffd103b9c1a4ce5bf305e7c0998eda6e05457dad",
-    "backend_tree": "81ed2982d16d21589b73e42e66c04ce19f8f5b5c",
-    "frontend_tree": "fe6ff83cf6582e573de5583737a4fab3eaa80577"
+    "tag": "v4.0.0-pre1",
+    "commit": "24082fe63cdcdf41993f9e1430d1405152a2c930",
+    "backend_tree": "6ad9769579f23b3ae8323b529cd3d07da20531d1",
+    "frontend_tree": "984904237945663c989aeef5955ec193d7ff673e"
   }
 }

@@ -1,5 +1,3 @@
-import { sleep } from '@decky/ui';
-
 import Logger from './logger';
 
 declare global {
@@ -233,7 +231,8 @@ export class WSRouter extends Logger {
 
   async onError(error: any) {
     this.error('WS DISCONNECTED', error);
-    await sleep(5000);
+    // Runs before window.DFL exists, so no DFL sleep.
+    await new Promise((r) => setTimeout(r, 5000));
     await this.connect();
   }
 

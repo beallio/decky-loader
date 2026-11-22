@@ -11,7 +11,7 @@ import {
   ToggleField,
   showModal,
 } from '@decky/ui';
-import { FC, useEffect, useRef, useState } from 'react';
+import { FC, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { FaFileArchive, FaLink, FaReact, FaSteamSymbol, FaTerminal } from 'react-icons/fa';
 
@@ -97,7 +97,6 @@ export default function DeveloperSettings() {
   const [enableValveInternal, setEnableValveInternal] = useSetting<boolean>('developer.valve_internal', false);
   const [reactDevtoolsEnabled, setReactDevtoolsEnabled] = useSetting<boolean>('developer.rdt.enabled', false);
   const [reactDevtoolsIP, setReactDevtoolsIP] = useSetting<string>('developer.rdt.ip', '');
-  const textRef = useRef<HTMLDivElement>(null);
   const { t } = useTranslation();
 
   const installFromZip = async () => {
@@ -188,18 +187,7 @@ export default function DeveloperSettings() {
         <ToggleField
           label={t('SettingsDeveloperIndex.react_devtools.label')}
           description={
-            <>
-              <span style={{ whiteSpace: 'pre-line' }}>{t('SettingsDeveloperIndex.react_devtools.desc')}</span>
-              <br />
-              <br />
-              <div ref={textRef}>
-                <TextField
-                  label={t('SettingsDeveloperIndex.react_devtools.ip_label')}
-                  value={reactDevtoolsIP}
-                  onChange={(e) => setReactDevtoolsIP(e?.target.value)}
-                />
-              </div>
-            </>
+            <span style={{ whiteSpace: 'pre-line' }}>{t('SettingsDeveloperIndex.react_devtools.desc')}</span>
           }
           icon={<FaReact style={{ display: 'block' }} />}
           checked={reactDevtoolsEnabled}
@@ -207,6 +195,11 @@ export default function DeveloperSettings() {
             setReactDevtoolsEnabled(toggleValue);
             setShouldConnectToReactDevTools(toggleValue);
           }}
+        />
+        <TextField
+          label={t('SettingsDeveloperIndex.react_devtools.ip_label')}
+          value={reactDevtoolsIP}
+          onChange={(e) => setReactDevtoolsIP(e?.target.value)}
         />
       </DialogControlsSection>
     </DialogBody>
