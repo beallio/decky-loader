@@ -47,7 +47,7 @@ const TestingInstallModal: FC<TestingInstallModalProps> = ({ version, onConfirm,
       bHideCloseIcon={loading}
       closeModal={closeModal}
       strTitle={version.name}
-      strOKButtonText={loading ? t('Testing.installing') : t('Testing.download')}
+      strOKButtonText={loading ? t('Testing.installing') : t('Testing.install')}
       onOK={async () => {
         setError(null);
         setReloading(false);
