@@ -286,6 +286,11 @@ impl Updater {
                     .get("updated_at")
                     .and_then(Value::as_str)
                     .ok_or_else(|| RpcError::failure("GitHub pull request has no updated_at"))?;
+                let author = pull
+                    .get("user")
+                    .and_then(|user| user.get("login"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::failure("GitHub pull request has no user.login"))?;
                 Ok(json!({
                     "id": id,
                     "name": name,
@@ -293,6 +298,7 @@ impl Updater {
                     "head_sha": head_sha,
                     "created_at": created_at,
                     "updated_at": updated_at,
+                    "author": author,
                 }))
             })
             .collect::<Result<Vec<_>, RpcError>>()

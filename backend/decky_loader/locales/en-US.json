@@ -379,12 +379,25 @@
         "url_label": "Store URL or GitHub repository (https://github.com/owner/repo)"
     },
     "Testing": {
+        "author": "by {{author}}",
         "download": "Download",
         "error": "Error Installing PR",
         "header": "The following versions of Decky Loader are built from open third-party Pull Requests. They are not verified for functionality or security, and they may be outdated.",
+        "installing": "Installing...",
+        "items": "Pull requests",
         "loading": "Loading open Pull Requests...",
         "no_prs": "No open PRs found",
         "opened": "Opened {{date}}",
+        "reloading": "Reloading Decky Loader...",
+        "sort": {
+            "author": "Author",
+            "number": "PR number",
+            "opened": "Opened",
+            "title": "Title",
+            "updated": "Updated"
+        },
+        "sort_ascending": "Sort ascending",
+        "sort_descending": "Sort descending",
         "start_download_toast": "Downloading PR #{{id}}",
         "updated": "Updated {{date}}"
     },
