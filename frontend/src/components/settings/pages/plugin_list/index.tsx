@@ -15,7 +15,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { FaDownload, FaEllipsisH, FaRecycle } from 'react-icons/fa';
 
-import { InstallType, enablePlugin } from '../../../../plugin';
+import { InstallType, disablePlugin, enablePlugin } from '../../../../plugin';
 import {
   StorePluginVersion,
   getPluginList,
@@ -50,6 +50,8 @@ type PluginTableData = PluginData & {
 };
 
 const reloadPluginBackend = DeckyBackend.callable<[pluginName: string], void>('loader/reload_plugin');
+
+const TOP_BUTTON_STYLE = { width: 'auto', display: 'flex', alignItems: 'center', gap: '8px' };
 
 function PluginInteractables(props: { entry: ReorderableEntry<PluginTableData> }) {
   const { t } = useTranslation();
@@ -161,6 +163,7 @@ type PluginData = {
 
 export default function PluginList({ isDeveloper }: { isDeveloper: boolean }) {
   const {
+    plugins,
     installedPlugins,
     disabledPlugins,
     updates,
@@ -181,6 +184,7 @@ export default function PluginList({ isDeveloper }: { isDeveloper: boolean }) {
   }, [installedPlugins, frozenPlugins]);
 
   const [pluginEntries, setPluginEntries] = useState<ReorderableEntry<PluginTableData>[]>([]);
+  const [bulkBusy, setBulkBusy] = useState(false);
   const hiddenPluginsService = DeckyPluginLoader.hiddenPluginsService;
   const frozenPluginsService = DeckyPluginLoader.frozenPluginsService;
 
@@ -243,10 +247,50 @@ export default function PluginList({ isDeveloper }: { isDeveloper: boolean }) {
     setPluginOrderSetting(newOrder);
   }
 
+  async function toggleAllPlugins(names: string[], enable: boolean) {
+    setBulkBusy(true);
+    // Sequential: enable/disable both reload plugins on the backend, so no concurrent reloads.
+    for (const name of names) {
+      try {
+        await (enable ? enablePlugin(name) : disablePlugin(name));
+      } catch (e) {
+        DeckyPluginLoader.toaster.toast({
+          title: t(enable ? 'PluginLoader.plugin_enable.error' : 'PluginLoader.plugin_disable.error', { name }),
+          body: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+    setBulkBusy(false);
+  }
+
   return (
     <DialogBody>
-      {updates && updates.size > 0 && (
-        <Focusable style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '12px' }}>
+      <Focusable style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginBottom: '12px' }}>
+        <DialogButton
+          disabled={bulkBusy || disabledPlugins.length === 0}
+          onClick={() =>
+            toggleAllPlugins(
+              disabledPlugins.map((plugin) => plugin.name),
+              true,
+            )
+          }
+          style={TOP_BUTTON_STYLE}
+        >
+          {t('PluginListIndex.enable_all')}
+        </DialogButton>
+        <DialogButton
+          disabled={bulkBusy || plugins.length === 0}
+          onClick={() =>
+            toggleAllPlugins(
+              plugins.map((plugin) => plugin.name),
+              false,
+            )
+          }
+          style={TOP_BUTTON_STYLE}
+        >
+          {t('PluginListIndex.disable_all')}
+        </DialogButton>
+        {updates && updates.size > 0 && (
           <DialogButton
             onClick={() =>
               requestMultiplePluginInstalls(
@@ -257,18 +301,13 @@ export default function PluginList({ isDeveloper }: { isDeveloper: boolean }) {
                 })),
               )
             }
-            style={{
-              width: 'auto',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '8px',
-            }}
+            style={TOP_BUTTON_STYLE}
           >
             {t('PluginListIndex.update_all', { count: updates.size })}
             <FaDownload style={{ display: 'block' }} />
           </DialogButton>
-        </Focusable>
-      )}
+        )}
+      </Focusable>
       <DialogControlsSection style={{ marginTop: 0 }}>
         <ReorderableList<PluginTableData>
           entries={pluginEntries}
