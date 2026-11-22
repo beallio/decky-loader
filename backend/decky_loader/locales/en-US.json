@@ -381,10 +381,12 @@
     "Testing": {
         "download": "Download",
         "error": "Error Installing PR",
-        "header": "The following versions of Decky Loader are built from open third-party Pull Requests. They have not verified their functionality or security, and they may be outdated.",
+        "header": "The following versions of Decky Loader are built from open third-party Pull Requests. They are not verified for functionality or security, and they may be outdated.",
         "loading": "Loading open Pull Requests...",
         "no_prs": "No open PRs found",
-        "start_download_toast": "Downloading PR #{{id}}"
+        "opened": "Opened {{date}}",
+        "start_download_toast": "Downloading PR #{{id}}",
+        "updated": "Updated {{date}}"
     },
     "TitleView": {
         "decky_store_desc": "Open Decky Store",
