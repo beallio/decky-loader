@@ -33,6 +33,8 @@ class TestingVersion(TypedDict):
     name: str
     link: str
     head_sha: str
+    created_at: str
+    updated_at: str
 
 class Updater:
     def __init__(self, context: PluginManager) -> None:
@@ -302,6 +304,8 @@ class Updater:
                         "name": pr['title'],
                         "link":  pr['html_url'],
                         "head_sha": pr['head']['sha'],
+                        "created_at": pr['created_at'],
+                        "updated_at": pr['updated_at'],
                     })
         return result
 
