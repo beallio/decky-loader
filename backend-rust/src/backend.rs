@@ -297,6 +297,12 @@ impl Backend {
                 self.registry.reload(string(&args, 0)?).await?;
                 Ok(Value::Null)
             }
+            // The frontend's module resolver hands over the V8 scope object id it stores in the page.
+            "instrumentation/resolve_scope" => {
+                exact(&args, 1)?;
+                self.cef.resolve_scope(integer(&args, 0)?).await?;
+                Ok(Value::Null)
+            }
             "utilities/ping" => {
                 exact(&args, 0)?;
                 Ok(json!("pong"))
@@ -402,6 +408,12 @@ pub(crate) fn string(args: &[Value], index: usize) -> Result<&str, RpcError> {
         .ok_or_else(|| RpcError::invalid(format!("argument {index} must be a string")))
 }
 
+fn integer(args: &[Value], index: usize) -> Result<u64, RpcError> {
+    args.get(index)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| RpcError::invalid(format!("argument {index} must be an integer")))
+}
+
 fn missing_route(route: &str) -> RpcError {
     RpcError::Error {
         name: "RouteNotFoundError".into(),
@@ -500,6 +512,26 @@ mod tests {
 
         backend.initialize_plugin_order().await.unwrap();
         assert_eq!(backend.setting("pluginOrder", json!(null)).await, json!([]));
+        registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_scope_requires_one_integer_argument() {
+        let directory = TestDirectory::new("decky-resolve-scope-args");
+        let (registry, backend) = test_backend(&directory).await;
+
+        let error = backend
+            .dispatch("instrumentation/resolve_scope", vec![json!("7")])
+            .await
+            .unwrap_err();
+        assert_eq!(error.message(), "argument 0 must be an integer");
+
+        let error = backend
+            .dispatch("instrumentation/resolve_scope", vec![json!(1), json!(2)])
+            .await
+            .unwrap_err();
+        assert_eq!(error.message(), "expected 1 arguments, received 2");
+
         registry.shutdown().await;
     }
 
