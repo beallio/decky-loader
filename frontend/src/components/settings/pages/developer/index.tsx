@@ -93,6 +93,16 @@ const PluginURLModal: FC<{ closeModal?(): void }> = ({ closeModal }) => {
   );
 };
 
+// Same input behavior as Steam's Settings > Internet manual IPv4 fields.
+const isValidIPv4Input = (value: string) => {
+  const octets = value.split('.');
+  if (octets.length > 4) return false;
+  return octets.every((octet, i) => {
+    if (octet === '') return i === octets.length - 1;
+    return /^\d+$/.test(octet) && Number(octet) <= 255;
+  });
+};
+
 export default function DeveloperSettings() {
   const [enableValveInternal, setEnableValveInternal] = useSetting<boolean>('developer.valve_internal', false);
   const [reactDevtoolsEnabled, setReactDevtoolsEnabled] = useSetting<boolean>('developer.rdt.enabled', false);
@@ -198,8 +208,12 @@ export default function DeveloperSettings() {
         />
         <TextField
           label={t('SettingsDeveloperIndex.react_devtools.ip_label')}
+          placeholder="   .   .   .   "
           value={reactDevtoolsIP}
-          onChange={(e) => setReactDevtoolsIP(e?.target.value)}
+          onChange={(e) => {
+            if (isValidIPv4Input(e.target.value)) setReactDevtoolsIP(e.target.value);
+            else e.target.value = reactDevtoolsIP;
+          }}
         />
       </DialogControlsSection>
     </DialogBody>

@@ -29,6 +29,9 @@ export default function GeneralSettings({
       <DialogControlsSection>
         <DialogControlsSectionHeader>{t('SettingsGeneralIndex.beta.header')}</DialogControlsSectionHeader>
         <BranchSelect />
+      </DialogControlsSection>
+      <DialogControlsSection>
+        <DialogControlsSectionHeader>{t('SettingsGeneralIndex.plugin_stores.header')}</DialogControlsSectionHeader>
         <StoreSelect />
       </DialogControlsSection>
       <DialogControlsSection>
