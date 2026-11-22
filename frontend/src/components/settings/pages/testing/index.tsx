@@ -3,19 +3,22 @@ import {
   DialogButton,
   DialogControlsSection,
   DialogControlsSectionHeader,
-  Field,
   Focusable,
+  Menu,
+  MenuItem,
   NavEntryPositionPreferences,
   Navigation,
-  ProgressBar,
   SteamSpinner,
+  showContextMenu,
+  showModal,
 } from '@decky/ui';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { FaDownload, FaFlask, FaInfo } from 'react-icons/fa';
+import { FaCaretDown, FaClock, FaDownload, FaInfo, FaSortAmountDownAlt, FaSortAmountUpAlt } from 'react-icons/fa';
 
 import { setSetting } from '../../../../utils/settings';
 import { ICON_BUTTON_STYLE, UI_COLORS } from '../../../../utils/uiStyles';
+import TestingInstallModal from '../../../modals/TestingInstallModal';
 import { UpdateBranch } from '../general/BranchSelect';
 
 interface TestingVersion {
@@ -25,7 +28,10 @@ interface TestingVersion {
   head_sha: string;
   created_at: string;
   updated_at: string;
+  author: string;
 }
+
+type SortField = 'updated' | 'opened' | 'number' | 'author' | 'title';
 
 const formatDate = (iso: string) =>
   new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
@@ -38,8 +44,8 @@ export default function TestingVersionList() {
 
   const [testingVersions, setTestingVersions] = useState<TestingVersion[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
-  const [updateProgress, setUpdateProgress] = useState<number | null>(null);
-  const [reloading, setReloading] = useState<boolean>(false);
+  const [sortField, setSortField] = useState<SortField>('updated');
+  const [sortDescending, setSortDescending] = useState<boolean>(true);
 
   useEffect(() => {
     (async () => {
@@ -48,20 +54,88 @@ export default function TestingVersionList() {
     })();
   }, []);
 
-  useEffect(() => {
-    const a = DeckyBackend.addEventListener('updater/update_download_percentage', (percentage) => {
-      setUpdateProgress(percentage);
-    });
-
-    const b = DeckyBackend.addEventListener('updater/finish_download', () => {
-      setReloading(true);
-    });
-
-    return () => {
-      DeckyBackend.removeEventListener('updater/update_download_percentage', a);
-      DeckyBackend.removeEventListener('updater/finish_download', b);
+  const sortedVersions = useMemo(() => {
+    const primaryValue = (version: TestingVersion): number | string => {
+      switch (sortField) {
+        case 'opened':
+          return new Date(version.created_at).getTime();
+        case 'number':
+          return version.id;
+        case 'author':
+          return version.author.toLowerCase();
+        case 'title':
+          return version.name.toLowerCase();
+        case 'updated':
+        default:
+          return new Date(version.updated_at).getTime();
+      }
     };
-  }, []);
+
+    return [...testingVersions].sort((a, b) => {
+      const aValue = primaryValue(a);
+      const bValue = primaryValue(b);
+      const comparison =
+        typeof aValue === 'number' && typeof bValue === 'number'
+          ? aValue - bValue
+          : String(aValue).localeCompare(String(bValue));
+      if (comparison !== 0) {
+        return sortDescending ? -comparison : comparison;
+      }
+      // Fork: equal sort values stay newest-PR-first.
+      return b.id - a.id;
+    });
+  }, [testingVersions, sortField, sortDescending]);
+
+  const sortValue = (version: TestingVersion): string => {
+    switch (sortField) {
+      case 'opened':
+        return formatDate(version.created_at);
+      case 'updated':
+        return formatDate(version.updated_at);
+      case 'author':
+        return version.author;
+      case 'number':
+      case 'title':
+      default:
+        return '#' + version.id;
+    }
+  };
+
+  const sortOptions: { label: string; data: SortField }[] = [
+    { label: t('Testing.sort.updated'), data: 'updated' },
+    { label: t('Testing.sort.opened'), data: 'opened' },
+    { label: t('Testing.sort.number'), data: 'number' },
+    { label: t('Testing.sort.author'), data: 'author' },
+    { label: t('Testing.sort.title'), data: 'title' },
+  ];
+
+  const sortLabel = t(`Testing.sort.${sortField}`);
+
+  const openSortMenu = (target: EventTarget | null) => {
+    showContextMenu(
+      <Menu label={t('Testing.items')}>
+        {sortOptions.map((option) => (
+          <MenuItem key={option.data} selected={option.data === sortField} onSelected={() => setSortField(option.data)}>
+            {option.label}
+          </MenuItem>
+        ))}
+      </Menu>,
+      target ?? window,
+    );
+  };
+
+  const openInstallModal = (version: TestingVersion) => {
+    showModal(
+      <TestingInstallModal
+        version={version}
+        onConfirm={async () => {
+          await downloadTestingVersion(version.id, version.head_sha);
+          // Fork: switch the branch only when the download worked.
+          setSetting('branch', UpdateBranch.Testing);
+        }}
+      />,
+    );
+  };
 
   if (loading) {
     return (
@@ -81,76 +155,142 @@ export default function TestingVersionList() {
 
   return (
     <DialogBody>
-      {updateProgress !== null && <ProgressBar nProgress={updateProgress} indeterminate={reloading} />}
       <DialogControlsSection>
         <DialogControlsSectionHeader>{t('Testing.header')}</DialogControlsSectionHeader>
-        <ul style={{ listStyleType: 'none', padding: '0' }}>
-          {testingVersions.map((version) => {
+        <Focusable style={{ display: 'flex', alignItems: 'center', padding: '8px 8px 0' }}>
+          <span
+            style={{
+              color: UI_COLORS.textPrimary,
+              fontSize: '16px',
+              fontWeight: 500,
+              lineHeight: '20px',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {t('Testing.items')}
+          </span>
+          <span
+            style={{
+              color: UI_COLORS.textSub,
+              fontSize: '16px',
+              fontWeight: 500,
+              lineHeight: '20px',
+              marginLeft: '8px',
+            }}
+          >
+            {testingVersions.length}
+          </span>
+          <div
+            aria-hidden="true"
+            style={{
+              flexGrow: 1,
+              height: '2px',
+              margin: '0 10px',
+              backgroundColor: 'rgba(103, 112, 123, 0.3)',
+            }}
+          />
+          <Focusable
+            onClick={(e) => openSortMenu(e.currentTarget)}
+            onOKButton={(e) => openSortMenu(e.currentTarget)}
+            focusClassName="decky-testing-focus"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              height: '28px',
+              padding: '4px 0',
+              marginTop: '1px',
+              cursor: 'pointer',
+            }}
+          >
+            <FaCaretDown size={16} style={{ margin: '2px 8px 2px 0', flexShrink: 0 }} />
+            <span style={{ fontSize: '16px', lineHeight: '20px', whiteSpace: 'nowrap' }}>{sortLabel}</span>
+          </Focusable>
+          <Focusable
+            onClick={() => setSortDescending((descending) => !descending)}
+            onOKButton={() => setSortDescending((descending) => !descending)}
+            focusClassName="decky-testing-focus"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: '28px',
+              height: '28px',
+              marginLeft: '13px',
+              flexShrink: 0,
+              cursor: 'pointer',
+            }}
+          >
+            {sortDescending ? (
+              <FaSortAmountDownAlt role="img" aria-label={t('Testing.sort_descending')} size={16} />
+            ) : (
+              <FaSortAmountUpAlt role="img" aria-label={t('Testing.sort_ascending')} size={16} />
+            )}
+          </Focusable>
+        </Focusable>
+        <ul style={{ listStyleType: 'none', padding: '0', margin: '0' }}>
+          {sortedVersions.map((version) => {
             return (
               <li key={`${version.id}_${version.name}`}>
-                <Field
-                  label={
-                    <>
-                      <div>
-                        {version.name}
-                        <div style={{ color: UI_COLORS.textSub, fontSize: '12px' }}>
-                          {t('Testing.opened', { date: formatDate(version.created_at) })}
-                          {' · '}
-                          {t('Testing.updated', { date: formatDate(version.updated_at) })}
-                        </div>
-                      </div>
-                      <span
-                        style={{
-                          color: UI_COLORS.textSub,
-                          whiteSpace: 'nowrap',
-                          marginLeft: 'auto',
-                          alignSelf: 'center',
-                        }}
-                      >
-                        {'#' + version.id}
-                      </span>
-                    </>
-                  }
-                >
-                  <Focusable
-                    style={{ height: '40px', marginLeft: 'auto', display: 'flex', gap: '8px' }}
-                    navEntryPreferPosition={NavEntryPositionPreferences.MAINTAIN_X}
-                  >
-                    <DialogButton
-                      style={{ height: '40px', minWidth: '60px' }}
-                      onClick={async () => {
-                        const downloadToast = DeckyPluginLoader.toaster.toast({
-                          title: t('Testing.start_download_toast', { id: version.id }),
-                          body: null,
-                          icon: <FaFlask />,
-                        });
-                        try {
-                          await downloadTestingVersion(version.id, version.head_sha);
-                          downloadToast.dismiss();
-                          // Fork: switch the branch only when the download worked.
-                          setSetting('branch', UpdateBranch.Testing);
-                        } catch (e) {
-                          if (e instanceof Error) {
-                            DeckyPluginLoader.toaster.toast({
-                              title: t('Testing.error'),
-                              body: `${e.name}: ${e.message}`,
-                              icon: <FaFlask />,
-                            });
-                          }
-                        }
+                <div style={{ display: 'flex', alignItems: 'center', minHeight: '58px', padding: '6px 8px' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+                    <div
+                      style={{
+                        color: UI_COLORS.textPrimary,
+                        fontSize: '16px',
+                        fontWeight: 500,
+                        lineHeight: '20px',
+                        marginBottom: '4px',
                       }}
                     >
-                      <div
+                      {version.name}
+                    </div>
+                    <div
+                      style={{
+                        color: UI_COLORS.textSub,
+                        fontSize: '12px',
+                        fontWeight: 700,
+                        lineHeight: '22px',
+                        letterSpacing: '0.5px',
+                        textTransform: 'uppercase',
+                      }}
+                    >
+                      {t('Testing.author', { author: version.author })}
+                      {' · '}
+                      <FaClock
+                        size={16}
                         style={{
-                          display: 'flex',
-                          minWidth: '150px',
-                          justifyContent: 'space-between',
-                          alignItems: 'center',
+                          display: 'inline-block',
+                          verticalAlign: '-3px',
+                          color: UI_COLORS.textBody,
+                          marginRight: '4px',
                         }}
-                      >
-                        {t('Testing.download')}
-                        <FaDownload style={{ paddingLeft: '1rem' }} />
-                      </div>
+                      />
+                      {t('Testing.opened', { date: formatDate(version.created_at) })}
+                      {' · '}
+                      {t('Testing.updated', { date: formatDate(version.updated_at) })}
+                    </div>
+                  </div>
+                  <span
+                    style={{
+                      color: UI_COLORS.textPrimary,
+                      fontSize: '12px',
+                      fontWeight: 700,
+                      lineHeight: '22px',
+                      letterSpacing: '0.5px',
+                      textTransform: 'uppercase',
+                      whiteSpace: 'nowrap',
+                      margin: '0 8px',
+                      flexShrink: 0,
+                    }}
+                  >
+                    {sortValue(version)}
+                  </span>
+                  <Focusable
+                    style={{ display: 'flex', gap: '8px', height: '40px', flexShrink: 0 }}
+                    navEntryPreferPosition={NavEntryPositionPreferences.MAINTAIN_X}
+                  >
+                    <DialogButton style={ICON_BUTTON_STYLE} onClick={() => openInstallModal(version)}>
+                      <FaDownload role="img" aria-label={t('Testing.download')} style={{ display: 'block' }} />
                     </DialogButton>
                     <DialogButton
                       style={ICON_BUTTON_STYLE}
@@ -159,12 +299,19 @@ export default function TestingVersionList() {
                       <FaInfo style={{ display: 'block' }} />
                     </DialogButton>
                   </Focusable>
-                </Field>
+                </div>
               </li>
             );
           })}
         </ul>
       </DialogControlsSection>
+      <style>{`
+.decky-testing-focus {
+  outline: 2px solid rgba(255, 255, 255, 0.8);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+`}</style>
     </DialogBody>
   );
 }
