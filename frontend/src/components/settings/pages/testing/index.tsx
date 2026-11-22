@@ -4,12 +4,12 @@ import {
   DialogControlsSection,
   DialogControlsSectionHeader,
   Focusable,
+  IconsModule,
   Menu,
   MenuItem,
   NavEntryPositionPreferences,
   Navigation,
   SteamSpinner,
-  findModuleExport,
   showContextMenu,
   showModal,
 } from '@decky/ui';
@@ -46,14 +46,11 @@ type SortField = 'updated' | 'opened' | 'number' | 'author' | 'title';
 const formatDate = (iso: string) =>
   new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 
-// Fork: Steam's own SVG icon components carry stable class names in their source.
-// SVGIcon_User lives in sp.js and is not indexed on Steam beta; the friends person icon is.
-const findSteamIcon = (className: string) =>
-  findModuleExport((e) => typeof e === 'function' && String(e).includes(className)) as ComponentType | undefined;
-
-const SteamAuthorIcon = findSteamIcon('SVGIcon_User') ?? findSteamIcon('SVGIcon_FriendIcon');
-const SteamClockIcon = findSteamIcon('SVGIcon_Clock');
-const SteamUpdatedIcon = findSteamIcon('SVGIcon_Reload');
+// Fork: Steam's own icons from @decky/ui's IconsModule (beta: the icon registry; Stable: the Webpack icon module).
+const steamIcons = IconsModule as Record<string, ComponentType | undefined> | undefined;
+const SteamAuthorIcon = steamIcons?.User;
+const SteamClockIcon = steamIcons?.Clock;
+const SteamUpdatedIcon = steamIcons?.Reload;
 
 const getTestingVersions = DeckyBackend.callable<[], TestingVersion[]>('updater/get_testing_versions');
 const downloadTestingVersion = DeckyBackend.callable<[pr_id: number, sha: string]>('updater/download_testing_version');
