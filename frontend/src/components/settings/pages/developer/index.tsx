@@ -206,15 +206,16 @@ export default function DeveloperSettings() {
             setShouldConnectToReactDevTools(toggleValue);
           }}
         />
-        <TextField
-          label={t('SettingsDeveloperIndex.react_devtools.ip_label')}
-          placeholder="   .   .   .   "
-          value={reactDevtoolsIP}
-          onChange={(e) => {
-            if (isValidIPv4Input(e.target.value)) setReactDevtoolsIP(e.target.value);
-            else e.target.value = reactDevtoolsIP;
-          }}
-        />
+        <Field label={t('SettingsDeveloperIndex.react_devtools.ip_label')} childrenContainerWidth="fixed">
+          <TextField
+            placeholder="   .   .   .   "
+            value={reactDevtoolsIP}
+            onChange={(e) => {
+              if (isValidIPv4Input(e.target.value)) setReactDevtoolsIP(e.target.value);
+              else e.target.value = reactDevtoolsIP;
+            }}
+          />
+        </Field>
       </DialogControlsSection>
     </DialogBody>
   );
