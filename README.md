@@ -3,9 +3,11 @@
 Decky Loader adds plugins to Gaming Mode on the Steam Deck and Linux gaming PCs. Plugins can [restyle menus](https://github.com/suchmememanyskill/SDH-CssLoader), [change system sounds](https://github.com/EMERALD0874/SDH-AudioLoader), [adjust colors](https://github.com/libvibrant/vibrantDeck), and more.
 
 > [!IMPORTANT]
-> **Works with newer Steam Beta updates.** Newer Steam Client Beta updates changed how Gaming Mode is built, which stops the official Decky Loader from starting. This fork adapts automatically so Decky and most plugins keep working on both Steam Stable and Steam Beta, with no extra steps.
+> **Works on Steam Stable and Steam Beta.** Steam Client Beta updates changed how Gaming Mode is built. This stops the official Decky Loader from starting. The newest test version of the official Decky Loader works only on Steam Beta.
 >
-> With Steam Deck `publicbeta` `1795048523` (changelist `11255874`), released Nov. 18, 2026, Valve migrated `steamui` from Webpack to Vite + Rolldown + LightningCSS. This resulted in a rare change to nearly all CSS class names, and most React components and internal stores moving from stable Webpack module IDs to minified chunk bindings.  Certain plugins may not work on Beta if they have not updated to accommodate this migration.
+> This Decky works on both Steam Stable and Steam Beta in the same release. You can switch Steam channels and keep Decky running, with no extra steps.
+>
+> Steam Deck `publicbeta` `1795048523` (changelist `11255874`), released Nov. 18, 2026, changed the build system that Gaming Mode uses. This rare change renamed almost all CSS class names and moved most React components and internal stores. Some plugins need an update from their author before they work on Steam Beta. On Steam Stable they work as before.
 
 This is an independent fork of [SteamDeckHomebrew/decky-loader](https://github.com/SteamDeckHomebrew/decky-loader). Gaming Mode looks and works the same and your existing plugins keep working, while the background service is rebuilt in Rust to run lighter, faster, and under your normal user account instead of `root`.
 
@@ -67,7 +69,7 @@ This is an independent fork of [SteamDeckHomebrew/decky-loader](https://github.c
 | **[For Plugin Authors](docs/guides/plugin-authors.md)** | `root` permissions, `decky.native.dumps`, Rust plugin backends, Steam Beta compatibility |
 | **[Development](docs/development.md)** | Building from source, Rust runtime packaging, native plugin backend SDK, testing |
 | **[Root Plugin Host Design](docs/root-plugin-host.md)** | Architecture, socket activation, control protocol, and threat model |
-| **[Vite SteamUI Hooking](docs/vite-esm-hooking.md)** | Technical design and component discovery for Vite + Rolldown SteamUI builds |
+| **[Steam UI Plugin Hooking](docs/vite-esm-hooking.md)** | How plugin finders behave on Steam Stable and Steam Beta, and how to find Steam components |
 
 ## Credits
 

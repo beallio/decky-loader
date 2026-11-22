@@ -47,12 +47,22 @@ You can ship a native compiled backend (such as Rust) instead of `main.py`, elim
 
 ## Steam Beta (Vite / Rolldown) Frontend Compatibility
 
-On newer Steam Client Beta builds (Webpack -> Vite + Rolldown + LightningCSS migration), Decky automatically bridges `@decky/ui` components and webpack compatibility shims so most plugins run seamlessly on both Steam Stable and Steam Beta.
+Steam Beta builds run Gaming Mode as native ES modules (Vite + Rolldown + Oxc + LightningCSS). Steam Stable still uses Webpack. One Decky release runs on both clients.
 
-- If your plugin inspects internal Steam CSS style objects directly from JavaScript, guard against missing keys/objects (LightningCSS tree-shaking/renaming).
-- For patterns, safe component discovery, and testing on Vite SteamUI builds, see:
-  - [Newer SteamUI (Vite / Rolldown) compatibility](../development.md#newer-steamui-vite--rolldown-compatibility)
-  - [Vite / Rolldown SteamUI Hooking Review & Component Discovery Guide](../vite-esm-hooking.md)
+Plugins get the same `@decky/ui` API that Official Decky gives them on each client:
+
+| Steam client | `@decky/ui` version | Same as |
+|---|---|---|
+| Steam Beta (ES modules) | `@decky/ui` 5 | Official Decky `v4.0.0-pre1` |
+| Steam Stable (Webpack) | `@decky/ui` 4.16.4 plus the 5.x finder names | Official Decky `v3.3.1` plus shims |
+
+- **Use the finder names from `@decky/ui` 5.** On Steam Beta, `findVar` finds module-scope bindings. On Steam Stable, `findVar` finds exported values only, because Webpack has no module scopes. Guard the result against `undefined`.
+- **Match Steam source text in both quote forms.** Webpack prints `"text"`. The Oxc minifier on Steam Beta prints `` `text` ``. A finder that matches one form can fail on the other client:
+  ```ts
+  /controller:[`"]notification[`"],method:/
+  ```
+- **Guard Steam CSS class objects.** LightningCSS removes or renames most class names in the JavaScript on Steam Beta. Check for missing keys and objects.
+- For patterns, safe component discovery, and testing on Steam Beta, see the [Steam UI plugin hooking guide](../vite-esm-hooking.md).
 
 ---
 
@@ -62,4 +72,4 @@ To build the loader, run tests, or inspect internal architecture:
 
 - [Development Guide](../development.md)
 - [Root Plugin Host Design](../root-plugin-host.md)
-- [Vite / Rolldown SteamUI Hooking Guide](../vite-esm-hooking.md)
+- [Steam UI Plugin Hooking Guide](../vite-esm-hooking.md)

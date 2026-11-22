@@ -132,7 +132,7 @@ The output directory must not already exist. A successful build produces:
 
 The manifest records source hashes, tool and package versions, and the Rust release identity. These records support repeatable builds; they do not promise byte-for-byte identical binaries on different hosts. Developer tools and tests are build inputs, not installed runtime payloads.
 
-The Python plugin support code and frontend are based on upstream `v3.3.1` (see `sdk` in [build-config.json](../backend-rust/build-config.json)). Bundle assembly verifies the pinned upstream baseline, records the worker startup changes, and checks packaged helper code against its source. The Rust release identity is separate; `dev` builds do not offer updates. CI fetches the upstream SDK tag and verifies its pinned commit and source hashes, so a fork does not need its own copy of that tag. On the device, the installer checks only what protects the device: file checksums, safe paths and permissions, the release identity, and that the new runtime starts. It does not check build facts such as the upstream base, the Python version or the worker packaging; CI checks those before release.
+The Python plugin support code and frontend are based on upstream `v4.0.0-pre1` (see `sdk` in [build-config.json](../backend-rust/build-config.json)). Bundle assembly verifies the pinned upstream baseline, records the worker startup changes, and checks packaged helper code against its source. The Rust release identity is separate; `dev` builds do not offer updates. CI fetches the upstream SDK tag and verifies its pinned commit and source hashes, so a fork does not need its own copy of that tag. On the device, the installer checks only what protects the device: file checksums, safe paths and permissions, the release identity, and that the new runtime starts. It does not check build facts such as the upstream base, the Python version or the worker packaging; CI checks those before release.
 
 An update in Decky starts the installed `install.py` with `queue-install-bundle`. That installer checks the new bundle's `install.py` against the bundle checksum and hands the command over to it, so each release checks and sets up itself, including the service command line. Releases up to `v3.3.0-rust.1-rc.14` do not hand over; they install with their own code. Keep the `queue-install-bundle` and `release-queued` options and their JSON replies compatible, because older loaders still call them. The `Runtime Release` workflow checks each new bundle with the newest published release's installer before it publishes.
 
@@ -254,6 +254,8 @@ The report has four parts:
 
 To run the check yourself, use `python3 scripts/runtime/upstream_check.py`. It prints JSON. Give a Git remote or path as an argument to use another source.
 
+Add `--tag TAG` to compare against one exact tag. The tag must be `vX.Y.Z` or `vX.Y.Z-preN`. Use this option to measure a prerelease while the pin is a stable release, or to test a candidate tag before you change the pin.
+
 To move to a new upstream tag:
 
 1. Fetch the tag: `git fetch --no-tags https://github.com/SteamDeckHomebrew/decky-loader.git refs/tags/vX.Y.Z:refs/tags/vX.Y.Z`.
@@ -265,23 +267,58 @@ To move to a new upstream tag:
 
 ### UI library
 
-The frontend uses `@decky/ui` (decky-frontend-lib). Keep the version that the pinned SDK tag locks in `frontend/pnpm-lock.yaml`; `frontend/package.json` and the lockfile are upstream files, so a different version needs `SDK_OVERLAYS` entries. The `Upstream UI Library` workflow runs every day and can be started by hand. It compares the locked version with upstream `main` and the newest upstream release. When either differs, it opens one issue with the `upstream-ui` label and updates it on later runs. When both match again, it closes the issue.
+The frontend has three `@decky/ui` entries:
 
-The loader sets `window.DFL` to its own copy of `@decky/ui`, and plugins read the library from there at runtime. A new version that removes exports breaks plugins built against the old one. Compared with 4.15.1, version 4.16.4 no longer exports these values from the package root, so [index.ts](../frontend/src/index.ts) adds them back on `window.DFL`:
+| Package | Version | Role |
+| --- | --- | --- |
+| `@decky/ui` | 5.x | Types for loader code. The `dfl-global` rule replaces this import at build time. |
+| `@decky/ui-v5` | 5.0.1 | Runtime library that the ES module client boots. |
+| `@decky/ui-legacy` | 4.16.4 | Runtime library that the Webpack client boots. |
 
-| Missing export | Source in 4.16.4 `dist` |
+Keep the versions that the pinned SDK tag locks in `frontend/pnpm-lock.yaml`; `frontend/package.json` and the lockfile are upstream files, so a different version needs `SDK_OVERLAYS` entries. The `Upstream UI Library` workflow runs every day and can be started by hand. It compares the locked `@decky/ui` version with upstream `main` and the newest upstream release. When either differs, it opens one issue with the `upstream-ui` label and updates it on later runs. When both match again, it closes the issue.
+
+The `dfl-global` rule in [rollup.config.js](../frontend/rollup.config.js) maps the bare import `@decky/ui` to `window.DFL`. Loader code therefore reads the library at runtime, as plugins do. Code that runs before `window.DFL` exists must not import `@decky/ui`, directly or through a static import. The build fails if [index.ts](../frontend/src/index.ts), [wsrouter.ts](../frontend/src/wsrouter.ts), [logger.ts](../frontend/src/logger.ts), or a file in `frontend/src/stable/` does this. Those files import `@decky/ui-v5` or `@decky/ui-legacy` when they need the real library.
+
+A new library version that removes exports breaks plugins built against the old one. Neither 4.16.4 nor 5.x exports these values from the package root, so [index.ts](../frontend/src/index.ts) adds them on `window.DFL` on both clients:
+
+| Missing export | Source |
 |---|---|
 | `EResult`, `EUIComposition` | `globals/steam-client/shared.js` |
 | `QuickAccessTab.Music` (7) | renamed `Soundtrack` in `globals/stores/steamuistore/menu.js` |
 
 `window.DFL` is a frozen module namespace, and some exports are `let` bindings that change later (`modules`, `Navigation`). Do not copy it with spread; add the aliases on an object that has the namespace as its prototype. When the locked version changes, compare its root exports and enum members with the previous version and update the aliases.
 
-### Newer SteamUI (Vite / Rolldown) compatibility
+### Steam clients: ES modules and Webpack
 
-Steam Deck `publicbeta` builds starting at `1795048523` (`CLSTAMP` `11255874`) replaced Webpack with Vite + Rolldown ES modules, removing `window.webpackChunksteamui` and tree-shaking ~85% of CSS class-name objects out of JavaScript.
+Steam Beta loads the Steam UI as native ES modules (Vite/Rolldown, Oxc minifier). Steam Stable still loads it as Webpack chunks. Upstream `v4.0.0-pre1` supports only the ES module client. This fork supports both clients in one release.
 
-- **Detection and Stable isolation (`backend-rust/src/cef.rs`):** `SharedJSContext` is treated as Vite only when `script[type="module"][src*="library.js"]` is present. SteamOS Stable uses classic `<script defer src="/library.js">`, so Stable skips the Vite shim, import map, `/steamui/` route, and page reload completely.
-- **ESM import map and `/steamui/{*path}` proxy (`backend-rust/src/vite_esm.rs`, `backend-rust/src/transport.rs`):** SteamOS CEF serves `https://steamloopback.host/*` through a custom in-process resource handler that bypasses CDP `Fetch.enable`. On Vite pages, `cef.rs` installs a pre-document shim (`Page.addScriptToEvaluateOnNewDocument`) that injects a `<script type="importmap">` mapping `https://steamloopback.host/` to `http://localhost:1337/steamui/` while pinning `http://localhost:1337/steamui/library.js?...` back to `https://steamloopback.host/library.js?...` so `library.js` and its React Contexts are never instantiated twice. `cef.rs` then reloads `SharedJSContext` once if `window.__DECKY_ESM__` is empty.
-- **Module registration and caching:** `transport.rs` serves `.js` files from Steam's local `steamui/` directory with an appended live getter/setter footer for every top-level mutable `var`/`let`/`function` declaration (computed in parallel with `spawn_blocking` and cached by `(path, size, mtime)`). Non-JS requests (CSS, `/custom_fonts/clientui.uifont`, images) return `302 Found` to `https://steamloopback.host/{path}`. The shim exposes `globalThis.__DECKY_ESM__` through a `window.webpackChunksteamui` compatibility proxy (skipping React `$$typeof` objects so `forwardRef`/`memo` components are not duplicated as module namespaces) and normalizes simple Oxc template literals and `let{` destructuring in `Function.prototype.toString`.
-- **Frontend Webpack-first fallbacks (`frontend/rollup.config.js`, `frontend/src/errorboundary-hook.tsx`, `frontend/src/components/modals/DropdownMultiselect.tsx`):** `@decky/ui` finders whose Webpack CSS class modules were inlined away (`IconsModule`, `PanelSection`, `PanelSectionRow`, `Field`, `ControlsList`, `DialogHeader`, `Marquee`, `SimpleModal`, `ProgressBar`, `ProgressBarWithInfo`, `Spinner`, `Tabs`) try their original Webpack finder first and fall back to structural/function-signature finders only when the Webpack lookup misses. `staticClasses` and `gamepadDialogClasses` fall back to `{}`, and `errorboundary-hook.tsx` accepts Oxc's `||=` assignment form.
-- **For plugin authors:** Avoid unguarded `Object.values(findModule(...))` calls against Steam CSS class modules, which may return `undefined` on Vite builds. Guard optional class maps with `?? {}` and prefer semantic/component finders over CSS class-name keys. See [docs/vite-esm-hooking.md](vite-esm-hooking.md) for the full hooking mechanism review, known limitations, and the Vite component discovery guide.
+At start-up, [index.ts](../frontend/src/index.ts) imports `IS_ESM_CLIENT` from [stable/client.ts](../frontend/src/stable/client.ts). The check looks for `script[type=module][src*="library.js"]`. [index.ts](../frontend/src/index.ts) then boots one of two paths:
+
+- **ES module client (Beta):** The loader imports `@decky/ui-v5/dist/module-system` and calls `initModules`. Module scopes contain non-exported variables, not only exports. `initModules` resolves a scope through the callback that [index.ts](../frontend/src/index.ts) gives it. The callback calls the backend route `instrumentation/resolve_scope` over the WebSocket. [cef.rs](../backend-rust/src/cef.rs) keeps one lazily connected CDP session to `SharedJSContext`. Concurrent requests share it, with one request id per call. Each resolve uses one CDP object group and always releases it. `window.DFL` is then `@decky/ui-v5`.
+- **Webpack client (Stable):** [stable/boot.ts](../frontend/src/stable/boot.ts) sets `window.SP_REACT` and `window.SP_JSX` from Webpack, then boots `@decky/ui-legacy` (4.16.4). It adds the 5.x names that loader code reads (`findVar`, `findModuleScopeByVar`, `findScopeDetailsByVar`, `findScope`, `createScopeMapping`, `createVarMapping`, `moduleScopes`, `processedModules`, `toastClasses`, `tabsClasses`) on an object that inherits from the 4.16.4 namespace.
+
+Plugins see on each client what upstream gives them:
+
+| Client | Plugin view |
+| --- | --- |
+| Beta | Upstream v4: `@decky/ui` 5. |
+| Stable | Upstream `v3.3.1` behaviour: `@decky/ui` 4.16.4 plus the 5.x names. |
+
+On Stable, `findVar` finds module exports only, because Webpack has no module scopes. The compatibility aliases listed above exist on both clients.
+
+Finders that match Steam source text accept both quote forms. Webpack prints `"x"` and the Oxc minifier on Beta prints `` `x` ``. For example, [toaster.tsx](../frontend/src/hooks/toaster.tsx) and [vr-dashboard-bar.tsx](../frontend/src/hooks/vr-dashboard-bar.tsx) match both forms.
+
+Upstream also adds early Steam Frame support: the VR dashboard bar. It needs a lock-screen PIN on Frame. This is an upstream limitation.
+
+#### Removal plan for the Stable branch
+
+Steam Stable ships ES modules when its `CLSTAMP` is at least `11255874` and the boot log shows `[Decky:Boot] Steam client: ES modules`. Then remove the Stable branch:
+
+- [ ] Delete `frontend/src/stable/`.
+- [ ] Delete the Stable branch in [index.ts](../frontend/src/index.ts).
+- [ ] Delete the `@decky/ui-legacy` dependency.
+- [ ] Delete every `// Stable:` call site, for example the popup class switch in [Toast.tsx](../frontend/src/components/Toast.tsx).
+
+The dual-quote finder regexes can stay.
+
+For plugin author guidance, see [the Steam UI hooking guide](vite-esm-hooking.md).
