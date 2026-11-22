@@ -23,7 +23,12 @@ interface TestingVersion {
   name: string;
   link: string;
   head_sha: string;
+  created_at: string;
+  updated_at: string;
 }
+
+const formatDate = (iso: string) =>
+  new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 
 const getTestingVersions = DeckyBackend.callable<[], TestingVersion[]>('updater/get_testing_versions');
 const downloadTestingVersion = DeckyBackend.callable<[pr_id: number, sha: string]>('updater/download_testing_version');
@@ -86,7 +91,14 @@ export default function TestingVersionList() {
                 <Field
                   label={
                     <>
-                      {version.name}{' '}
+                      <div>
+                        {version.name}
+                        <div style={{ color: UI_COLORS.textSub, fontSize: '12px' }}>
+                          {t('Testing.opened', { date: formatDate(version.created_at) })}
+                          {' · '}
+                          {t('Testing.updated', { date: formatDate(version.updated_at) })}
+                        </div>
+                      </div>
                       <span
                         style={{
                           color: UI_COLORS.textSub,

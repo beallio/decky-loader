@@ -278,11 +278,21 @@ impl Updater {
                     .and_then(|head| head.get("sha"))
                     .and_then(Value::as_str)
                     .ok_or_else(|| RpcError::failure("GitHub pull request has no head.sha"))?;
+                let created_at = pull
+                    .get("created_at")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::failure("GitHub pull request has no created_at"))?;
+                let updated_at = pull
+                    .get("updated_at")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::failure("GitHub pull request has no updated_at"))?;
                 Ok(json!({
                     "id": id,
                     "name": name,
                     "link": link,
                     "head_sha": head_sha,
+                    "created_at": created_at,
+                    "updated_at": updated_at,
                 }))
             })
             .collect::<Result<Vec<_>, RpcError>>()
