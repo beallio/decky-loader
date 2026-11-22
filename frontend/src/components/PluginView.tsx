@@ -1,4 +1,12 @@
-import { ButtonItem, ErrorBoundary, Focusable, PanelSection, PanelSectionRow } from '@decky/ui';
+import {
+  ButtonItem,
+  ErrorBoundary,
+  Focusable,
+  PanelSection,
+  PanelSectionRow,
+  joinClassNames,
+  vrDashboardClasses,
+} from '@decky/ui';
 import { FC, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { FaBan, FaEyeSlash } from 'react-icons/fa';
@@ -9,7 +17,7 @@ import NotificationBadge from './NotificationBadge';
 import { useQuickAccessVisible } from './QuickAccessVisibleState';
 import TitleView from './TitleView';
 
-const PluginView: FC = () => {
+const PluginView: FC<{ vr?: boolean }> = ({ vr }) => {
   const {
     plugins,
     disabledPlugins,
@@ -41,20 +49,38 @@ const PluginView: FC = () => {
 
   if (activePlugin) {
     return (
-      <Focusable onCancelButton={closeActivePlugin}>
+      <Focusable
+        onCancelButton={closeActivePlugin}
+        className={
+          (vr && joinClassNames(vrDashboardClasses.QuickAccessPopupPanel, vrDashboardClasses.BottomFade)) || ''
+        }
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          paddingBottom: '20px', // override bottomfade, there is prolly a better way
+        }}
+      >
         <TitleView />
-        <div style={{ height: '100%', paddingTop: '16px' }}>
+        <div style={{ paddingTop: '16px', overflowY: vr ? 'auto' : undefined }}>
           <ErrorBoundary>{(visible || activePlugin.alwaysRender) && activePlugin.content}</ErrorBoundary>
         </div>
       </Focusable>
     );
   }
   return (
-    <>
+    <div
+      className={(vr && joinClassNames(vrDashboardClasses.QuickAccessPopupPanel, vrDashboardClasses.BottomFade)) || ''}
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        paddingBottom: '20px', // override bottomfade, there is prolly a better way
+      }}
+    >
       <TitleView />
       <div
         style={{
-          paddingTop: '16px',
+          paddingTop: vr ? '16px' : '16px',
+          overflowY: vr ? 'auto' : undefined,
         }}
       >
         <PanelSection>
@@ -95,7 +121,7 @@ const PluginView: FC = () => {
           )}
         </PanelSection>
       </div>
-    </>
+    </div>
   );
 };
 

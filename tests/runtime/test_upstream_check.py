@@ -56,8 +56,9 @@ class UpstreamCheckTests(unittest.TestCase):
         lines[number - 1] = text
         self.write(repo, OVERLAY, "\n".join(lines) + "\n")
 
-    def check(self, pinned="v1.0.0"):
-        return upstream_check.check(self.fork, str(self.upstream), pinned, self.pinned_commit, OVERLAYS, REMOVALS)
+    def check(self, pinned="v1.0.0", tag=None):
+        return upstream_check.check(self.fork, str(self.upstream), pinned, self.pinned_commit, OVERLAYS, REMOVALS,
+                                    tag)
 
     def statuses(self, report, key):
         return {item["path"]: item["status"] for item in report[key]}
@@ -145,6 +146,18 @@ class UpstreamCheckTests(unittest.TestCase):
         self.release(self.upstream, "v1.2.0-pre1")
 
         self.assertFalse(self.check(pinned="v1.1.0")["update_available"])
+
+    def test_explicit_tag_overrides_the_newest_tag(self):
+        self.edit_line(self.upstream, 3, "prerelease change")
+        self.release(self.upstream, "v1.1.0-pre1")
+        self.release(self.upstream, "v2.0.0")
+
+        self.assertEqual(self.check()["latest"], "v2.0.0")
+        report = self.check(tag="v1.1.0-pre1")
+
+        self.assertEqual((report["latest"], report["latest_is_prerelease"], report["update_available"]),
+                         ("v1.1.0-pre1", True, True))
+        self.assertEqual(self.statuses(report, "overlays")[OVERLAY], "clean")
 
     def test_pin_that_does_not_match_upstream_is_an_error(self):
         self.release(self.upstream, "v1.1.0")

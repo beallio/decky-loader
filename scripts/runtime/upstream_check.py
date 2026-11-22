@@ -6,9 +6,11 @@ Stable vX.Y.Z tags always count. While the pin is an upstream prerelease
 prerelease line until the stable release appears.
 
 The check uses git only. For each fork overlay it runs a three-way merge of the
-pinned tag (base), fork HEAD (ours), and the new tag (theirs). It prints a JSON
-report on stdout and appends a Markdown summary to $GITHUB_STEP_SUMMARY.
-It exits non-zero only on errors; a newer tag is a normal result.
+pinned tag (base), fork HEAD (ours), and the new tag (theirs). --tag TAG compares
+against that exact tag, so a dry run can target a release the newest-tag listing
+skips. It prints a JSON report on stdout and appends a Markdown summary to
+$GITHUB_STEP_SUMMARY. It exits non-zero only on errors; a newer tag is a normal
+result.
 """
 from __future__ import annotations
 
@@ -105,13 +107,15 @@ def other_changes(upstream: Path, base_tag: str, new_tag: str, excluded: tuple[s
 
 
 def check(fork: Path, remote: str, pinned_tag: str, pinned_commit: str,
-          overlays: tuple[str, ...], removals: tuple[str, ...]) -> dict:
+          overlays: tuple[str, ...], removals: tuple[str, ...], tag: str | None = None) -> dict:
     pinned_key = version_key(pinned_tag)
     if pinned_key is None:
         raise UpstreamError(f'pinned SDK tag is not a vX.Y.Z or vX.Y.Z-preN tag: {pinned_tag}')
+    if tag is not None and version_key(tag) is None:
+        raise UpstreamError(f'not a vX.Y.Z or vX.Y.Z-preN tag: {tag}')
     if Path(remote).exists():
         remote = str(Path(remote).resolve())
-    latest = newest_tag(remote, include_prereleases=is_prerelease(pinned_tag))
+    latest = tag if tag is not None else newest_tag(remote, include_prereleases=is_prerelease(pinned_tag))
     report = {'remote': remote, 'pinned': pinned_tag, 'latest': latest,
               'latest_is_prerelease': is_prerelease(latest),
               'update_available': version_key(latest) > pinned_key}
@@ -174,11 +178,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('remote', nargs='?', default=DEFAULT_REMOTE, help='git remote or URL (default: %(default)s)')
     parser.add_argument('--repo', type=Path, default=REPO, help='fork checkout to read overlays from')
+    parser.add_argument('--tag', help='compare against this exact upstream tag instead of the newest one')
     parser.add_argument('--markdown', type=Path, help='also write the Markdown summary to this file')
     arguments = parser.parse_args(argv)
+    if arguments.tag is not None and not RELEASE_TAG.fullmatch(arguments.tag):
+        parser.error(f'--tag is not a vX.Y.Z or vX.Y.Z-preN tag: {arguments.tag}')
     sdk = BUILD_CONFIG['sdk']
     try:
-        report = check(arguments.repo, arguments.remote, sdk['tag'], sdk['commit'], SDK_OVERLAYS, SDK_REMOVALS)
+        report = check(arguments.repo, arguments.remote, sdk['tag'], sdk['commit'], SDK_OVERLAYS, SDK_REMOVALS,
+                       arguments.tag)
     except (UpstreamError, OSError) as error:
         print(f'upstream_check: {error}', file=sys.stderr)
         return 1
