@@ -52,6 +52,7 @@ SDK_OVERLAYS = (
     'backend/decky_loader/localplatform/localsocket.py',
     'backend/decky_loader/main.py',
     'backend/decky_loader/utilities.py',
+    'backend/decky_loader/updater.py',
     'backend/decky_loader/wsrouter.py',
     'frontend/src/storeSources.ts',
     'frontend/src/plugin.ts',
