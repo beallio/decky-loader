@@ -64,6 +64,7 @@ SDK_OVERLAYS = (
     'frontend/src/components/modals/PluginInstallModal.tsx',
     'frontend/src/components/modals/MultiplePluginsInstallModal.tsx',
     'frontend/src/components/modals/PluginUninstallModal.tsx',
+    'frontend/src/components/modals/TestingInstallModal.tsx',
     'frontend/src/components/settings/pages/developer/index.tsx',
     'frontend/src/components/settings/pages/testing/index.tsx',
     'frontend/src/index.ts',
