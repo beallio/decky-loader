@@ -9,12 +9,22 @@ import {
   NavEntryPositionPreferences,
   Navigation,
   SteamSpinner,
+  findModuleExport,
   showContextMenu,
   showModal,
 } from '@decky/ui';
-import { useEffect, useMemo, useState } from 'react';
+import { ComponentType, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { FaCaretDown, FaClock, FaDownload, FaInfo, FaSortAmountDownAlt, FaSortAmountUpAlt } from 'react-icons/fa';
+import {
+  FaCaretDown,
+  FaClock,
+  FaDownload,
+  FaInfo,
+  FaSortAmountDownAlt,
+  FaSortAmountUpAlt,
+  FaSyncAlt,
+  FaUser,
+} from 'react-icons/fa';
 
 import { setSetting } from '../../../../utils/settings';
 import { ICON_BUTTON_STYLE, UI_COLORS } from '../../../../utils/uiStyles';
@@ -35,6 +45,15 @@ type SortField = 'updated' | 'opened' | 'number' | 'author' | 'title';
 
 const formatDate = (iso: string) =>
   new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+
+// Fork: Steam's own SVG icon components carry stable class names in their source.
+// SVGIcon_User lives in sp.js and is not indexed on Steam beta; the friends person icon is.
+const findSteamIcon = (className: string) =>
+  findModuleExport((e) => typeof e === 'function' && String(e).includes(className)) as ComponentType | undefined;
+
+const SteamAuthorIcon = findSteamIcon('SVGIcon_User') ?? findSteamIcon('SVGIcon_FriendIcon');
+const SteamClockIcon = findSteamIcon('SVGIcon_Clock');
+const SteamUpdatedIcon = findSteamIcon('SVGIcon_Reload');
 
 const getTestingVersions = DeckyBackend.callable<[], TestingVersion[]>('updater/get_testing_versions');
 const downloadTestingVersion = DeckyBackend.callable<[pr_id: number, sha: string]>('updater/download_testing_version');
@@ -254,19 +273,15 @@ export default function TestingVersionList() {
                         textTransform: 'uppercase',
                       }}
                     >
+                      <span className="decky-testing-icon">{SteamAuthorIcon ? <SteamAuthorIcon /> : <FaUser />}</span>
                       {t('Testing.author', { author: version.author })}
                       {' · '}
-                      <FaClock
-                        size={16}
-                        style={{
-                          display: 'inline-block',
-                          verticalAlign: '-3px',
-                          color: UI_COLORS.textBody,
-                          marginRight: '4px',
-                        }}
-                      />
+                      <span className="decky-testing-icon">{SteamClockIcon ? <SteamClockIcon /> : <FaClock />}</span>
                       {t('Testing.opened', { date: formatDate(version.created_at) })}
                       {' · '}
+                      <span className="decky-testing-icon">
+                        {SteamUpdatedIcon ? <SteamUpdatedIcon /> : <FaSyncAlt />}
+                      </span>
                       {t('Testing.updated', { date: formatDate(version.updated_at) })}
                     </div>
                   </div>
@@ -290,7 +305,7 @@ export default function TestingVersionList() {
                     navEntryPreferPosition={NavEntryPositionPreferences.MAINTAIN_X}
                   >
                     <DialogButton style={ICON_BUTTON_STYLE} onClick={() => openInstallModal(version)}>
-                      <FaDownload role="img" aria-label={t('Testing.download')} style={{ display: 'block' }} />
+                      <FaDownload role="img" aria-label={t('Testing.install')} style={{ display: 'block' }} />
                     </DialogButton>
                     <DialogButton
                       style={ICON_BUTTON_STYLE}
@@ -310,6 +325,22 @@ export default function TestingVersionList() {
   outline: 2px solid rgba(255, 255, 255, 0.8);
   outline-offset: 2px;
   border-radius: 4px;
+}
+.decky-testing-icon {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: -3px;
+  margin-right: 4px;
+  color: ${UI_COLORS.textBody};
+}
+.decky-testing-icon svg {
+  width: 16px !important;
+  height: 16px !important;
+  flex-shrink: 0;
+  fill: ${UI_COLORS.textBody};
+}
+.decky-testing-icon svg [stroke] {
+  stroke: ${UI_COLORS.textBody};
 }
 `}</style>
     </DialogBody>

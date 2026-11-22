@@ -380,9 +380,9 @@
     },
     "Testing": {
         "author": "by {{author}}",
-        "download": "Download",
         "error": "Error Installing PR",
         "header": "The following versions of Decky Loader are built from open third-party Pull Requests. They are not verified for functionality or security, and they may be outdated.",
+        "install": "Install",
         "installing": "Installing...",
         "items": "Pull requests",
         "loading": "Loading open Pull Requests...",
