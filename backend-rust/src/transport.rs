@@ -38,6 +38,29 @@ use crate::backend::{Backend, RpcError};
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(20);
 const CATALOG_MAX_BYTES: usize = 5_000_000;
+const INLINE_FILE_LIMIT: u64 = 2 * 1024 * 1024;
+const STREAM_CHUNK_SIZE: usize = 64 * 1024;
+
+enum AssetRoot {
+    Canonical(PathBuf),
+    Raw(PathBuf),
+}
+
+impl AssetRoot {
+    async fn new(path: PathBuf) -> Self {
+        match tokio::fs::canonicalize(&path).await {
+            Ok(canonical) => Self::Canonical(canonical),
+            Err(_) => Self::Raw(path),
+        }
+    }
+
+    async fn resolve(&self, relative: &str) -> Option<PathBuf> {
+        match self {
+            Self::Canonical(root) => resolve_file_in_canonical_root(root, relative).await,
+            Self::Raw(root) => resolve_file(root, relative).await,
+        }
+    }
+}
 
 type PendingCalls = HashMap<i64, PendingCall>;
 
@@ -74,8 +97,8 @@ fn prune_pending_calls(pending: &mut PendingCalls, live_ids: &HashSet<i64>) {
 #[derive(Clone)]
 struct AppState {
     token: Arc<str>,
-    assets: Arc<PathBuf>,
-    locales: Arc<PathBuf>,
+    assets: Arc<AssetRoot>,
+    locales: Arc<AssetRoot>,
     backend: Arc<Backend>,
     user_agent: HeaderValue,
     pending: Arc<Mutex<PendingCalls>>,
@@ -125,6 +148,8 @@ pub async fn serve(
         "Decky/{} (https://decky.xyz)",
         backend.loader_version()
     ))?;
+    let assets = AssetRoot::new(assets).await;
+    let locales = AssetRoot::new(locales).await;
     let state = AppState {
         token: token.clone(),
         assets: Arc::new(assets),
@@ -667,19 +692,36 @@ async fn handle_full_sync(state: &AppState, data: Value) {
     prune_pending_calls(&mut *state.pending.lock().await, &live_ids);
 }
 
+fn frontend_cache_control(path: &str) -> &'static str {
+    if !path.contains('/')
+        && path.starts_with("chunk-")
+        && (path.ends_with(".js") || path.ends_with(".js.map"))
+    {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
+}
+
 async fn frontend_asset(
     State(state): State<AppState>,
     AxumPath(path): AxumPath<String>,
 ) -> Response {
-    serve_file(&state.assets, &path, Some("no-cache"), None).await
+    serve_asset(
+        &state.assets,
+        &path,
+        Some(frontend_cache_control(&path)),
+        None,
+    )
+    .await
 }
 
 async fn static_asset(State(state): State<AppState>, AxumPath(path): AxumPath<String>) -> Response {
-    serve_file(&state.assets, &path, Some("no-cache"), None).await
+    serve_asset(&state.assets, &path, Some("no-cache"), None).await
 }
 
 async fn locale_asset(State(state): State<AppState>, AxumPath(path): AxumPath<String>) -> Response {
-    match resolve_file(&state.locales, &path).await {
+    match state.locales.resolve(&path).await {
         Some(file) => read_file_response(&file, Some("no-cache"), Some("application/json")).await,
         None => {
             let mut response = Json(json!({})).into_response();
@@ -736,6 +778,18 @@ async fn plugin_data_asset(
     serve_file(&data_root, &path, Some("no-cache"), None).await
 }
 
+async fn serve_asset(
+    root: &AssetRoot,
+    relative: &str,
+    cache_control: Option<&'static str>,
+    content_type: Option<&'static str>,
+) -> Response {
+    let Some(file) = root.resolve(relative).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    read_file_response(&file, cache_control, content_type).await
+}
+
 async fn serve_file(
     root: &Path,
     relative: &str,
@@ -753,10 +807,17 @@ async fn resolve_file(root: &Path, relative: &str) -> Option<PathBuf> {
         return None;
     }
     let canonical_root = tokio::fs::canonicalize(root).await.ok()?;
+    resolve_file_in_canonical_root(&canonical_root, relative).await
+}
+
+async fn resolve_file_in_canonical_root(canonical_root: &Path, relative: &str) -> Option<PathBuf> {
+    if !is_safe_relative_path(relative) {
+        return None;
+    }
     let canonical_file = tokio::fs::canonicalize(canonical_root.join(relative))
         .await
         .ok()?;
-    if !canonical_file.starts_with(&canonical_root)
+    if !canonical_file.starts_with(canonical_root)
         || !tokio::fs::metadata(&canonical_file).await.ok()?.is_file()
     {
         return None;
@@ -780,24 +841,34 @@ async fn read_file_response(
     cache_control: Option<&'static str>,
     content_type: Option<&'static str>,
 ) -> Response {
-    let Ok(file_handle) = tokio::fs::File::open(file).await else {
+    let Ok(mut file_handle) = tokio::fs::File::open(file).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Ok(metadata) = file_handle.metadata().await else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let content_length = metadata.len();
-    let file_stream = futures_util::stream::try_unfold(file_handle, |mut file| async move {
-        let mut chunk = vec![0; 16 * 1024];
-        let bytes_read = file.read(&mut chunk).await?;
-        if bytes_read == 0 {
-            Ok::<_, std::io::Error>(None)
-        } else {
-            chunk.truncate(bytes_read);
-            Ok(Some((Bytes::from(chunk), file)))
+    let (body, content_length) = if content_length <= INLINE_FILE_LIMIT {
+        let mut buffer = Vec::with_capacity(content_length as usize);
+        if file_handle.read_to_end(&mut buffer).await.is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-    });
-    let mut response = Response::new(Body::from_stream(file_stream));
+        let actual_length = buffer.len() as u64;
+        (Body::from(buffer), actual_length)
+    } else {
+        let file_stream = futures_util::stream::try_unfold(file_handle, |mut file| async move {
+            let mut chunk = vec![0; STREAM_CHUNK_SIZE];
+            let bytes_read = file.read(&mut chunk).await?;
+            if bytes_read == 0 {
+                Ok::<_, std::io::Error>(None)
+            } else {
+                chunk.truncate(bytes_read);
+                Ok(Some((Bytes::from(chunk), file)))
+            }
+        });
+        (Body::from_stream(file_stream), content_length)
+    };
+    let mut response = Response::new(body);
     if let Ok(content_length) = HeaderValue::from_str(&content_length.to_string()) {
         response
             .headers_mut()
@@ -1419,8 +1490,8 @@ mod tests {
         let (sender, mut replies) = mpsc::unbounded_channel();
         let state = AppState {
             token: Arc::from("test-token"),
-            assets: Arc::new(directory.0.clone()),
-            locales: Arc::new(directory.0.clone()),
+            assets: Arc::new(AssetRoot::Raw(directory.0.clone())),
+            locales: Arc::new(AssetRoot::Raw(directory.0.clone())),
             backend,
             user_agent: HeaderValue::from_static("Decky/dev"),
             pending: Arc::new(Mutex::new(PendingCalls::new())),
@@ -1504,5 +1575,53 @@ mod tests {
         assert!(!is_safe_relative_path("assets/../../outside"));
         assert!(!is_safe_relative_path("/etc/passwd"));
         assert!(!is_safe_relative_path("assets\\..\\outside"));
+    }
+
+    #[test]
+    fn frontend_cache_control_marks_hashed_chunks_immutable_and_entrypoints_no_cache() {
+        assert_eq!(
+            frontend_cache_control("chunk-CqJUDUa7.js"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            frontend_cache_control("chunk-CqJUDUa7.js.map"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(frontend_cache_control("index.js"), "no-cache");
+        assert_eq!(frontend_cache_control("fallback.js"), "no-cache");
+        assert_eq!(frontend_cache_control("nested/chunk-abc.js"), "no-cache");
+    }
+
+    #[tokio::test]
+    async fn read_file_response_serves_inline_and_streamed_files_with_exact_content() {
+        let directory = TestDirectory::new("decky-static-file-test");
+        let small_path = directory.0.join("chunk-test.js");
+        let small_bytes = b"export const ok = true;\n".to_vec();
+        tokio::fs::write(&small_path, &small_bytes).await.unwrap();
+
+        let large_path = directory.0.join("large.bin");
+        let large_bytes = vec![0x5Au8; INLINE_FILE_LIMIT as usize + 4096];
+        tokio::fs::write(&large_path, &large_bytes).await.unwrap();
+
+        for (path, expected, cache_control) in [
+            (
+                &small_path,
+                &small_bytes,
+                "public, max-age=31536000, immutable",
+            ),
+            (&large_path, &large_bytes, "no-cache"),
+        ] {
+            let response = read_file_response(path, Some(cache_control), None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[CONTENT_LENGTH],
+                expected.len().to_string()
+            );
+            assert_eq!(response.headers()[CACHE_CONTROL], cache_control);
+            let body = axum::body::to_bytes(response.into_body(), expected.len() + 1)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), expected.as_slice());
+        }
     }
 }

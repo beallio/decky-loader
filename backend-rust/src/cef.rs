@@ -541,6 +541,12 @@ impl ScopeConnection {
             }
         }
     }
+
+    fn notify(&self, method: &str, params: Value) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let message = json!({"id":id,"method":method,"params":params}).to_string();
+        let _ = self.requests.send(message);
+    }
 }
 
 /// Routes one CDP message: command responses go to their waiter, events are dropped.
@@ -587,13 +593,12 @@ async fn resolve_scope_in(
         Ok(evaluated) => resolve_scope_objects(connection, object_key, &evaluated).await,
         Err(error) => Err(error),
     };
-    // The group holds every object id this resolve created; drop them even after a failure.
-    let _ = connection
-        .request(
-            "Runtime.releaseObjectGroup",
-            json!({"objectGroup": object_group}),
-        )
-        .await;
+    // The group holds every object id this resolve created; drop them even after a failure
+    // without blocking the caller on an extra CDP round trip.
+    connection.notify(
+        "Runtime.releaseObjectGroup",
+        json!({"objectGroup": object_group}),
+    );
     result
 }
 
@@ -604,7 +609,10 @@ async fn resolve_scope_objects(
 ) -> Result<(), RpcError> {
     let function = evaluated_object_id(evaluated)?;
     let properties = connection
-        .request("Runtime.getProperties", json!({"objectId": function}))
+        .request(
+            "Runtime.getProperties",
+            json!({"objectId": function, "ownProperties": true}),
+        )
         .await?;
     let scopes = scopes_object_id(&properties)?;
     let scope_list = connection
@@ -884,5 +892,65 @@ mod tests {
             ]
         );
         assert_eq!(seen[3].1.as_deref(), Some("decky-scope-test"));
+    }
+
+    /// Step 2 requests only own properties (plus `[[Scopes]]` internal properties), and
+    /// releasing the object group does not block the caller waiting for a CDP reply.
+    #[tokio::test]
+    async fn scope_resolve_uses_own_properties_and_does_not_wait_for_release_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let mut fn_own_properties = None;
+            let mut released_group = None;
+            while let Some(Ok(Message::Text(request))) = socket.next().await {
+                let request: Value = serde_json::from_str(&request).unwrap();
+                let id = request["id"].clone();
+                let method = request["method"].as_str().unwrap();
+                if method == "Runtime.releaseObjectGroup" {
+                    released_group = request["params"]["objectGroup"].as_str().map(str::to_owned);
+                    // Deliberately do not reply; caller must already have returned.
+                    continue;
+                }
+                let result = if method == "Runtime.evaluate" {
+                    json!({"result":{"objectId":"fn"}})
+                } else if method == "Runtime.getProperties" && request["params"]["objectId"] == "fn"
+                {
+                    fn_own_properties = request["params"]["ownProperties"].as_bool();
+                    json!({"internalProperties":[internal_property("[[Scopes]]","scopes")]})
+                } else if method == "Runtime.getProperties" {
+                    json!({"result":[scope_entry("Module","module")]})
+                } else {
+                    json!({"result":{}})
+                };
+                socket
+                    .send(Message::Text(
+                        json!({"id":id,"result":result}).to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            (fn_own_properties, released_group)
+        });
+        let target = Target {
+            id: "test".into(),
+            title: "SharedJSContext".into(),
+            url: "https://steamloopback.host/routes/library".into(),
+            websocket_url: Some(format!("ws://{address}")),
+        };
+        let connection = ScopeConnection::connect(&target).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            resolve_scope_in(&connection, 42, "decky-scope-fast"),
+        )
+        .await
+        .expect("resolve_scope_in should not wait for Runtime.releaseObjectGroup reply")
+        .unwrap();
+        drop(connection);
+        let (fn_own_properties, released_group) = server.await.unwrap();
+        assert_eq!(fn_own_properties, Some(true));
+        assert_eq!(released_group.as_deref(), Some("decky-scope-fast"));
     }
 }
