@@ -79,6 +79,7 @@ Do not compare the text of the file on disk with the runtime `toString()` text. 
 
 - For your own UI, use your own CSS classes or Steam's global classes such as `.BasicUI`, `.GamepadMode`, `.gpfocus`, `.DialogButton`, and `.Primary`.
 - Do not assume that `staticClasses`, `gamepadDialogClasses`, or `findClassModule(...)` contains a given class name on Beta.
+- Oxc strips most `SVGIcon_*` class names on Beta. Find icons by their registry key, not by a class name.
 - For hashed Steam classes in themes or DOM queries, use the class mapping feed from `beallio/steamui-watch`: `https://beallio.github.io/steamui-watch/{stable,beta}.json`. `beallio/SDH-CssLoader` reads this feed.
 
 ## Extra Steam components

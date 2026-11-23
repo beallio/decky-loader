@@ -8,9 +8,9 @@ Decky Loader (Rust fork) can browse, install, and check updates across **multipl
 
 ![Plugin stores list in Decky General settings](../images/screenshots/settings-general-stores.png)
 
-Open Decky settings -> **General** and scroll to **Plugin stores**:
+Open Decky settings -> **General** and scroll past **Beta participation** to **Plugin stores**:
 
-- **Default stores:** **[Decky Extended](https://decky-extended-plugins.beallio.com/)** and the **Official** Decky store are both enabled out of the box.
+- **Stable Plugin Stores:** The list shows your active stable stores. **[Decky Extended](https://decky-extended-plugins.beallio.com/)** and the **Official** Decky store are enabled by default.
 - **Change store priority:** Press **X** on the store list, move a store up or down, and press **X** again to save.
   - When two stores carry the same plugin, the store **higher in the list** is the primary store for that plugin and sends update notices for it.
   - Other versions from lower-priority stores remain available in that plugin's version dropdown.

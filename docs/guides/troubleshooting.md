@@ -24,6 +24,20 @@ That individual plugin failed to start cleanly, while Decky itself stayed online
 
 ---
 
+## Plugins misbehave
+
+Open Decky settings -> **Plugins** and select **Disable all**. Enable plugins one at a time to find the one causing the problem. **Enable all** also turns on plugins that you had disabled before.
+
+---
+
+## A pull request build cannot be installed
+
+Read the error shown in the install window. If an install fails, Decky keeps the update channel it had before the attempt. For details, see [Trying a Pull Request Build](./installation.md#trying-a-pull-request-build).
+
+If **Install** is greyed out, another Decky update is running. Wait for it to finish, then try again.
+
+---
+
 ## A plugin shows an error after switching to Steam Beta
 
 Steam Beta builds changed how Gaming Mode is built. Valve's change renamed almost all CSS class names and moved most React components and internal stores. Some plugins expect the old names.

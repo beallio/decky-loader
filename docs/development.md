@@ -95,9 +95,15 @@ pnpm --dir frontend run build
 
 The output is consumed by both Python packaging and the complete Rust bundle build. The complete runtime builder performs this work in its temporary source snapshot; it does not replace the checkout's generated assets.
 
-Failed plugin installs and uninstalls close their confirmation window and show an error notification. Once an install starts, **Close** (or B) dismisses only the window; it does not cancel the install. To try a failed install again, start a new install request. Cancelling the ZIP picker is a normal exit. A failed update check releases its busy state, and a failed testing-build download does not change the update channel.
+Failed plugin installs and uninstalls close their confirmation window and show an error notification. Once an install starts, **Close** (or B) dismisses only the window; it does not cancel the install. To try a failed install again, start a new install request. Cancelling the ZIP picker is a normal exit. A failed update check releases its busy state.
 
 WebSocket error replies have two shapes: missing-route errors use `error.error`, and failures inside a route use `error.message`. The frontend reads both so that error notifications retain the backend's explanation.
+
+### Testing page
+
+The Testing page calls `updater/get_testing_versions`, which returns each pull request's `id`, `name`, `link`, `head_sha`, `created_at`, `updated_at`, and `author` (an empty string if GitHub has no user). Installing calls `updater/download_testing_version` with the pull request number and head SHA. The backend verifies the testing bundle, stamps a development bundle `PR-<number>`, then sets the update channel to Testing before handing off the install. If the handoff fails, it restores the previous channel.
+
+The backend sends `updater/update_download_percentage` during the download and `updater/finish_download` when it finishes. The install modal stays open, disables dismissal while the install runs, and shows errors inside the modal. The WebSocket router does not reject pending calls when the connection drops; it resends them after reconnect.
 
 Replacing an installed plugin preserves its position in `pluginOrder`, for both normal and root plugins. Fresh installs append once, and a name that is already listed is never appended again. On startup the stored order is deduplicated in first-occurrence order, so a list that already contains a plugin more than once heals. Uninstall removes the entry. Installation still clears that plugin's frozen, hidden, and disabled flags, as before.
 
@@ -235,7 +241,7 @@ The workflow's optional `release_notes` input holds Markdown that is appended be
 
 ```sh
 gh workflow run runtime-release.yml --repo beallio/decky-loader --ref main \
-  -f release_tag=v3.3.1-rust.1-rc.3 -f release_channel=preview -f publish=true \
+  -f release_tag=v3.3.1-rust.1-rc.11 -f release_channel=preview -f publish=true \
   -f release_notes="$(cat notes.md)"
 ```
 
@@ -264,6 +270,8 @@ To move to a new upstream tag:
 4. Set `version` in `backend/pyproject.toml` to the new tag without the `v`. For each package that the report lists, match upstream: change the dependency range in `pyproject.toml` if upstream changed it, then `UV_NO_CONFIG=1 uv lock --upgrade-package NAME==VERSION` in `backend`. `python3 scripts/runtime/python_parity.py` must pass.
 5. Run the local checks and a complete build.
 6. Release as `vX.Y.Z-rust.N` (use `-rc.N` for a preview). See [Release validation and publication](#release-validation-and-publication).
+
+When a change adds or modifies an upstream SDK file, add that path to `SDK_OVERLAYS` in [`scripts/runtime/prepare_bundle.py`](../scripts/runtime/prepare_bundle.py). Bundle assembly checks the overlay list against the pinned SDK baseline, and CI fails if a changed upstream file is missing from the list. For example, the current overlays include `backend/decky_loader/updater.py` and `frontend/src/components/modals/TestingInstallModal.tsx`.
 
 ### UI library
 

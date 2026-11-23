@@ -62,6 +62,7 @@ Plugins get the same `@decky/ui` API that Official Decky gives them on each clie
   /controller:[`"]notification[`"],method:/
   ```
 - **Guard Steam CSS class objects.** LightningCSS removes or renames most class names in the JavaScript on Steam Beta. Check for missing keys and objects.
+- **Use `IconsModule` for Steam's icons.** `IconsModule` from `@decky/ui` gives Steam's named icon set, with keys such as `User`, `Clock`, and `Reload`. On Steam Stable, this fork's loader uses the same named set when Steam has it, and otherwise the older icon module. Names can differ or be missing between Steam clients, so always provide a fallback. Do not copy Valve's SVG data into your plugin.
 - For patterns, safe component discovery, and testing on Steam Beta, see the [Steam UI plugin hooking guide](../vite-esm-hooking.md).
 
 ---
