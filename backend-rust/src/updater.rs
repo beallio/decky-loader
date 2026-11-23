@@ -290,7 +290,7 @@ impl Updater {
                     .get("user")
                     .and_then(|user| user.get("login"))
                     .and_then(Value::as_str)
-                    .ok_or_else(|| RpcError::failure("GitHub pull request has no user.login"))?;
+                    .unwrap_or("");
                 Ok(json!({
                     "id": id,
                     "name": name,
@@ -380,14 +380,15 @@ impl Updater {
         let bundle = temporary.reserve_directory("bundle").await?;
         extract_bundle_archive(bundle_archive, bundle.clone()).await?;
         let version = stamp_testing_bundle_version(&bundle, pr_id).await?;
-        queue_install_bundle(backend, &bundle, &version)
-            .await
-            .map_err(|error| {
-                RpcError::failure(format!(
-                    "testing version PR-{pr_id} install failed: {}",
-                    error.message()
-                ))
-            })?;
+        let previous_branch = backend.setting("branch", json!(-1)).await;
+        backend.set_setting("branch", json!(2)).await?;
+        if let Err(error) = queue_install_bundle(backend, &bundle, &version).await {
+            backend.set_setting("branch", previous_branch).await?;
+            return Err(RpcError::failure(format!(
+                "testing version PR-{pr_id} install failed: {}",
+                error.message()
+            )));
+        }
         Ok(Value::Null)
     }
 

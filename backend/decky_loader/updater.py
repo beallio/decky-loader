@@ -184,7 +184,7 @@ class Updater:
 
         return binary_name
 
-    async def download_decky_binary(self, download_url: str, version: str, is_zip: bool = False, size_in_bytes: int | None = None):
+    async def download_decky_binary(self, download_url: str, version: str, is_zip: bool = False, size_in_bytes: int | None = None, previous_branch: int | None = None):
         download_filename = self.get_local_binary_name()
         download_temp_filename = download_filename + ".new"
 
@@ -229,8 +229,16 @@ class Updater:
                 logger.info(f"Setting the executable flag with chcon returned {await process.wait()}")
 
         logger.info("Updated loader installation.")
-        await self.context.ws.emit("updater/finish_download")
-        await self.do_restart()
+        # Fork: a testing install switches to the Testing branch before the restart; restore it if the restart fails.
+        if previous_branch is not None:
+            self.context.settings.setSetting("branch", 2)
+        try:
+            await self.context.ws.emit("updater/finish_download")
+            await self.do_restart()
+        except Exception:
+            if previous_branch is not None:
+                self.context.settings.setSetting("branch", previous_branch)
+            raise
 
     async def do_update(self):
         logger.debug("Starting update.")
@@ -303,11 +311,11 @@ class Updater:
                     result.append({
                         "id": int(pr['number']),
                         "name": pr['title'],
-                        "link":  pr['html_url'],
+                        "link": pr['html_url'],
                         "head_sha": pr['head']['sha'],
                         "created_at": pr['created_at'],
                         "updated_at": pr['updated_at'],
-                        "author": pr['user']['login'],
+                        "author": (pr.get('user') or {}).get('login') or "",
                     })
         return result
 
@@ -342,17 +350,19 @@ class Updater:
                         headers={'X-GitHub-Api-Version': '2022-11-28'}, ssl=helpers.get_ssl_context()) as res:
                     jresp = await res.json()
                     #If the request found at least one artifact to download...
-                    if int(jresp['total_count']) != 0:
-                        # this assumes that the artifact we want is the first one!
-                        artifact = jresp['artifacts'][0]
-                        target_art = self.get_remote_binary_name(False)
-                        for art in jresp['artifacts']:
-                            if art['name'] == target_art:
-                                artifact = art
-                                break
-                        down_link = f"https://nightly.link/{self.repo}/actions/artifacts/{artifact['id']}.zip"
-                        #Then fetch it and restart itself
-                        await self.download_decky_binary(down_link, f'PR-{pr_id}', is_zip=True, size_in_bytes=artifact.get('size_in_bytes',None))
+                    if int(jresp['total_count']) == 0:
+                        raise Exception("Workflow run has no downloadable artifacts.")
+                    target_art = self.get_remote_binary_name(False)
+                    artifact = next((art for art in jresp['artifacts'] if art['name'] == target_art), None)
+                    if artifact is None:
+                        raise Exception(f"Workflow run has no {target_art} artifact.")
+                    down_link = f"https://nightly.link/{self.repo}/actions/artifacts/{artifact['id']}.zip"
+                    previous_branch = self.context.settings.getSetting("branch", -1)
+                    await self.download_decky_binary(
+                        down_link, f'PR-{pr_id}', is_zip=True,
+                        size_in_bytes=artifact.get('size_in_bytes', None),
+                        previous_branch=previous_branch,
+                    )
         else:
             logger.error("workflow run not found", str(works))
             raise Exception("Workflow run not found.")
