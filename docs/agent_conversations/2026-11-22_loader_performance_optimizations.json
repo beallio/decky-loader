@@ -123,6 +123,43 @@
         "index.js": "no-cache",
         "chunk-B352hPKx.js": "public, max-age=31536000, immutable"
       }
+    },
+    "three_way_vs_upstream_v4_pre1_isolated_netns": {
+      "binary_size_bytes": {
+        "upstream_v4_pre1": 35323720,
+        "fork_main": 13398288,
+        "this_pr": 9210808
+      },
+      "zero_plugin_cold_start_median_ms": {
+        "upstream_v4_pre1": 800.2,
+        "fork_main": 292.87,
+        "this_pr": 6.98
+      },
+      "zero_plugin_idle_tree": {
+        "upstream_v4_pre1": {"procs": 2, "threads": 6, "rss_kib": 52604, "pss_kib": 47322, "anon_kib": 32724},
+        "fork_main": {"procs": 1, "threads": 6, "rss_kib": 10584, "pss_kib": 8198, "anon_kib": 1352},
+        "this_pr": {"procs": 1, "threads": 4, "rss_kib": 8604, "pss_kib": 6103, "anon_kib": 1092}
+      },
+      "ws_ping_100_p95_ms": {
+        "upstream_v4_pre1": 0.15,
+        "fork_main": 0.18,
+        "this_pr": 0.117
+      },
+      "eight_plugins_startup_chown1_avg_ms": {
+        "upstream_v4_pre1": 1563.8,
+        "fork_main": 746.85,
+        "this_pr": 434.51
+      },
+      "eight_plugins_steady_tree_after_4s": {
+        "upstream_v4_pre1": {"procs": 14, "threads": 30, "rss_kib": 392812, "pss_kib": 247229, "anon_kib": 255648},
+        "fork_main": {"procs": 8, "threads": 25, "rss_kib": 181776, "pss_kib": 97625, "anon_kib": 109156},
+        "this_pr": {"procs": 8, "threads": 23, "rss_kib": 179692, "pss_kib": 95596, "anon_kib": 108812}
+      },
+      "zip_24mib_install_2_rounds": {
+        "upstream_v4_pre1": "blocked in offline netns waiting on deckbrew.xyz install counter",
+        "fork_main": {"install_ms": [112.3, 63.3], "peak_anon_mib": [31.52, 38.67], "peak_rss_mib": [41.08, 48.48]},
+        "this_pr": {"install_ms": [88.4, 50.1], "peak_anon_mib": [3.02, 2.83], "peak_rss_mib": [10.79, 10.71]}
+      }
     }
   }
 }
