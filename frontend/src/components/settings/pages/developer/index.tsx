@@ -208,6 +208,7 @@ export default function DeveloperSettings() {
         />
         <Field label={t('SettingsDeveloperIndex.react_devtools.ip_label')} childrenContainerWidth="fixed">
           <TextField
+            aria-label={t('SettingsDeveloperIndex.react_devtools.ip_label')}
             placeholder="   .   .   .   "
             value={reactDevtoolsIP}
             onChange={(e) => {
