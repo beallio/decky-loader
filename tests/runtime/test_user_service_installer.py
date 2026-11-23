@@ -69,6 +69,23 @@ class UserServiceInstallerTests(unittest.TestCase):
         self.assertIn("SERVER_HOST=127.0.0.2", service)
         self.assertIn("SERVER_PORT=1444", service)
 
+    def test_generated_unit_passes_runtime_versions_when_supplied(self) -> None:
+        paths = {
+            "unit": Path("loader.service"),
+            "homebrew": Path("/home/deck/homebrew"),
+            "services": Path("/home/deck/homebrew/services"),
+            "binary": Path("/runtime/decky-loader-runtime"),
+        }
+        with patch.object(installer, "_systemctl", return_value=SimpleNamespace(stdout="")):
+            generated = installer._generated_unit(
+                paths, Path("/runtime"), "deck", "loader.service", "127.0.0.1:1337",
+                "http://127.0.0.1:8080", False, "fork", "https://api.github.com",
+                "beallio/decky-loader", "https://nightly.link", "1.0",
+                sdk_version="v4.0.0-pre1", python_version="3.14.8",
+            ).decode()
+        self.assertIn('"--sdk-version" "v4.0.0-pre1"', generated)
+        self.assertIn('"--python-version" "3.14.8"', generated)
+
     def write_bundle(self, bundle: Path, sdk_tag: str, worker_version: str, worker_python: str = "3.11.9") -> None:
         files = {
             "decky-loader-runtime": b"rust executable",
