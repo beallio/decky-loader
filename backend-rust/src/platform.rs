@@ -144,6 +144,30 @@ pub(crate) fn process_exit_fd(pid: u32) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(descriptor as i32) })
 }
 
+/// Non-blocking readiness check on a borrowed descriptor (used for pidfd exit checks).
+pub(crate) fn fd_is_readable(fd: BorrowedFd<'_>) -> io::Result<bool> {
+    let mut pollfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `pollfd` points to a valid single-element stack struct for the
+        // duration of the non-blocking (timeout=0) syscall; `fd` is borrowed live.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        return Ok(
+            ready > 0 && (pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +189,25 @@ mod tests {
                 .expect_err("broadcast group")
                 .raw_os_error(),
             Some(libc::EINVAL),
+        );
+    }
+
+    #[test]
+    fn fd_is_readable_tracks_child_exit_without_blocking() {
+        use std::os::fd::AsFd;
+        use std::process::Command;
+
+        let mut child = Command::new("sleep").arg("10").spawn().unwrap();
+        let pidfd = process_exit_fd(child.id()).unwrap();
+        assert!(
+            !fd_is_readable(pidfd.as_fd()).unwrap(),
+            "live child pidfd must not report readable"
+        );
+        child.kill().unwrap();
+        let _ = child.wait().unwrap();
+        assert!(
+            fd_is_readable(pidfd.as_fd()).unwrap(),
+            "exited child pidfd must report readable"
         );
     }
 }

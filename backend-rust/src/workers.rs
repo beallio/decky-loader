@@ -248,8 +248,15 @@ impl WorkerSupervisor {
                 None => Ok(None),
             },
             Self::Fork {
-                launcher, id, pid, ..
+                launcher,
+                id,
+                pid,
+                exit,
+                ..
             } => {
+                if !platform::fd_is_readable(exit.as_fd())? {
+                    return Ok(None);
+                }
                 let status = launcher
                     .child_status(id)
                     .await
@@ -264,7 +271,10 @@ impl WorkerSupervisor {
                     .map_err(|error| io::Error::other(error.to_string()))?;
                 Ok(Some(ExitStatus::from_raw(status)))
             }
-            Self::Root { host, id, .. } => {
+            Self::Root { host, id, exit } => {
+                if !platform::fd_is_readable(exit.as_fd())? {
+                    return Ok(None);
+                }
                 let status = host
                     .child_status(id)
                     .await
@@ -1687,7 +1697,7 @@ fn set_plugin_permissions_on_approved(
     } else {
         Mode::from_bits_truncate(0o700)
     };
-    if effective_user_ids.0 != 0 {
+    let root_mode_needs_update = if effective_user_ids.0 != 0 {
         let owner = fstat(&root).map_err(io::Error::from).map_err(|error| {
             WorkerError::Error(format!(
                 "Could not inspect plugin directory {}: {error}",
@@ -1702,14 +1712,16 @@ fn set_plugin_permissions_on_approved(
                 effective_user_ids.0,
             )));
         }
-    }
-
-    lock_directory(&root, effective_user_ids, locked_mode).map_err(|error| {
-        WorkerError::Error(format!(
-            "Could not secure plugin directory {}: {error}",
-            directory_path.display()
-        ))
-    })?;
+        owner.st_mode & 0o7777 != 0o755
+    } else {
+        lock_directory(&root, effective_user_ids, locked_mode).map_err(|error| {
+            WorkerError::Error(format!(
+                "Could not secure plugin directory {}: {error}",
+                directory_path.display()
+            ))
+        })?;
+        true
+    };
     update_directory_contents(
         &mut root,
         tree_user_ids,
@@ -1723,12 +1735,14 @@ fn set_plugin_permissions_on_approved(
             directory_path.display()
         ))
     })?;
-    fchmod(&root, Mode::from_bits_truncate(0o755)).map_err(|error| {
-        WorkerError::Error(format!(
-            "Could not chmod plugin directory {}: {error}",
-            directory_path.display()
-        ))
-    })?;
+    if root_mode_needs_update {
+        fchmod(&root, Mode::from_bits_truncate(0o755)).map_err(|error| {
+            WorkerError::Error(format!(
+                "Could not chmod plugin directory {}: {error}",
+                directory_path.display()
+            ))
+        })?;
+    }
     Ok(())
 }
 
@@ -1931,23 +1945,50 @@ fn update_directory_contents(
                 Err(Errno::ELOOP | Errno::ENOENT) => continue,
                 Err(error) => return Err(io::Error::from(error)),
             };
-            lock_directory(&child, effective_user_ids, locked_mode)?;
-            if is_plugin_metadata {
-                fchmod(&child, Mode::from_bits_truncate(0o755)).map_err(io::Error::from)?;
+            if effective_user_ids.0 == 0 {
+                lock_directory(&child, effective_user_ids, locked_mode)?;
+                if is_plugin_metadata {
+                    fchmod(&child, Mode::from_bits_truncate(0o755)).map_err(io::Error::from)?;
+                } else {
+                    update_directory_contents(
+                        &mut child,
+                        tree_owner,
+                        effective_user_ids,
+                        locked_mode,
+                        false,
+                    )?;
+                    restore_directory_owner(&child, tree_owner)?;
+                }
             } else {
-                update_directory_contents(
-                    &mut child,
-                    tree_owner,
-                    effective_user_ids,
-                    locked_mode,
-                    false,
-                )?;
-                restore_directory_owner(&child, tree_owner)?;
+                if !is_plugin_metadata {
+                    update_directory_contents(
+                        &mut child,
+                        tree_owner,
+                        effective_user_ids,
+                        locked_mode,
+                        false,
+                    )?;
+                }
+                if metadata.st_mode & 0o7777 != 0o755 {
+                    fchmod(&child, Mode::from_bits_truncate(0o755)).map_err(io::Error::from)?;
+                }
             }
             continue;
         }
 
         if file_type != SFlag::S_IFREG && file_type != SFlag::S_IFIFO {
+            continue;
+        }
+        let expected_owner = if is_plugin_metadata {
+            effective_user_ids
+        } else {
+            tree_owner
+        };
+        if effective_user_ids.0 != 0
+            && metadata.st_uid == expected_owner.0
+            && metadata.st_gid == expected_owner.1
+            && metadata.st_mode & 0o7777 == 0o755
+        {
             continue;
         }
         let fd = match openat(
@@ -2444,6 +2485,54 @@ mod plugin_permission_tests {
             (after.uid(), after.gid(), after.mode()),
             (before.uid(), before.gid(), before.mode())
         );
+    }
+
+    #[test]
+    fn non_root_permissions_skip_redundant_chmod_on_already_compliant_tree() {
+        let temporary = TestDirectory::new("decky-permissions-noop");
+        let root = fs::canonicalize(&temporary.0).unwrap();
+        let plugin = root.join("plugin");
+        let nested = plugin.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            br#"{"name":"Example","flags":[]}"#,
+        )
+        .unwrap();
+        fs::write(plugin.join("main.py"), b"pass\n").unwrap();
+        fs::write(nested.join("code.py"), b"pass\n").unwrap();
+        let effective = platform::effective_user_ids();
+        let host = host_user_ids(effective);
+        // First pass normalizes everything to 0o755.
+        set_plugin_permissions_inner(&plugin, false, host, true).unwrap();
+        if effective.0 != 0 {
+            let before_plugin_ctime = (
+                fs::metadata(&plugin).unwrap().ctime(),
+                fs::metadata(&plugin).unwrap().ctime_nsec(),
+            );
+            let before_nested_ctime = (
+                fs::metadata(&nested).unwrap().ctime(),
+                fs::metadata(&nested).unwrap().ctime_nsec(),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            set_plugin_permissions_inner(&plugin, false, host, true).unwrap();
+            let after_plugin_ctime = (
+                fs::metadata(&plugin).unwrap().ctime(),
+                fs::metadata(&plugin).unwrap().ctime_nsec(),
+            );
+            let after_nested_ctime = (
+                fs::metadata(&nested).unwrap().ctime(),
+                fs::metadata(&nested).unwrap().ctime_nsec(),
+            );
+            assert_eq!(
+                after_plugin_ctime, before_plugin_ctime,
+                "already-0o755 plugin root must not be toggled with fchmod"
+            );
+            assert_eq!(
+                after_nested_ctime, before_nested_ctime,
+                "already-0o755 subdirectory must not be toggled with fchmod"
+            );
+        }
     }
 }
 
