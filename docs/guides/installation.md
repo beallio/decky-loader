@@ -55,6 +55,22 @@ In Gaming Mode, open Decky settings -> **General** -> **Updates** -> **Check For
 
 ---
 
+## Trying a Pull Request Build
+
+The **Testing** page lists Decky pull request builds. These builds are not verified for functionality or security, and they may be outdated. The page shows only when **Developer mode** is on: open Decky settings -> **General** -> **Other** and turn on **Developer mode**.
+
+![Decky Testing page](../images/screenshots/settings-testing.png)
+
+Choose a build and select **Install**. Review the pull request title, number, and author in the confirmation window, then select **Install** again. Decky downloads the build and reloads. The window shows download progress and the reload status.
+
+![Pull request build downloading](../images/screenshots/testing-install-progress.png)
+
+After the build is installed, Decky switches **Update Channel** to **Testing**. The version is shown as `PR-<number>`.
+
+To return to regular releases, open Decky settings -> **General** -> **Updates**. Choose **Prerelease** or **Stable** under **Update Channel**, then check for updates.
+
+---
+
 ## Undoing an Update & Restoring Official Decky
 
 Every change saves a backup of your `homebrew` folder (your plugins and settings) in `~/decky-user-backups`, keeping the **3 newest copies** and deleting older ones to save disk space. You can change the backup location with `--backup-dir FOLDER`.

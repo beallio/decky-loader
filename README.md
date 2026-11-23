@@ -28,7 +28,8 @@ This is an independent fork of [SteamDeckHomebrew/decky-loader](https://github.c
 | **Plugin stores** | Single store at a time; no GitHub repo tracking | **Multiple stores** simultaneously ([Decky Extended](https://decky-extended-plugins.beallio.com/) included), priority ordering, GitHub repo URLs as stores, and custom-store update notices | [Plugin Stores](docs/guides/plugin-stores.md) |
 | **Store browsing** | Basic catalog list; fails or stalls when a store is slow | **6 filters**, sort by update date, `Updated` dates, root badges, GitHub links, **6-hour cache**, and **20 s** per-store timeout | [Plugin Stores](docs/guides/plugin-stores.md) |
 | **Install & recovery** | Single-version system service install | **Clickable GUI installer**, auto-backups before every change, **3-step undo**, and reversible migration from Official Decky | [Installation](docs/guides/installation.md) |
-| **Everyday UI polish** | Modal warning timers on manual ZIP/URL installs; reload-page error lockouts | Clean in-place error recovery, no ZIP/URL warning countdown, dismissed toasts stay cleared, and preserved plugin order | — |
+| **Everyday UI polish** | Modal warning timers on manual ZIP/URL installs; reload-page error lockouts | Clean in-place error recovery, no ZIP/URL warning countdown, dismissed toasts stay cleared, preserved plugin order, and **Enable all / Disable all** for plugins | [Decky Settings](docs/guides/settings.md) |
+| **Testing builds** | Download-only list with progress at the top of the page | Steam-style pull request list with author and dates, sorting, and an install window with progress and in-window errors | [Decky Settings](docs/guides/settings.md#testing) |
 | **Plugin authors** | Python plugin backends only | Live CPU/RAM per plugin (`--status`), optional zero-Python **Rust backends**, and fast `decky.native.dumps` JSON | [Plugin Authors](docs/guides/plugin-authors.md) |
 
 ## Install in 3 steps
@@ -63,6 +64,7 @@ This is an independent fork of [SteamDeckHomebrew/decky-loader](https://github.c
 |---|---|
 | **[Installation & Migration](docs/guides/installation.md)** | Graphical installer walkthrough, moving from Official Decky, 3-step undo, CLI & SSH flags |
 | **[Plugin Stores & GitHub](docs/guides/plugin-stores.md)** | Multiple stores, priority ordering, adding GitHub repos, filters, caching, timeouts |
+| **[Decky Settings](docs/guides/settings.md)** | Tour of the General, Plugins, Developer, and Testing pages; enable or disable all plugins; install pull request builds |
 | **[Root Plugins](docs/guides/root-plugins.md)** | Enabling isolated root plugin support, per-install consent, security rules, turning it off |
 | **[Speed & Memory Benchmarks](docs/guides/benchmarks.md)** | Official Decky vs. Rust loader metrics, Python vs. Rust plugin benchmarks, `--status` |
 | **[Troubleshooting](docs/guides/troubleshooting.md)** | Fixing missing QAM menu, Steam Beta plugin errors, ports 1337/8080, legacy upgrades, debug logs |
