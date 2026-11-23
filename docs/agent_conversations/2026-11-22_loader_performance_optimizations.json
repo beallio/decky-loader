@@ -1,0 +1,128 @@
+{
+  "date": "2026-11-22",
+  "task_objective": "Empirically profile and optimize Decky Loader Rust backend, installer, Steam Beta CDP scope resolution, static asset serving, and frontend boot/store performance on branch perf/loader-startup-and-memory using strict Red-Green-Refactor TDD and A/B verification on steamdeck-vm.",
+  "branch": "perf/loader-startup-and-memory",
+  "commits": [
+    "6bde376 perf(startup): add release LTO, cap Tokio threads, and skip worker --describe when flags provided",
+    "03d1702 perf(workers): poll pidfd before launcher status IPC and skip no-op non-root chmods",
+    "f967df5 perf(io): stream plugin ZIPs to disk, offload ZIP/filepicker I/O, and reuse HTTP clients",
+    "659a04c perf(transport,cef): optimize Beta CDP scope lookup and static asset serving",
+    "ea72222 perf(frontend): cut boot waterfall, deduplicate store/version RPCs, lazy-load store images, and speed up sorting"
+  ],
+  "files_modified": [
+    "docs/plans/loader_performance.md",
+    "backend-rust/Cargo.toml",
+    "backend-rust/install.py",
+    "backend-rust/src/main.rs",
+    "backend-rust/src/platform.rs",
+    "backend-rust/src/workers.rs",
+    "backend-rust/src/backend.rs",
+    "backend-rust/src/plugin_manager.rs",
+    "backend-rust/src/utilities.rs",
+    "backend-rust/src/cef.rs",
+    "backend-rust/src/transport.rs",
+    "frontend/src/index.ts",
+    "frontend/src/plugin-loader.tsx",
+    "frontend/src/store.tsx",
+    "frontend/src/storeSources.ts",
+    "frontend/src/components/store/Store.tsx",
+    "frontend/src/components/store/PluginCard.tsx",
+    "tests/runtime/test_user_service_installer.py",
+    "tests/frontend/store_sources.test.mts"
+  ],
+  "tests_added": [
+    "backend-rust/src/main.rs: resolve_host_user_uses_system_passwd_entry",
+    "backend-rust/src/main.rs: runtime_metadata_uses_explicit_flags_without_running_worker_describe",
+    "tests/runtime/test_user_service_installer.py: generated unit passes --sdk-version and --python-version when manifest metadata is present",
+    "backend-rust/src/platform.rs: fd_is_readable_tracks_child_exit_without_blocking",
+    "backend-rust/src/workers.rs: non_root_permissions_skip_redundant_chmod_on_already_compliant_tree",
+    "backend-rust/src/plugin_manager.rs: streamed_archive_hashes_and_extracts_from_disk_and_cleans_temp_file",
+    "backend-rust/src/utilities.rs: legacy_http_reuses_shared_client_only_for_default_transport_options",
+    "backend-rust/src/cef.rs: scope_resolve_uses_own_properties_and_does_not_wait_for_release_reply",
+    "backend-rust/src/transport.rs: frontend_cache_control_marks_hashed_chunks_immutable_and_entrypoints_no_cache",
+    "backend-rust/src/transport.rs: read_file_response_serves_inline_and_streamed_files_with_exact_content",
+    "tests/frontend/store_sources.test.mts: sortStorePlugins orders by name, dates, and downloads without mutating input",
+    "tests/frontend/store_sources.test.mts: createUpdateCheckDeduplicator coalesces in-flight checks and caches only complete results"
+  ],
+  "design_decisions": [
+    "Passed --sdk-version and --python-version from install.py systemd unit generation with automatic fallback to DeckyPluginWorker --describe when flags are omitted (because bundle.json is not copied into installed runtime directories).",
+    "Used ownProperties: true on CDP Runtime.getProperties for function objects (empirically verified 40/40 [[Scopes]] hit rate and -84% payload size on Steam Beta 1795048523) and rejected accessorPropertiesOnly: true (0/40 scopes).",
+    "Made Runtime.releaseObjectGroup fire-and-forget via ScopeConnection::notify instead of awaiting a fifth CDP round trip per module.",
+    "Preserved transport.rs socket_lifecycle mutex for connection takeover and FULL_SYNC serialization.",
+    "Replaced SuspensefulImage in PluginCard.tsx with native <img loading=\"lazy\" decoding=\"async\"> plus a spinner/error overlay because @decky/ui SuspensefulImage eagerly triggers new Image() inside useEffect for every mounted card.",
+    "Kept all frontend edits strictly within existing SDK_OVERLAYS entries in scripts/runtime/prepare_bundle.py."
+  ],
+  "results": {
+    "local_validation": {
+      "rust_fmt_clippy_test": "passed (87 runtime + 10 decky_plugin + 1 doc-test)",
+      "python_runtime_unittest": "passed (161 passed, 2 skipped)",
+      "python_ruff_and_backend_ty": "passed",
+      "python_parity": "passed (v4.0.0-pre1)",
+      "frontend_unit_tests": "passed (23 passed)",
+      "frontend_typecheck_lint_build": "passed (including rollup dflGlobal check)"
+    },
+    "steamdeck_vm_ab_benchmarks": {
+      "binary_size_bytes": {
+        "before": 13398288,
+        "after": 9210808,
+        "delta": "-4.00 MiB (-31.3%)"
+      },
+      "zero_plugin_cold_start_ms": {
+        "before_median": 242.1,
+        "after_with_flags_median": 6.56,
+        "after_fallback_median": 234.85,
+        "delta": "-97.3% (36.9x faster with metadata flags)"
+      },
+      "idle_process_same_fs": {
+        "threads": {
+          "before": 6,
+          "after": 4
+        },
+        "rss_kib": {
+          "before": 10448,
+          "after": 8544,
+          "delta": "-18.2%"
+        },
+        "pss_kib": {
+          "before": 8073,
+          "after": 6075,
+          "delta": "-24.7%"
+        },
+        "anonymous_kib": {
+          "before": 1356,
+          "after": 1064,
+          "delta": "-21.5%"
+        }
+      },
+      "seven_plugins_startup_chown1_ms": {
+        "before_avg": 1799.51,
+        "after_avg": 1489.98,
+        "delta": "-309.5 ms (-17.2%)"
+      },
+      "synthetic_24mib_zip_install_3_rounds": {
+        "peak_anonymous_mib": {
+          "before": [31.73, 35.98, 38.76],
+          "after": [2.73, 3.41, 3.23],
+          "delta": "-91.7% peak heap (38.76 MiB -> 3.23 MiB)"
+        },
+        "peak_rss_mib": {
+          "before": [41.38, 45.82, 48.6],
+          "after": [10.47, 11.28, 11.1],
+          "delta": "-77.2% peak RSS"
+        },
+        "post_install_anonymous_mib": {
+          "before": [2.05, 3.56, 3.14],
+          "after": [1.59, 2.38, 2.38]
+        },
+        "install_ms": {
+          "before": [62.9, 61.7, 62.6],
+          "after": [61.7, 62.0, 61.8]
+        }
+      },
+      "static_asset_cache_control": {
+        "index.js": "no-cache",
+        "chunk-B352hPKx.js": "public, max-age=31536000, immutable"
+      }
+    }
+  }
+}
