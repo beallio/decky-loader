@@ -199,7 +199,11 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
   }, []);
 
   const { installedPlugins } = useDeckyState();
-  const installedNames = useMemo(() => new Set(installedPlugins.map((plugin) => plugin.name)), [installedPlugins]);
+  const installedByName = useMemo(
+    () => new Map(installedPlugins.map((plugin) => [plugin.name, plugin])),
+    [installedPlugins],
+  );
+  const installedNames = useMemo(() => new Set(installedByName.keys()), [installedByName]);
 
   const storeOptions = useMemo(() => {
     const counts = new Map<string, number>();
@@ -431,7 +435,7 @@ const BrowseTab: FC<{ setPluginCount: Dispatch<SetStateAction<number | null>> }>
             <PluginCard
               key={`${plugin.id}_${plugin.name}`}
               storePlugin={plugin}
-              installedPlugin={installedPlugins.find((installedPlugin) => installedPlugin.name === plugin.name)}
+              installedPlugin={installedByName.get(plugin.name)}
             />
           ))
         )}

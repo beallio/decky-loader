@@ -283,18 +283,54 @@ export function sortStorePlugins<T extends StorePlugin>(
 ): T[] {
   if (!by) return plugins;
   const sign = direction === 'desc' ? -1 : 1;
-  const number = (plugin: T) =>
-    by === 'date'
-      ? Date.parse(plugin.created ?? '') || 0
-      : by === 'updated'
-        ? Date.parse(plugin.updated ?? '') || 0
-        : by === 'downloads'
-          ? plugin.downloads ?? 0
-          : 0;
-  return [...plugins].sort(
-    (a, b) =>
-      sign * (by === 'name' ? a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }) : number(a) - number(b)),
-  );
+  if (by === 'name') {
+    const collator = new Intl.Collator(undefined, { sensitivity: 'base' });
+    return [...plugins].sort((a, b) => sign * collator.compare(a.name, b.name));
+  }
+  const keyed = plugins.map((plugin) => ({
+    plugin,
+    key:
+      by === 'date'
+        ? Date.parse(plugin.created ?? '') || 0
+        : by === 'updated'
+          ? Date.parse(plugin.updated ?? '') || 0
+          : by === 'downloads'
+            ? plugin.downloads ?? 0
+            : 0,
+  }));
+  keyed.sort((a, b) => sign * (a.key - b.key));
+  return keyed.map((entry) => entry.plugin);
+}
+
+/**
+ * Coalesces overlapping checks and optionally reuses a recent complete check.
+ * A check marked incomplete (for example, while offline) is never reused so a later retry runs.
+ */
+export function createUpdateCheckDeduplicator<T>(
+  run: () => Promise<{ value: T; complete: boolean }>,
+  now: () => number = Date.now,
+) {
+  let inflight: Promise<T> | null = null;
+  let lastComplete: { at: number; value: T } | null = null;
+  return {
+    hasCompleteResult: () => lastComplete !== null,
+    check(maxAgeMs?: number): Promise<T> {
+      if (maxAgeMs !== undefined && lastComplete !== null && now() - lastComplete.at < maxAgeMs) {
+        return Promise.resolve(lastComplete.value);
+      }
+      if (inflight) return inflight;
+      const promise = run()
+        .then(({ value, complete }) => {
+          if (complete) lastComplete = { at: now(), value };
+          return value;
+        })
+        .finally(() => {
+          if (inflight === promise) inflight = null;
+        });
+      inflight = promise;
+      return promise;
+    },
+  };
 }
 
 /** How long a saved store list is used before the store is asked again. */

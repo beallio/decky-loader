@@ -67,15 +67,20 @@ export type PluginUpdateMapping = Map<string, StorePluginVersion>;
 // Fork: an ordered list of stores replaces the single 'store' / 'store-url' choice. Those old
 // settings stay untouched, so going back to official Decky keeps the user's old store.
 export async function getStoreSettings(): Promise<StoreSettings> {
-  const stores = await getSetting<string[] | null>('store_urls', null);
+  const [stores, prereleaseStores, includePrereleases] = await Promise.all([
+    getSetting<string[] | null>('store_urls', null),
+    getSetting<string[]>('prerelease_store_urls', []),
+    getSetting<boolean>('include_prereleases', false),
+  ]);
   if (Array.isArray(stores)) {
     return {
       stores,
-      prereleaseStores: await getSetting<string[]>('prerelease_store_urls', []),
-      includePrereleases: await getSetting<boolean>('include_prereleases', false),
+      prereleaseStores,
+      includePrereleases,
     };
   }
-  const settings = migrateStoreSettings(await getSetting('store', null), await getSetting('store-url', null));
+  const [oldStore, oldUrl] = await Promise.all([getSetting('store', null), getSetting('store-url', null)]);
+  const settings = migrateStoreSettings(oldStore, oldUrl);
   await saveStoreSettings(settings);
   return settings;
 }
@@ -90,12 +95,12 @@ export async function saveStoreSettings(settings: StoreSettings) {
 // Fork: store data goes through the backend's authenticated /fetch proxy. A browser fetch
 // with X-Decky-Version needs a CORS preflight, which static hosts such as GitHub Pages refuse.
 async function storeFetch(url: string, signal: AbortSignal): Promise<Response> {
-  const version = await window.DeckyPluginLoader.updateVersion();
+  const currentVersion = await window.DeckyPluginLoader.getCurrentVersion();
   return window.DeckyPluginLoader.fetchNoCors(url, {
     method: 'GET',
     catalog: true,
     headers: {
-      'X-Decky-Version': version.current,
+      'X-Decky-Version': currentVersion,
     },
     excludedHeaders: [],
     signal,
@@ -278,7 +283,9 @@ function countingStore(store: string | undefined): string | undefined {
   return store && !githubRepo(store) ? store : undefined;
 }
 
-export async function checkForPluginUpdates(plugins: (Plugin | DisabledPlugin)[]): Promise<PluginUpdateMapping> {
+export async function checkForPluginUpdatesWithStatus(
+  plugins: (Plugin | DisabledPlugin)[],
+): Promise<{ updates: PluginUpdateMapping; complete: boolean }> {
   const serverData = await fromEachStore(fetchVersionList);
   const updateMap = new Map<string, StorePluginVersion>();
   for (let plugin of plugins) {
@@ -298,7 +305,12 @@ export async function checkForPluginUpdates(plugins: (Plugin | DisabledPlugin)[]
       updateMap.set(plugin.name, remotePlugin);
     }
   }
-  return updateMap;
+  const complete = serverData.length > 0 && serverData.every((entry) => entry.value !== null);
+  return { updates: updateMap, complete };
+}
+
+export async function checkForPluginUpdates(plugins: (Plugin | DisabledPlugin)[]): Promise<PluginUpdateMapping> {
+  return (await checkForPluginUpdatesWithStatus(plugins)).updates;
 }
 
 function pluginUrl(hash: string) {

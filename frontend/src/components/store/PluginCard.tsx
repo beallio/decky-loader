@@ -6,11 +6,11 @@ import {
   Navigation,
   PanelSectionRow,
   SingleDropdownOption,
-  SuspensefulImage,
+  Spinner,
   showModal,
 } from '@decky/ui';
 import { compare, validate } from 'compare-versions';
-import { CSSProperties, FC, useState } from 'react';
+import { CSSProperties, FC, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   FaArrowDown,
@@ -36,6 +36,12 @@ interface PluginCardProps {
 
 const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
   const [selectedOption, setSelectedOption] = useState<number>(0);
+  const [imageState, setImageState] = useState<'loading' | 'loaded' | 'error'>(() =>
+    storePlugin.image_url ? 'loading' : 'error',
+  );
+  useEffect(() => {
+    setImageState(storePlugin.image_url ? 'loading' : 'error');
+  }, [storePlugin.image_url]);
   const installedVersionIndex = storePlugin.versions.findIndex((version) => version.name === installedPlugin?.version);
   // Fork: versions from several stores are not in one newest-first order, so compare them when possible.
   const installedVersion = installedPlugin?.version;
@@ -78,17 +84,39 @@ const PluginCard: FC<PluginCardProps> = ({ storePlugin, installedPlugin }) => {
           position: 'relative',
         }}
       >
-        <SuspensefulImage
-          className="deckyStoreCardImage"
-          suspenseHeight="200px"
-          suspenseWidth="320px"
-          style={{
-            width: '320px',
-            height: '200px',
-            objectFit: 'cover',
-          }}
-          src={storePlugin.image_url}
-        />
+        {imageState !== 'loaded' && (
+          <div
+            style={{
+              position: 'absolute',
+              inset: 0,
+              width: '320px',
+              height: '200px',
+              background: 'rgba(255, 255, 255, 0.2)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              pointerEvents: 'none',
+            }}
+          >
+            {imageState === 'error' ? 'Missing image' : <Spinner style={{ height: '48px' }} />}
+          </div>
+        )}
+        {storePlugin.image_url && imageState !== 'error' && (
+          <img
+            className="deckyStoreCardImage"
+            loading="lazy"
+            decoding="async"
+            style={{
+              width: '320px',
+              height: '200px',
+              objectFit: 'cover',
+              opacity: imageState === 'loaded' ? 1 : 0,
+            }}
+            src={storePlugin.image_url}
+            onLoad={() => setImageState('loaded')}
+            onError={() => setImageState('error')}
+          />
+        )}
       </div>
       <div
         className="deckyStoreCardInfo"
