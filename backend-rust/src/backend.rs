@@ -91,6 +91,7 @@ pub struct Backend {
     pub(crate) version: String,
     pub(crate) sdk_version: String,
     pub(crate) client: reqwest::Client,
+    pub(crate) download_client: reqwest::Client,
     pub(crate) config: RuntimeConfig,
     pub(crate) cef: Cef,
     pub(crate) updater: Arc<Updater>,
@@ -101,6 +102,7 @@ pub struct Backend {
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 // Matches the 300 s that upstream's aiohttp session allows a stalled server; idle-based, so long streams keep working.
 const HTTP_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The shared client for plugin fetches, CEF discovery and loader updates.
 pub(crate) fn http_client(version: &str) -> reqwest::Result<reqwest::Client> {
@@ -112,6 +114,19 @@ pub(crate) fn http_client(version: &str) -> reqwest::Result<reqwest::Client> {
         .no_deflate()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .read_timeout(HTTP_READ_IDLE_TIMEOUT)
+        .build()
+}
+
+/// Shared decoding client for plugin archives and remote binary downloads.
+pub(crate) fn download_http_client(version: &str) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(format!("Decky/{version} (https://decky.xyz)"))
+        .no_proxy()
+        .gzip(true)
+        .brotli(true)
+        .deflate(true)
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(DOWNLOAD_READ_TIMEOUT)
         .build()
 }
 
@@ -137,6 +152,7 @@ impl Backend {
         };
         let config = RuntimeConfig::default();
         let client = http_client(&version)?;
+        let download_client = download_http_client(&version)?;
         let cef = Cef::new(client.clone(), config.cef_url.clone());
         Ok(Self {
             registry,
@@ -148,6 +164,7 @@ impl Backend {
             version,
             sdk_version,
             client,
+            download_client,
             config,
             cef,
             updater: Arc::new(Updater::new()),

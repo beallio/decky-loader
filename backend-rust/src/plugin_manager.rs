@@ -1,15 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, OpenOptions},
-    io::{self, Cursor},
+    fs::{self, File, OpenOptions},
+    io,
     path::{Component, Path, PathBuf},
-    time::Duration,
 };
 
-use axum::body::Bytes;
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, oneshot};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{Mutex, oneshot},
+};
 use uuid::Uuid;
 use zip::ZipArchive;
 
@@ -25,8 +27,6 @@ const SETTINGS_KEYS: [&str; 4] = [
     "pluginOrder",
     "disabled_plugins",
 ];
-const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct InstallRequest {
@@ -470,46 +470,26 @@ impl PluginManager {
             find_plugin_directory(&plugin_root, &request.name)?.is_some();
         let archive = if let Some(local_path) = request.artifact.strip_prefix("file://") {
             download_info(backend, 10, "Store.download_progress_info.open_zip");
-            Bytes::from(tokio::fs::read(local_path).await.map_err(|error| {
-                RpcError::failure(format!(
-                    "Could not open local plugin archive {local_path}: {error}"
-                ))
-            })?)
+            hash_local_archive(PathBuf::from(local_path)).await?
         } else {
             download_info(backend, 10, "Store.download_progress_info.download_zip");
-            let download_client = decoding_download_client(backend)?;
-            let response = download_client
-                .get(&request.artifact)
-                .send()
-                .await
-                .map_err(|error| {
-                    RpcError::failure(format!(
-                        "Could not download plugin archive {}: {error}",
-                        request.artifact
-                    ))
-                })?;
-            if response.status() != reqwest::StatusCode::OK {
-                let status = response.status();
-                let detail = response.text().await.unwrap_or_default();
-                return Err(RpcError::failure(format!(
-                    "Could not fetch plugin archive {}: HTTP {status}: {detail}",
-                    request.artifact
-                )));
-            }
-            let bytes = response.bytes().await.map_err(|error| {
-                RpcError::failure(format!(
-                    "Could not read plugin archive {}: {error}",
-                    request.artifact
-                ))
-            })?;
+            let downloaded =
+                stream_archive_to_file(&backend.download_client, &request.artifact, &plugin_root)
+                    .await?;
             download_info(backend, 70, "Store.download_progress_info.increment_count");
             increment_install_count(backend, request, already_installed_by_request_name);
-            bytes
+            downloaded
         };
 
         download_info(backend, 75, "Store.download_progress_info.parse_zip");
-        verify_archive_hash(&archive, &request.hash)?;
-        let archive_directory = inspect_archive(&archive)?;
+        verify_archive_digest(&archive.sha256, &request.hash)?;
+        let archive_path = archive.path.clone();
+        let archive_directory =
+            tokio::task::spawn_blocking(move || inspect_archive_file(&archive_path))
+                .await
+                .map_err(|error| {
+                    RpcError::failure(format!("Plugin ZIP inspection task failed: {error}"))
+                })??;
         download_info(
             backend,
             80,
@@ -521,7 +501,18 @@ impl PluginManager {
             "Store.download_progress_info.installing_plugin",
         );
         let stage = StagedPlugin::create(&plugin_root, &backend.homebrew)?;
-        extract_archive(&archive, &archive_directory, &stage.path)?;
+        let extract_archive_path = archive.path.clone();
+        let extract_directory = archive_directory.clone();
+        let extract_stage = stage.path.clone();
+        tokio::task::spawn_blocking(move || {
+            extract_archive_file(&extract_archive_path, &extract_directory, &extract_stage)
+        })
+        .await
+        .map_err(|error| {
+            RpcError::failure(format!("Plugin ZIP extraction task failed: {error}"))
+        })??;
+        let sha256 = archive.sha256.clone();
+        drop(archive);
         let candidate = read_plugin_candidate(&stage.path)?;
         if request.version != "dev" && candidate.name != request.name {
             return Err(RpcError::failure(format!(
@@ -533,8 +524,6 @@ impl PluginManager {
         if candidate.requires_root && platform::effective_user_ids().0 != 0 {
             // Root plugin files must come from root, not from this account's download.
             drop(stage);
-            // The root host downloads the archive again and must get these same bytes.
-            let sha256 = format!("{:x}", Sha256::digest(&archive));
             let artifact_host = reqwest::Url::parse(&request.artifact)
                 .ok()
                 .and_then(|url| url.host_str().map(str::to_owned))
@@ -1170,7 +1159,100 @@ fn encode_path_segment(segment: &str) -> String {
     result
 }
 
-fn verify_archive_hash(archive: &[u8], expected: &Value) -> Result<(), RpcError> {
+struct DownloadedArchive {
+    path: PathBuf,
+    sha256: String,
+    remove_on_drop: bool,
+}
+
+impl Drop for DownloadedArchive {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+async fn hash_local_archive(path: PathBuf) -> Result<DownloadedArchive, RpcError> {
+    let display = path.display().to_string();
+    let hash_path = path.clone();
+    let sha256 = tokio::task::spawn_blocking(move || -> io::Result<String> {
+        let mut file = File::open(&hash_path)?;
+        let mut hasher = Sha256::new();
+        io::copy(&mut file, &mut hasher)?;
+        Ok(format!("{:x}", hasher.finalize()))
+    })
+    .await
+    .map_err(|error| RpcError::failure(format!("Hashing local plugin archive failed: {error}")))?
+    .map_err(|error| {
+        RpcError::failure(format!(
+            "Could not open local plugin archive {display}: {error}"
+        ))
+    })?;
+    Ok(DownloadedArchive {
+        path,
+        sha256,
+        remove_on_drop: false,
+    })
+}
+
+async fn stream_archive_to_file(
+    client: &reqwest::Client,
+    url: &str,
+    directory: &Path,
+) -> Result<DownloadedArchive, RpcError> {
+    let response = client.get(url).send().await.map_err(|error| {
+        RpcError::failure(format!("Could not download plugin archive {url}: {error}"))
+    })?;
+    if response.status() != reqwest::StatusCode::OK {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        return Err(RpcError::failure(format!(
+            "Could not fetch plugin archive {url}: HTTP {status}: {detail}"
+        )));
+    }
+    let path = directory.join(format!(".decky-download-{}.zip", Uuid::new_v4().simple()));
+    let mut output = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .await
+        .map_err(|error| {
+            RpcError::failure(format!(
+                "Could not create temporary plugin archive {}: {error}",
+                path.display()
+            ))
+        })?;
+    let mut archive = DownloadedArchive {
+        path,
+        sha256: String::new(),
+        remove_on_drop: true,
+    };
+    let mut hasher = Sha256::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            RpcError::failure(format!("Could not read plugin archive {url}: {error}"))
+        })?;
+        hasher.update(&chunk);
+        output.write_all(&chunk).await.map_err(|error| {
+            RpcError::failure(format!(
+                "Could not write temporary plugin archive {}: {error}",
+                archive.path.display()
+            ))
+        })?;
+    }
+    output.flush().await.map_err(|error| {
+        RpcError::failure(format!(
+            "Could not flush temporary plugin archive {}: {error}",
+            archive.path.display()
+        ))
+    })?;
+    archive.sha256 = format!("{:x}", hasher.finalize());
+    Ok(archive)
+}
+
+fn verify_archive_digest(actual: &str, expected: &Value) -> Result<(), RpcError> {
     let expected = match expected {
         Value::String(value) if !value.is_empty() => Some(value.as_str()),
         Value::Bool(false) | Value::Null => None,
@@ -1181,19 +1263,24 @@ fn verify_archive_hash(archive: &[u8], expected: &Value) -> Result<(), RpcError>
             ));
         }
     };
-    if let Some(expected) = expected {
-        let actual = format!("{:x}", Sha256::digest(archive));
-        if actual != expected {
-            return Err(RpcError::failure(format!(
-                "SHA-256 mismatch for plugin archive: expected {expected}, received {actual}"
-            )));
-        }
+    if let Some(expected) = expected
+        && actual != expected
+    {
+        return Err(RpcError::failure(format!(
+            "SHA-256 mismatch for plugin archive: expected {expected}, received {actual}"
+        )));
     }
     Ok(())
 }
 
-fn inspect_archive(archive_bytes: &[u8]) -> Result<String, RpcError> {
-    let mut archive = ZipArchive::new(Cursor::new(archive_bytes)).map_err(|error| {
+fn inspect_archive_file(path: &Path) -> Result<String, RpcError> {
+    let file = File::open(path).map_err(|error| {
+        RpcError::failure(format!(
+            "Could not open plugin ZIP archive {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut archive = ZipArchive::new(file).map_err(|error| {
         RpcError::failure(format!("Could not read plugin ZIP archive: {error}"))
     })?;
     let mut plugin_roots = HashSet::new();
@@ -1253,12 +1340,18 @@ fn safe_archive_path(name: &str) -> Result<PathBuf, RpcError> {
     Ok(path)
 }
 
-fn extract_archive(
-    archive_bytes: &[u8],
+fn extract_archive_file(
+    archive_path: &Path,
     archive_directory: &str,
     stage: &Path,
 ) -> Result<(), RpcError> {
-    let mut archive = ZipArchive::new(Cursor::new(archive_bytes)).map_err(|error| {
+    let file = File::open(archive_path).map_err(|error| {
+        RpcError::failure(format!(
+            "Could not open plugin ZIP archive {}: {error}",
+            archive_path.display()
+        ))
+    })?;
+    let mut archive = ZipArchive::new(file).map_err(|error| {
         RpcError::failure(format!("Could not read plugin ZIP archive: {error}"))
     })?;
     let mut paths = HashSet::new();
@@ -1413,18 +1506,11 @@ fn read_json_file(path: &Path) -> Result<Value, RpcError> {
         .map_err(|error| RpcError::failure(format!("Invalid JSON in {}: {error}", path.display())))
 }
 
-fn decoding_download_client(backend: &Backend) -> Result<reqwest::Client, RpcError> {
-    decoding_download_client_with_timeouts(
-        &backend.version,
-        DOWNLOAD_CONNECT_TIMEOUT,
-        DOWNLOAD_READ_TIMEOUT,
-    )
-}
-
+#[cfg(test)]
 fn decoding_download_client_with_timeouts(
     version: &str,
-    connect_timeout: Duration,
-    read_timeout: Duration,
+    connect_timeout: std::time::Duration,
+    read_timeout: std::time::Duration,
 ) -> Result<reqwest::Client, RpcError> {
     reqwest::Client::builder()
         .user_agent(format!("Decky/{version} (https://decky.xyz)"))
@@ -1460,7 +1546,7 @@ async fn download_remote_binaries(
     if remote_binaries.is_empty() {
         return Ok(());
     }
-    let download_client = decoding_download_client(backend)?;
+    let download_client = &backend.download_client;
     let bin_directory = plugin_directory.join("bin");
     fs::create_dir_all(&bin_directory).map_err(|error| {
         RpcError::failure(format!(
@@ -1761,6 +1847,8 @@ fn with_rollback_error(error: String, rollback_error: Option<String>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn root_install_continues_only_with_a_password() {
@@ -1964,5 +2052,76 @@ mod tests {
             settings.get("pluginOrder"),
             ["before", "Target", "after", "Fresh"]
         );
+    }
+
+    #[tokio::test]
+    async fn streamed_archive_hashes_and_extracts_from_disk_and_cleans_temp_file() {
+        use std::io::Write;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut zip_bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut zip_bytes));
+            let options = zip::write::SimpleFileOptions::default();
+            writer
+                .start_file("DemoPlugin/plugin.json", options)
+                .unwrap();
+            writer
+                .write_all(br#"{"name":"Demo","author":"Test","flags":[]}"#)
+                .unwrap();
+            writer.start_file("DemoPlugin/main.py", options).unwrap();
+            writer.write_all(b"class Plugin: pass\n").unwrap();
+            writer.finish().unwrap();
+        }
+        let expected_sha = format!("{:x}", Sha256::digest(&zip_bytes));
+        let payload = zip_bytes.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = socket.read(&mut req).await;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                payload.len()
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(&payload).await.unwrap();
+        });
+
+        let root = std::env::temp_dir().join(format!("decky-stream-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let client = decoding_download_client_with_timeouts(
+            "test",
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let downloaded =
+            stream_archive_to_file(&client, &format!("http://{address}/demo.zip"), &root)
+                .await
+                .unwrap();
+        assert_eq!(downloaded.sha256, expected_sha);
+        verify_archive_digest(&downloaded.sha256, &Value::String(expected_sha.clone())).unwrap();
+        assert!(verify_archive_digest(&downloaded.sha256, &Value::String("0".repeat(64))).is_err());
+
+        let temp_path = downloaded.path.clone();
+        assert!(temp_path.is_file());
+        let dir = inspect_archive_file(&temp_path).unwrap();
+        assert_eq!(dir, "DemoPlugin");
+        let stage = root.join("stage");
+        fs::create_dir(&stage).unwrap();
+        extract_archive_file(&temp_path, &dir, &stage).unwrap();
+        assert!(stage.join("plugin.json").is_file());
+        assert!(stage.join("main.py").is_file());
+
+        drop(downloaded);
+        assert!(
+            !temp_path.exists(),
+            "streamed temporary archive must be deleted on drop"
+        );
+        server.await.unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 }
