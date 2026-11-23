@@ -1,5 +1,5 @@
 import { ConfirmModal, Field, ProgressBar } from '@decky/ui';
-import { FC, useEffect, useRef, useState } from 'react';
+import { FC, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { UI_COLORS } from '../../utils/uiStyles';
@@ -8,29 +8,28 @@ import PluginInstallProgress from './PluginInstallProgress';
 interface TestingInstallVersion {
   id: number;
   name: string;
-  author: string;
+  author?: string;
 }
 
 interface TestingInstallModalProps {
   version: TestingInstallVersion;
   onConfirm(): Promise<void>;
+  onInstallFailed(): void;
   closeModal?(): void;
 }
 
-const TestingInstallModal: FC<TestingInstallModalProps> = ({ version, onConfirm, closeModal }) => {
+const TestingInstallModal: FC<TestingInstallModalProps> = ({ version, onConfirm, onInstallFailed, closeModal }) => {
   const { t } = useTranslation();
   const [loading, setLoading] = useState<boolean>(false);
   const [reloading, setReloading] = useState<boolean>(false);
   const [percentage, setPercentage] = useState<number>(0);
   const [error, setError] = useState<string | null>(null);
-  const finishedRef = useRef<boolean>(false);
 
   useEffect(() => {
     const progressListener = DeckyBackend.addEventListener('updater/update_download_percentage', (value) => {
       setPercentage(value);
     });
     const finishListener = DeckyBackend.addEventListener('updater/finish_download', () => {
-      finishedRef.current = true;
       setReloading(true);
     });
 
@@ -42,31 +41,32 @@ const TestingInstallModal: FC<TestingInstallModalProps> = ({ version, onConfirm,
 
   return (
     <ConfirmModal
+      bDisableBackgroundDismiss={loading}
       bOKDisabled={loading}
       bCancelDisabled={loading}
       bHideCloseIcon={loading}
-      closeModal={closeModal}
       strTitle={version.name}
       strOKButtonText={loading ? t('Testing.installing') : t('Testing.install')}
       onOK={async () => {
         setError(null);
         setReloading(false);
         setPercentage(0);
-        finishedRef.current = false;
         setLoading(true);
         try {
           await onConfirm();
           // Fork: the RPC resolves after the install handoff is queued, so the reload is next.
           setReloading(true);
         } catch (e) {
-          // Fork: a dropped WebSocket after finish_download is the restart, not a failed download.
-          if (finishedRef.current) return;
           setError(e instanceof Error ? `${e.name}: ${e.message}` : String(e));
           setReloading(false);
           setLoading(false);
+          onInstallFailed();
         }
       }}
       onCancel={() => {
+        if (!loading) closeModal?.();
+      }}
+      onEscKeypress={() => {
         if (!loading) closeModal?.();
       }}
     >
@@ -81,7 +81,7 @@ const TestingInstallModal: FC<TestingInstallModalProps> = ({ version, onConfirm,
       >
         {'#' + version.id}
         {' · '}
-        {t('Testing.author', { author: version.author })}
+        {t('Testing.author', { author: version.author ?? '' })}
       </div>
       {loading &&
         (reloading ? (
