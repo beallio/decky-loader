@@ -33,6 +33,7 @@ export async function bootStable(): Promise<void> {
     findScopeDetailsByVar: legacy.findModuleDetailsByExport,
     findScope: legacy.findModule,
     createScopeMapping: legacy.createModuleMapping,
+    IconsModule: legacy.findModuleExport((e) => e?.ABXYButton && e?.VR) || legacy.IconsModule,
     // Same shape as 5.x createVarMapping, over Webpack export values instead of module scopes.
     createVarMapping(filter: (variable: unknown) => boolean) {
       const mapping = new Map<string, unknown>();

@@ -13,7 +13,7 @@ import {
   showContextMenu,
   showModal,
 } from '@decky/ui';
-import { ComponentType, useEffect, useMemo, useState } from 'react';
+import { ComponentType, ExoticComponent, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   FaCaretDown,
@@ -26,10 +26,9 @@ import {
   FaUser,
 } from 'react-icons/fa';
 
-import { setSetting } from '../../../../utils/settings';
 import { ICON_BUTTON_STYLE, UI_COLORS } from '../../../../utils/uiStyles';
+import { useDeckyState } from '../../../DeckyState';
 import TestingInstallModal from '../../../modals/TestingInstallModal';
-import { UpdateBranch } from '../general/BranchSelect';
 
 interface TestingVersion {
   id: number;
@@ -38,7 +37,7 @@ interface TestingVersion {
   head_sha: string;
   created_at: string;
   updated_at: string;
-  author: string;
+  author?: string;
 }
 
 type SortField = 'updated' | 'opened' | 'number' | 'author' | 'title';
@@ -46,28 +45,47 @@ type SortField = 'updated' | 'opened' | 'number' | 'author' | 'title';
 const formatDate = (iso: string) =>
   new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 
-// Fork: Steam's own icons from @decky/ui's IconsModule (beta: the icon registry; Stable: the Webpack icon module).
-const steamIcons = IconsModule as Record<string, ComponentType | undefined> | undefined;
-const SteamAuthorIcon = steamIcons?.User;
-const SteamClockIcon = steamIcons?.Clock;
-const SteamUpdatedIcon = steamIcons?.Reload;
+// Fork: Steam's own icons from @decky/ui's IconsModule, validated before rendering.
+const steamIcons = IconsModule as Record<string, unknown> | undefined;
+const getRenderableIcon = (icon: unknown): ComponentType | ExoticComponent | undefined =>
+  typeof icon === 'function' || (typeof icon === 'object' && icon !== null && '$$typeof' in icon)
+    ? (icon as ComponentType | ExoticComponent)
+    : undefined;
+const SteamAuthorIcon = getRenderableIcon(steamIcons?.User);
+const SteamClockIcon = getRenderableIcon(steamIcons?.Clock);
+const SteamUpdatedIcon = getRenderableIcon(steamIcons?.Reload);
 
 const getTestingVersions = DeckyBackend.callable<[], TestingVersion[]>('updater/get_testing_versions');
 const downloadTestingVersion = DeckyBackend.callable<[pr_id: number, sha: string]>('updater/download_testing_version');
 
 export default function TestingVersionList() {
   const { t } = useTranslation();
+  const { isLoaderUpdating, setIsLoaderUpdating } = useDeckyState();
 
   const [testingVersions, setTestingVersions] = useState<TestingVersion[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
+  const [loadingError, setLoadingError] = useState<string | null>(null);
   const [sortField, setSortField] = useState<SortField>('updated');
   const [sortDescending, setSortDescending] = useState<boolean>(true);
 
   useEffect(() => {
-    (async () => {
-      setTestingVersions(await getTestingVersions());
-      setLoading(false);
-    })();
+    let cancelled = false;
+
+    const loadTestingVersions = async () => {
+      try {
+        const versions = await getTestingVersions();
+        if (!cancelled) setTestingVersions(versions);
+      } catch (e) {
+        if (!cancelled) setLoadingError(e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+
+    loadTestingVersions();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const sortedVersions = useMemo(() => {
@@ -78,7 +96,7 @@ export default function TestingVersionList() {
         case 'number':
           return version.id;
         case 'author':
-          return version.author.toLowerCase();
+          return (version.author ?? '').toLowerCase();
         case 'title':
           return version.name.toLowerCase();
         case 'updated':
@@ -109,7 +127,7 @@ export default function TestingVersionList() {
       case 'updated':
         return formatDate(version.updated_at);
       case 'author':
-        return version.author;
+        return version.author ?? '';
       case 'number':
       case 'title':
       default:
@@ -125,7 +143,7 @@ export default function TestingVersionList() {
     { label: t('Testing.sort.title'), data: 'title' },
   ];
 
-  const sortLabel = t(`Testing.sort.${sortField}`);
+  const sortLabel = sortOptions.find((option) => option.data === sortField)?.label ?? sortOptions[0].label;
 
   const openSortMenu = (target: EventTarget | null) => {
     showContextMenu(
@@ -141,13 +159,14 @@ export default function TestingVersionList() {
   };
 
   const openInstallModal = (version: TestingVersion) => {
+    if (isLoaderUpdating) return;
+
     showModal(
       <TestingInstallModal
         version={version}
+        onInstallFailed={() => setIsLoaderUpdating(false)}
         onConfirm={async () => {
           await downloadTestingVersion(version.id, version.head_sha);
-          // Fork: switch the branch only when the download worked.
-          setSetting('branch', UpdateBranch.Testing);
         }}
       />,
     );
@@ -158,6 +177,16 @@ export default function TestingVersionList() {
       <>
         <SteamSpinner background="transparent">{t('Testing.loading')}</SteamSpinner>
       </>
+    );
+  }
+
+  if (loadingError) {
+    return (
+      <DialogBody>
+        <p>
+          {t('Testing.load_error')}: {loadingError}
+        </p>
+      </DialogBody>
     );
   }
 
@@ -206,8 +235,10 @@ export default function TestingVersionList() {
             }}
           />
           <Focusable
-            onClick={(e) => openSortMenu(e.currentTarget)}
-            onOKButton={(e) => openSortMenu(e.currentTarget)}
+            role="button"
+            aria-label={sortLabel}
+            aria-haspopup="menu"
+            onActivate={(e) => openSortMenu(e.currentTarget)}
             focusClassName="decky-testing-focus"
             style={{
               display: 'flex',
@@ -222,8 +253,9 @@ export default function TestingVersionList() {
             <span style={{ fontSize: '16px', lineHeight: '20px', whiteSpace: 'nowrap' }}>{sortLabel}</span>
           </Focusable>
           <Focusable
-            onClick={() => setSortDescending((descending) => !descending)}
-            onOKButton={() => setSortDescending((descending) => !descending)}
+            role="button"
+            aria-label={sortDescending ? t('Testing.sort_ascending') : t('Testing.sort_descending')}
+            onActivate={() => setSortDescending((descending) => !descending)}
             focusClassName="decky-testing-focus"
             style={{
               display: 'flex',
@@ -237,9 +269,9 @@ export default function TestingVersionList() {
             }}
           >
             {sortDescending ? (
-              <FaSortAmountDownAlt role="img" aria-label={t('Testing.sort_descending')} size={16} />
+              <FaSortAmountDownAlt aria-hidden="true" size={16} />
             ) : (
-              <FaSortAmountUpAlt role="img" aria-label={t('Testing.sort_ascending')} size={16} />
+              <FaSortAmountUpAlt aria-hidden="true" size={16} />
             )}
           </Focusable>
         </Focusable>
@@ -271,7 +303,7 @@ export default function TestingVersionList() {
                       }}
                     >
                       <span className="decky-testing-icon">{SteamAuthorIcon ? <SteamAuthorIcon /> : <FaUser />}</span>
-                      {t('Testing.author', { author: version.author })}
+                      {t('Testing.author', { author: version.author ?? '' })}
                       {' · '}
                       <span className="decky-testing-icon">{SteamClockIcon ? <SteamClockIcon /> : <FaClock />}</span>
                       {t('Testing.opened', { date: formatDate(version.created_at) })}
@@ -291,6 +323,9 @@ export default function TestingVersionList() {
                       letterSpacing: '0.5px',
                       textTransform: 'uppercase',
                       whiteSpace: 'nowrap',
+                      maxWidth: '35%',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
                       margin: '0 8px',
                       flexShrink: 0,
                     }}
@@ -301,14 +336,20 @@ export default function TestingVersionList() {
                     style={{ display: 'flex', gap: '8px', height: '40px', flexShrink: 0 }}
                     navEntryPreferPosition={NavEntryPositionPreferences.MAINTAIN_X}
                   >
-                    <DialogButton style={ICON_BUTTON_STYLE} onClick={() => openInstallModal(version)}>
-                      <FaDownload role="img" aria-label={t('Testing.install')} style={{ display: 'block' }} />
+                    <DialogButton
+                      style={ICON_BUTTON_STYLE}
+                      aria-label={t('Testing.install')}
+                      disabled={isLoaderUpdating}
+                      onClick={() => openInstallModal(version)}
+                    >
+                      <FaDownload aria-hidden="true" style={{ display: 'block' }} />
                     </DialogButton>
                     <DialogButton
                       style={ICON_BUTTON_STYLE}
+                      aria-label={t('Testing.info')}
                       onClick={() => Navigation.NavigateToExternalWeb(version.link)}
                     >
-                      <FaInfo style={{ display: 'block' }} />
+                      <FaInfo aria-hidden="true" style={{ display: 'block' }} />
                     </DialogButton>
                   </Focusable>
                 </div>
