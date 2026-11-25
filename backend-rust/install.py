@@ -1298,7 +1298,7 @@ def _listener_configuration(environment: list[str], listen: str) -> tuple[list[s
     return preserved, ['/usr/bin/env', *assignments]
 
 
-def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_name: str, listen: str, cef_url: str, inject_frontend: bool, worker_mode: str, github_api: str, release_repository: str, testing_download_url: str, version: str) -> bytes:
+def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_name: str, listen: str, cef_url: str, inject_frontend: bool, worker_mode: str, github_api: str, release_repository: str, testing_download_url: str, version: str, *, sdk_version: str | None = None, python_version: str | None = None) -> bytes:
     environment = _service_environment(paths)
     present = _environment_keys(environment)
     defaults = {
@@ -1316,6 +1316,12 @@ def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_na
         '--worker', str(runtime / WORKER_EXECUTABLE),
         '--worker-mode', worker_mode,
         '--release-version', version,
+    ]
+    if sdk_version:
+        arguments.extend(['--sdk-version', sdk_version])
+    if python_version:
+        arguments.extend(['--python-version', python_version])
+    arguments.extend([
         '--plugin-root', str(paths['homebrew'] / 'plugins'),
         '--homebrew', str(paths['homebrew']),
         '--user', user,
@@ -1329,7 +1335,7 @@ def _generated_unit(paths: dict[str, Path], runtime: Path, user: str, service_na
         '--github-api', github_api,
         '--release-repository', release_repository,
         '--testing-download-url', testing_download_url,
-    ]
+    ])
     command = ' '.join(_systemd_quote(argument) for argument in arguments)
     lines = [
         '[Unit]',
@@ -2269,6 +2275,8 @@ def _run_install(args: argparse.Namespace) -> dict[str, object]:
             args.release_repository,
             args.testing_download_url,
             version,
+            sdk_version=manifest['runtime']['decky_version'],
+            python_version=manifest['runtime']['python'],
         )
         unit_stage = _stage_bytes(unit_data, paths['unit_dir'], f'.{service_file}.{transaction_id}.')
         active_stage = _stage_bytes((json.dumps({'listen': listen, 'version': version, 'sdk_version': manifest['runtime']['decky_version']}, sort_keys=True) + '\n').encode(), paths['state'], f'.active.{transaction_id}.', 0o644)

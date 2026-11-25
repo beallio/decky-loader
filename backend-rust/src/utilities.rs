@@ -327,7 +327,12 @@ impl Utilities {
             }
             "filepicker_ls" => {
                 let options = parse_filepicker_options(&args)?;
-                filepicker_listing(backend.user_home.as_str(), options)
+                let home = backend.user_home.clone();
+                tokio::task::spawn_blocking(move || filepicker_listing(&home, options))
+                    .await
+                    .map_err(|error| {
+                        RpcError::failure(format!("filepicker_ls task failed: {error}"))
+                    })?
             }
             "http_request" => self.http_request(&args).await,
             _ => Err(RpcError::invalid(format!(
@@ -484,41 +489,55 @@ impl Utilities {
             }
         }
 
-        let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
-        if let Some(cookies) = options.get("cookies").filter(|value| !value.is_null()) {
-            let cookies = cookie_pairs(cookies)?;
-            for (name, value) in cookies {
-                cookie_jar.add_cookie_str(&format!("{name}={value}"), &request_url);
-            }
-        }
-
-        let policy = if allow_redirects {
-            reqwest::redirect::Policy::limited(max_redirects)
-        } else {
-            reqwest::redirect::Policy::none()
-        };
+        let cookies_option = options.get("cookies").filter(|value| !value.is_null());
         let manual_decompress = auto_decompress && skip_accept_encoding;
-        let mut builder = Client::builder()
-            .no_proxy()
-            .cookie_provider(cookie_jar)
-            .redirect(policy);
-        if !verify_ssl {
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-        if !auto_decompress || manual_decompress {
-            builder = builder.no_gzip().no_brotli().no_deflate();
-        }
-        if let Some(proxy) = proxy {
-            let mut proxy =
-                reqwest::Proxy::all(proxy).map_err(|error| RpcError::invalid(error.to_string()))?;
-            if !proxy_headers.is_empty() {
-                proxy = proxy.headers(proxy_headers);
+        let owned_client;
+        let client = if can_reuse_legacy_client(
+            cookies_option.is_some(),
+            allow_redirects,
+            max_redirects,
+            auto_decompress,
+            verify_ssl,
+            manual_decompress,
+            proxy.is_some(),
+        ) {
+            &self.legacy_client
+        } else {
+            let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
+            if let Some(cookies) = cookies_option {
+                let cookies = cookie_pairs(cookies)?;
+                for (name, value) in cookies {
+                    cookie_jar.add_cookie_str(&format!("{name}={value}"), &request_url);
+                }
             }
-            builder = builder.proxy(proxy);
-        }
-        let client = builder
-            .build()
-            .map_err(|error| RpcError::failure(error.to_string()))?;
+            let policy = if allow_redirects {
+                reqwest::redirect::Policy::limited(max_redirects)
+            } else {
+                reqwest::redirect::Policy::none()
+            };
+            let mut builder = Client::builder()
+                .no_proxy()
+                .cookie_provider(cookie_jar)
+                .redirect(policy);
+            if !verify_ssl {
+                builder = builder.danger_accept_invalid_certs(true);
+            }
+            if !auto_decompress || manual_decompress {
+                builder = builder.no_gzip().no_brotli().no_deflate();
+            }
+            if let Some(proxy) = proxy {
+                let mut proxy = reqwest::Proxy::all(proxy)
+                    .map_err(|error| RpcError::invalid(error.to_string()))?;
+                if !proxy_headers.is_empty() {
+                    proxy = proxy.headers(proxy_headers);
+                }
+                builder = builder.proxy(proxy);
+            }
+            owned_client = builder
+                .build()
+                .map_err(|error| RpcError::failure(error.to_string()))?;
+            &owned_client
+        };
         let method = Method::from_bytes(method.to_ascii_uppercase().as_bytes())
             .map_err(|error| RpcError::invalid(error.to_string()))?;
         let mut request = client.request(method, request_url);
@@ -1204,14 +1223,31 @@ fn filepicker_listing(home: &str, options: FilePickerOptions) -> Result<Value, R
 
     for entry in entries {
         let entry = entry.map_err(|error| filepicker_io_error(error, requested_path))?;
-        let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') && !options.include_hidden {
+            continue;
+        }
+        let path = entry.path();
         let metadata = match path.metadata() {
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
-        let is_hidden = name.starts_with('.');
         let is_dir = metadata.is_dir();
+        if is_dir && !options.include_folders {
+            continue;
+        }
+        if !is_dir && !options.include_files {
+            continue;
+        }
+        if !is_dir && !extension_matches(&name, options.include_ext.as_deref()) {
+            continue;
+        }
+        if !is_dir
+            && let Some(filter) = &filter
+            && !filter_matches(filter, &name)?
+        {
+            continue;
+        }
         let size = metadata.len();
         let (modified, created) = metadata_times(&metadata);
         let record = FileEntry {
@@ -1223,23 +1259,10 @@ fn filepicker_listing(home: &str, options: FilePickerOptions) -> Result<Value, R
             modified,
             created,
         };
-        if is_hidden && !options.include_hidden {
-            continue;
-        }
-        if options.include_folders && is_dir {
+        if is_dir {
             folders.push(record);
-        } else if options.include_files
-            && extension_matches(&record.name, options.include_ext.as_deref())
-        {
-            if let Some(filter) = &filter
-                && !filter_matches(filter, &record.name)?
-            {
-                continue;
-            }
-            files.push(FileEntry {
-                is_dir: false,
-                ..record
-            });
+        } else {
+            files.push(record);
         }
     }
 
@@ -1496,6 +1519,24 @@ fn max_redirects(value: Option<&Value>) -> Result<usize, RpcError> {
     };
     usize::try_from(value)
         .map_err(|_| RpcError::invalid("http_request max_redirects must be non-negative"))
+}
+
+fn can_reuse_legacy_client(
+    has_cookies: bool,
+    allow_redirects: bool,
+    max_redirects: usize,
+    auto_decompress: bool,
+    verify_ssl: bool,
+    manual_decompress: bool,
+    has_proxy: bool,
+) -> bool {
+    !has_cookies
+        && allow_redirects
+        && max_redirects == 10
+        && auto_decompress
+        && verify_ssl
+        && !manual_decompress
+        && !has_proxy
 }
 
 fn parse_skip_auto_headers(value: Option<&Value>) -> Result<HashSet<HeaderName>, RpcError> {
@@ -2461,5 +2502,33 @@ mod tests {
         .unwrap();
         assert_eq!(listing["total"], 1);
         assert_eq!(listing["files"][0]["name"], "abba.txt");
+    }
+
+    #[test]
+    fn legacy_http_reuses_shared_client_only_for_default_transport_options() {
+        assert!(super::can_reuse_legacy_client(
+            false, true, 10, true, true, false, false
+        ));
+        assert!(!super::can_reuse_legacy_client(
+            true, true, 10, true, true, false, false
+        ));
+        assert!(!super::can_reuse_legacy_client(
+            false, false, 10, true, true, false, false
+        ));
+        assert!(!super::can_reuse_legacy_client(
+            false, true, 5, true, true, false, false
+        ));
+        assert!(!super::can_reuse_legacy_client(
+            false, true, 10, false, true, false, false
+        ));
+        assert!(!super::can_reuse_legacy_client(
+            false, true, 10, true, false, false, false
+        ));
+        assert!(!super::can_reuse_legacy_client(
+            false, true, 10, true, true, true, false
+        ));
+        assert!(!super::can_reuse_legacy_client(
+            false, true, 10, true, true, false, true
+        ));
     }
 }

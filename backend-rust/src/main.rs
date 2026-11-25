@@ -14,7 +14,12 @@ mod updater;
 mod utilities;
 mod workers;
 
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, bail};
 use serde_json::Value;
@@ -26,9 +31,11 @@ use tokio::{
 use backend::{Backend, RuntimeConfig};
 use workers::{PluginRegistry, WorkerConfiguration, WorkerMode};
 
-const HELP: &str = "Decky Rust backend (private SteamOS validation build)\n\nRequired:\n  --worker PATH              Packaged DeckyPluginWorker executable\n  --plugin-root PATH         Installed plugin directory\n  --homebrew PATH            Unprivileged settings/data/logs root\n  --user USER                Host user identity for normal plugins\n  --assets PATH              Existing Decky frontend bundles\n  --locales PATH             Existing Decky locale JSON directory\n\nOptional:\n  --worker-mode MODE         Worker supervision: fork or exec (default fork)\n  --release-version STRING  Installed Rust release identity (default dev)\n  --listen ADDRESS           Loopback address (default 127.0.0.1:1339)\n  --auth-file PATH           Read token from a private file\n  --service-name NAME        Loader user service (default plugin_loader)\n  --cef-url URL              Steam CEF debugger (default http://127.0.0.1:8080)\n  --inject-frontend BOOL     Run native frontend injector (default false)\n  --installer PATH           Transactional installer used for loader updates\n  --github-api URL           GitHub API origin\n  --release-repository NAME  Rust release repository (default beallio/decky-loader)\n  --testing-download-url URL Rust testing artifact service (default https://nightly.link)\n\nUses the upstream Decky frontend and packaged Python SDK pinned in build-config.json.\nSupports plugin management, utilities, native CEF integration and transactional\nloader updates.\n";
+const HELP: &str = "Decky Rust backend (private SteamOS validation build)\n\nRequired:\n  --worker PATH              Packaged DeckyPluginWorker executable\n  --plugin-root PATH         Installed plugin directory\n  --homebrew PATH            Unprivileged settings/data/logs root\n  --user USER                Host user identity for normal plugins\n  --assets PATH              Existing Decky frontend bundles\n  --locales PATH             Existing Decky locale JSON directory\n\nOptional:\n  --worker-mode MODE         Worker supervision: fork or exec (default fork)\n  --release-version STRING  Installed Rust release identity (default dev)\n  --sdk-version STRING      Packaged Decky SDK version (skips worker --describe)\n  --python-version STRING   Packaged CPython version (skips worker --describe)\n  --listen ADDRESS           Loopback address (default 127.0.0.1:1339)\n  --auth-file PATH           Read token from a private file\n  --service-name NAME        Loader user service (default plugin_loader)\n  --cef-url URL              Steam CEF debugger (default http://127.0.0.1:8080)\n  --inject-frontend BOOL     Run native frontend injector (default false)\n  --installer PATH           Transactional installer used for loader updates\n  --github-api URL           GitHub API origin\n  --release-repository NAME  Rust release repository (default beallio/decky-loader)\n  --testing-download-url URL Rust testing artifact service (default https://nightly.link)\n\nUses the upstream Decky frontend and packaged Python SDK pinned in build-config.json.\nSupports plugin management, utilities, native CEF integration and transactional\nloader updates.\n";
 
-#[tokio::main]
+// This daemon serves one local user and one WebSocket; two Tokio worker threads
+// keep thread stacks and glibc per-thread malloc arenas small on handheld CPUs.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     // glibc raises its mmap threshold after the first large free, so later plugin
     // download buffers stayed in thread arenas; a fixed 1 MiB returns them on free.
@@ -45,6 +52,8 @@ async fn main() -> anyhow::Result<()> {
             "--worker",
             "--worker-mode",
             "--release-version",
+            "--sdk-version",
+            "--python-version",
             "--plugin-root",
             "--homebrew",
             "--user",
@@ -146,31 +155,13 @@ async fn main() -> anyhow::Result<()> {
     } else {
         uuid::Uuid::new_v4().to_string()
     };
-    let description = Command::new(&worker)
-        .arg("--describe")
-        .output()
-        .await
-        .context("describing packaged Python worker")?;
-    if !description.status.success() {
-        bail!(
-            "worker description failed: {}",
-            String::from_utf8_lossy(&description.stderr)
-        );
-    }
-    let runtime: Value = serde_json::from_slice(&description.stdout)
-        .context("decoding worker runtime description")?;
-    if runtime["python"]
-        .as_str()
-        .and_then(|version| version.strip_prefix("3."))
-        .and_then(|rest| rest.split('.').next()?.parse::<u32>().ok())
-        .is_none_or(|minor| minor < 11)
-    {
-        bail!("the runtime requires a CPython 3.11 or newer worker, received {runtime}");
-    }
-    let sdk_version = runtime["decky_version"]
-        .as_str()
-        .context("worker description is missing decky_version")?
-        .to_owned();
+    let runtime = resolve_runtime_metadata(
+        &worker,
+        options.remove("--sdk-version"),
+        options.remove("--python-version"),
+    )
+    .await?;
+    let sdk_version = runtime.sdk_version;
     let version = options
         .remove("--release-version")
         .unwrap_or_else(|| "dev".to_owned());
@@ -181,25 +172,10 @@ async fn main() -> anyhow::Result<()> {
     {
         bail!("--release-version must be a non-empty printable release identifier");
     }
-    let account = Command::new("getent")
-        .args(["passwd", &user])
-        .output()
-        .await
-        .context("resolving host user")?;
-    if !account.status.success() {
-        bail!("host user {user} could not be resolved");
-    }
-    let account = std::str::from_utf8(&account.stdout)?;
-    let mut fields = account.split(':');
-    let _ = fields.next();
-    let _ = fields.next();
-    let user_uid = fields.next().context("host account has no uid")?.parse()?;
-    let user_gid = fields.next().context("host account has no gid")?.parse()?;
-    let _ = fields.next();
-    let user_home = fields
-        .next()
-        .context("host account has no home directory")?
-        .to_owned();
+    let host_user = resolve_host_user(&user)?;
+    let user_uid = host_user.uid;
+    let user_gid = host_user.gid;
+    let user_home = host_user.home;
     let (events, _) = broadcast::channel(256);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
@@ -315,7 +291,7 @@ async fn main() -> anyhow::Result<()> {
     });
     eprintln!(
         "Decky Rust backend listening at {address}; CPython runtime: {}",
-        runtime["python"]
+        runtime.python
     );
     let server = transport::serve(
         address,
@@ -364,6 +340,94 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
+struct RuntimeMetadata {
+    python: String,
+    sdk_version: String,
+}
+
+fn validate_python_version(python: &str) -> anyhow::Result<()> {
+    if python
+        .strip_prefix("3.")
+        .and_then(|rest| rest.split('.').next()?.parse::<u32>().ok())
+        .is_none_or(|minor| minor < 11)
+    {
+        bail!("the runtime requires a CPython 3.11 or newer worker, received {python:?}");
+    }
+    Ok(())
+}
+
+async fn resolve_runtime_metadata(
+    worker: &Path,
+    sdk_version: Option<String>,
+    python_version: Option<String>,
+) -> anyhow::Result<RuntimeMetadata> {
+    if let (Some(sdk_version), Some(python)) = (sdk_version, python_version) {
+        if sdk_version.is_empty()
+            || sdk_version
+                .chars()
+                .any(|character| character.is_ascii_control())
+        {
+            bail!("--sdk-version must be a non-empty printable identifier");
+        }
+        validate_python_version(&python)?;
+        return Ok(RuntimeMetadata {
+            python,
+            sdk_version,
+        });
+    }
+    let description = Command::new(worker)
+        .arg("--describe")
+        .output()
+        .await
+        .context("describing packaged Python worker")?;
+    if !description.status.success() {
+        bail!(
+            "worker description failed: {}",
+            String::from_utf8_lossy(&description.stderr)
+        );
+    }
+    let runtime: Value = serde_json::from_slice(&description.stdout)
+        .context("decoding worker runtime description")?;
+    let python = runtime["python"]
+        .as_str()
+        .context("worker description is missing python")?
+        .to_owned();
+    validate_python_version(&python)?;
+    let sdk_version = runtime["decky_version"]
+        .as_str()
+        .context("worker description is missing decky_version")?
+        .to_owned();
+    Ok(RuntimeMetadata {
+        python,
+        sdk_version,
+    })
+}
+
+struct HostUser {
+    uid: u32,
+    gid: u32,
+    home: String,
+}
+
+fn resolve_host_user(user: &str) -> anyhow::Result<HostUser> {
+    let account = nix::unistd::User::from_name(user)
+        .with_context(|| format!("resolving host user {user}"))?
+        .with_context(|| format!("host user {user} could not be resolved"))?;
+    let home = account
+        .dir
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("host account home directory is not valid UTF-8"))?;
+    if home.is_empty() {
+        bail!("host account has no home directory");
+    }
+    Ok(HostUser {
+        uid: account.uid.as_raw(),
+        gid: account.gid.as_raw(),
+        home,
+    })
+}
+
 fn required(options: &mut HashMap<String, String>, key: &str) -> anyhow::Result<String> {
     options
         .remove(key)
@@ -379,5 +443,43 @@ async fn essential_launcher_failed(receiver: Option<watch::Receiver<bool>>) {
         if receiver.changed().await.is_err() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runtime_metadata_uses_explicit_flags_without_running_worker_describe() {
+        let metadata = resolve_runtime_metadata(
+            Path::new("/nonexistent/worker"),
+            Some("v4.0.0-pre1".to_owned()),
+            Some("3.14.8".to_owned()),
+        )
+        .await
+        .expect("explicit flags should bypass worker --describe");
+        assert_eq!(metadata.sdk_version, "v4.0.0-pre1");
+        assert_eq!(metadata.python, "3.14.8");
+
+        let too_old = resolve_runtime_metadata(
+            Path::new("/nonexistent/worker"),
+            Some("v4.0.0-pre1".to_owned()),
+            Some("3.10.14".to_owned()),
+        )
+        .await;
+        assert!(too_old.is_err(), "CPython 3.10 must be rejected");
+    }
+
+    #[test]
+    fn resolve_host_user_uses_system_passwd_entry() {
+        let user = std::env::var("USER").expect("USER env var");
+        let resolved = resolve_host_user(&user).expect("current user must resolve");
+        assert!(!resolved.home.is_empty());
+
+        assert!(
+            resolve_host_user("decky-definitely-nonexistent-user-xyz").is_err(),
+            "missing user must return an error"
+        );
     }
 }

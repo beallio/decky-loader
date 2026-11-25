@@ -9,6 +9,7 @@ import {
   OFFICIAL_STORE,
   OFFICIAL_TESTING_STORE,
   STORE_CACHE_MS,
+  createUpdateCheckDeduplicator,
   filterStorePlugins,
   githubRepo,
   githubRepoPlugins,
@@ -19,6 +20,7 @@ import {
   migrateStoreSettings,
   providerVersion,
   restoreStoreView,
+  sortStorePlugins,
   tagGroups,
   withoutPrereleases,
 } from '../../frontend/src/storeSources.ts';
@@ -355,4 +357,86 @@ test('a saved store view keeps only known values', () => {
     filters: NO_STORE_FILTERS,
   });
   assert.deepEqual(restoreStoreView('garbage', sorts).filters, NO_STORE_FILTERS);
+});
+
+test('sortStorePlugins orders by name, dates, and downloads without mutating input', () => {
+  const items = [
+    { ...plugin('beta', '1.0.0'), created: '2025-01-01T00:00:00Z', updated: '2026-01-01T00:00:00Z', downloads: 50 },
+    { ...plugin('Alpha', '1.0.0'), created: 'not-a-date', updated: undefined, downloads: 200 },
+    { ...plugin('gamma', '1.0.0'), created: '2026-02-01T00:00:00Z', updated: '2026-03-01T00:00:00Z', downloads: 10 },
+  ];
+  const originalOrder = items.map((p) => p.name);
+  assert.deepEqual(
+    sortStorePlugins(items, 'name', 'asc').map((p) => p.name),
+    ['Alpha', 'beta', 'gamma'],
+  );
+  assert.deepEqual(
+    sortStorePlugins(items, 'name', 'desc').map((p) => p.name),
+    ['gamma', 'beta', 'Alpha'],
+  );
+  assert.deepEqual(
+    sortStorePlugins(items, 'updated', 'desc').map((p) => p.name),
+    ['gamma', 'beta', 'Alpha'],
+  );
+  assert.deepEqual(
+    sortStorePlugins(items, 'date', 'asc').map((p) => p.name),
+    ['Alpha', 'beta', 'gamma'],
+  );
+  assert.deepEqual(
+    sortStorePlugins(items, 'downloads', 'desc').map((p) => p.name),
+    ['Alpha', 'beta', 'gamma'],
+  );
+  assert.deepEqual(
+    items.map((p) => p.name),
+    originalOrder,
+  );
+});
+
+test('createUpdateCheckDeduplicator coalesces in-flight checks and caches only complete results', async () => {
+  let clock = 1000;
+  let calls = 0;
+  let nextComplete = false;
+  let resolveRun: (() => void) | null = null;
+  const dedup = createUpdateCheckDeduplicator(
+    () =>
+      new Promise<{ value: number; complete: boolean }>((resolve) => {
+        calls += 1;
+        const call = calls;
+        resolveRun = () => resolve({ value: call, complete: nextComplete });
+      }),
+    () => clock,
+  );
+
+  // Two concurrent calls coalesce into one execution; incomplete result is not cached.
+  const first = dedup.check();
+  const second = dedup.check(15_000);
+  assert.equal(calls, 1);
+  resolveRun!();
+  assert.deepEqual(await Promise.all([first, second]), [1, 1]);
+  assert.equal(dedup.hasCompleteResult(), false);
+
+  // Next call runs because the previous check was incomplete; now it completes.
+  nextComplete = true;
+  const third = dedup.check(15_000);
+  assert.equal(calls, 2);
+  resolveRun!();
+  assert.equal(await third, 2);
+  assert.equal(dedup.hasCompleteResult(), true);
+
+  // Within maxAgeMs, the complete result is reused without another call.
+  clock += 7_000;
+  assert.equal(await dedup.check(15_000), 2);
+  assert.equal(calls, 2);
+
+  // Explicit fresh check (no maxAgeMs) or expired maxAgeMs runs again.
+  const fourth = dedup.check();
+  assert.equal(calls, 3);
+  resolveRun!();
+  assert.equal(await fourth, 3);
+
+  clock += 20_000;
+  const fifth = dedup.check(15_000);
+  assert.equal(calls, 4);
+  resolveRun!();
+  assert.equal(await fifth, 4);
 });

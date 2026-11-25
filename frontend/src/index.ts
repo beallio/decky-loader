@@ -1,11 +1,15 @@
 // Sets up DFL, then loads start.ts which starts up the loader
+// Runs before window.DFL exists, so stable/client must not import @decky/ui.
+import { IS_ESM_CLIENT } from './stable/client';
 
-interface Window {
-  _deckyModuleResolverInternals: {
-    scopes: Map<number, unknown>;
-    scopedObjects: Map<number, unknown>;
-  };
-  DFLModules: unknown;
+declare global {
+  interface Window {
+    _deckyModuleResolverInternals: {
+      scopes: Map<number, unknown>;
+      scopedObjects: Map<number, unknown>;
+    };
+    DFLModules: unknown;
+  }
 }
 
 interface SteamAppInitialization {
@@ -21,25 +25,31 @@ const isSteamAppInitialized = () => {
 (async () => {
   console.debug('[Decky:Boot] Frontend init');
 
-  console.debug('[Decky:Boot] Authenticating with Decky backend...');
-  window.deckyAuthToken = await fetch('http://127.0.0.1:1337/auth/token').then((r) => r.text());
-  console.debug('[Decky:Boot] Connecting to Decky backend...');
-  const ws = (window.DeckyBackend = new (await import('./wsrouter')).WSRouter());
+  console.debug('[Decky:Boot] Authenticating and connecting to Decky backend...');
+  const [authToken, { WSRouter }] = await Promise.all([
+    fetch('http://127.0.0.1:1337/auth/token').then((r) => r.text()),
+    import('./wsrouter'),
+  ]);
+  window.deckyAuthToken = authToken;
+  const ws = (window.DeckyBackend = new WSRouter());
   await ws.connect();
+
+  // Overlap fetching the module-system chunk with waiting for SteamApp init.
+  const moduleSystemPromise = IS_ESM_CLIENT ? import('@decky/ui-v5/dist/module-system') : null;
 
   console.time('[Decky:Boot] Waiting for SteamApp init stage 1 to finish...');
 
   while (!isSteamAppInitialized()) {
-    await new Promise((r) => setTimeout(r, 0)); // Can't use DFL sleep here.
+    await new Promise((r) => setTimeout(r, 16)); // Can't use DFL sleep here.
   }
 
   console.timeEnd('[Decky:Boot] Waiting for SteamApp init stage 1 to finish...');
 
-  // Runs before window.DFL exists, so this must not import @decky/ui.
-  const { IS_ESM_CLIENT } = await import('./stable/client');
   console.debug(`[Decky:Boot] Steam client: ${IS_ESM_CLIENT ? 'ES modules' : 'Webpack (Stable compatibility)'}`);
 
+  let sharedCompatPromise: Promise<typeof import('@decky/ui-v5/dist/globals/steam-client/shared')>;
   if (!IS_ESM_CLIENT) {
+    sharedCompatPromise = import('@decky/ui-v5/dist/globals/steam-client/shared');
     await (await import('./stable/boot')).bootStable();
   } else {
     console.debug('[Decky:Boot] Setting up Module System & React globals...');
@@ -67,7 +77,7 @@ const isSteamAppInitialized = () => {
     }
 
     // deliberate partial import
-    const DFLModules = await import('@decky/ui-v5/dist/module-system');
+    const DFLModules = await moduleSystemPromise!;
     await DFLModules.initModules(resolveModuleScope);
     window.DFLModules = DFLModules;
     window.SP_REACT = DFLModules.findModule((m) => m.Component && m.PureComponent && m.useLayoutEffect);
@@ -87,13 +97,14 @@ const isSteamAppInitialized = () => {
       };
     }
     console.debug('[Decky:Boot] Setting up @decky/ui...');
+    sharedCompatPromise = import('@decky/ui-v5/dist/globals/steam-client/shared');
     window.DFL = await import('@decky/ui-v5');
   }
 
   // Fork: plugins built against 4.15.1 read these from window.DFL, but neither 4.16.4 nor 5.x exports
   // them from the package root. The namespace is sealed with live bindings, so the aliases go on an
   // object that inherits from it.
-  const { EResult, EUIComposition } = await import('@decky/ui-v5/dist/globals/steam-client/shared');
+  const { EResult, EUIComposition } = await sharedCompatPromise;
   const { QuickAccessTab } = window.DFL as { QuickAccessTab: { Soundtrack: number } };
   const compatAliases = Object.getOwnPropertyDescriptors({
     EResult,

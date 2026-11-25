@@ -39,7 +39,8 @@ import VRDashboardBarHook from './hooks/vr-dashboard-bar';
 import Logger from './logger';
 import { NotificationService } from './notification-service';
 import { DisabledPlugin, InstallType, Plugin, PluginLoadType } from './plugin';
-import { PluginUpdateMapping, checkForPluginUpdates } from './store';
+import { PluginUpdateMapping, checkForPluginUpdatesWithStatus } from './store';
+import { createUpdateCheckDeduplicator } from './storeSources';
 import { getVersionInfo } from './updater';
 import { getPluginDisplayName } from './utils/pluginHelpers';
 import { getSetting, setSetting } from './utils/settings';
@@ -96,6 +97,19 @@ class PluginLoader extends Logger {
   private loaderUpdateToast?: ToastNotification;
   private pluginUpdateToast?: ToastNotification;
   private pendingDirectInstall?: (requestId: string) => void;
+  private pluginUpdateChecker = createUpdateCheckDeduplicator<PluginUpdateMapping | null>(async () => {
+    try {
+      const frozenPlugins = this.deckyState.publicState().frozenPlugins;
+      const { updates, complete } = await checkForPluginUpdatesWithStatus(
+        this.deckyState.publicState().installedPlugins.filter((p) => !frozenPlugins.includes(p.name)),
+      );
+      this.deckyState.setUpdates(updates);
+      return { value: updates, complete };
+    } catch (error) {
+      this.error('Failed to check for plugin updates', error);
+      return { value: null, complete: false };
+    }
+  });
 
   constructor() {
     super(PluginLoader.name);
@@ -205,7 +219,10 @@ class PluginLoader extends Logger {
         this.notifySupportStatus();
       }) // TODO safeguard this
       .then(() => sleep(30000)) // Internet might not immediately be up
-      .then(() => this.checkPluginUpdates());
+      .then(() => {
+        if (!this.pluginUpdateChecker.hasCompleteResult()) return this.checkPluginUpdates();
+        return null;
+      });
   }
 
   private checkForSP(): boolean {
@@ -257,7 +274,6 @@ class PluginLoader extends Logger {
     for (const plugin of plugins) {
       if (plugin.disabled) {
         disabledPlugins.push({ name: plugin.name, version: plugin.version });
-        this.deckyState.setDisabledPlugins(disabledPlugins);
       } else {
         if (!this.hasPlugin(plugin.name))
           pluginLoadPromises.push(
@@ -265,6 +281,7 @@ class PluginLoader extends Logger {
           );
       }
     }
+    this.deckyState.setDisabledPlugins(disabledPlugins);
     await Promise.all(pluginLoadPromises);
     const loadEnd = performance.now();
     this.log(`Loaded ${plugins.length} plugins in ${loadEnd - loadStart}ms`);
@@ -288,6 +305,12 @@ class PluginLoader extends Logger {
   public async getUserInfo() {
     const userInfo = await DeckyBackend.call<[], UserInfo>('utilities/get_user_info');
     setSetting('user_info.user_home', userInfo.path);
+  }
+
+  public async getCurrentVersion(): Promise<string> {
+    const cached = this.deckyState.publicState().versionInfo?.current;
+    if (cached) return cached;
+    return (await this.updateVersion()).current;
   }
 
   public async updateVersion() {
@@ -323,23 +346,12 @@ class PluginLoader extends Logger {
     await this.notifyPluginUpdates();
   }
 
-  public async checkPluginUpdates(): Promise<PluginUpdateMapping | null> {
-    try {
-      const frozenPlugins = this.deckyState.publicState().frozenPlugins;
-
-      const updates = await checkForPluginUpdates(
-        this.deckyState.publicState().installedPlugins.filter((p) => !frozenPlugins.includes(p.name)),
-      );
-      this.deckyState.setUpdates(updates);
-      return updates;
-    } catch (error) {
-      this.error('Failed to check for plugin updates', error);
-      return null;
-    }
+  public async checkPluginUpdates(options?: { maxAgeMs?: number }): Promise<PluginUpdateMapping | null> {
+    return this.pluginUpdateChecker.check(options?.maxAgeMs);
   }
 
   public async notifyPluginUpdates() {
-    const updates = await this.checkPluginUpdates();
+    const updates = await this.checkPluginUpdates({ maxAgeMs: 15_000 });
     if (updates && updates.size > 0 && this.notificationService.shouldNotify('pluginUpdates')) {
       this.pluginUpdateToast && this.pluginUpdateToast.dismiss();
       this.pluginUpdateToast = this.toaster.toast({

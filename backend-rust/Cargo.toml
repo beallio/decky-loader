@@ -41,6 +41,8 @@ incremental = false
 
 [profile.release]
 strip = true
+lto = "thin"
+codegen-units = 1
 
 [profile.native]
 inherits = "release"
