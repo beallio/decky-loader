@@ -1,6 +1,8 @@
 // Sets up DFL, then loads start.ts which starts up the loader
-// Runs before window.DFL exists, so stable/client must not import @decky/ui.
-import { IS_ESM_CLIENT } from './stable/client';
+// Runs before window.DFL exists; do not statically import modules shared with other chunks or
+// Rollup will export them from index.js and cause downstream chunks to re-import ./index.js
+// without CEF's ?v=<version> query string.
+import { claimFrontendBoot } from './bootGuard';
 
 declare global {
   interface Window {
@@ -9,6 +11,7 @@ declare global {
       scopedObjects: Map<number, unknown>;
     };
     DFLModules: unknown;
+    __deckyFrontendBooted?: boolean;
   }
 }
 
@@ -23,6 +26,11 @@ const isSteamAppInitialized = () => {
 };
 
 (async () => {
+  if (!claimFrontendBoot(window)) {
+    console.warn('[Decky:Boot] Frontend already booted in this context; skipping duplicate boot');
+    return;
+  }
+
   console.debug('[Decky:Boot] Frontend init');
 
   console.debug('[Decky:Boot] Authenticating and connecting to Decky backend...');
@@ -33,6 +41,9 @@ const isSteamAppInitialized = () => {
   window.deckyAuthToken = authToken;
   const ws = (window.DeckyBackend = new WSRouter());
   await ws.connect();
+
+  // The ES module build loads library.js as a module; Steam Stable loads it as a classic script.
+  const IS_ESM_CLIENT = !!document.querySelector('script[type=module][src*="library.js"]');
 
   // Overlap fetching the module-system chunk with waiting for SteamApp init.
   const moduleSystemPromise = IS_ESM_CLIENT ? import('@decky/ui-v5/dist/module-system') : null;

@@ -1,4 +1,5 @@
 import Logger from './logger';
+import { buildWsUrl, createClientId } from './wsUrl';
 
 declare global {
   export var DeckyBackend: WSRouter;
@@ -93,14 +94,16 @@ export class WSRouter extends Logger {
   ws?: WebSocket;
   // Used to map results and errors to calls
   reqId: number = 0;
+  private readonly clientId: string;
   constructor() {
     super('WSRouter');
+    this.clientId = createClientId();
   }
 
   connect() {
     return new Promise<void>((resolve) => {
       // Auth is a query param as JS WebSocket doesn't support headers
-      this.ws = new WebSocket(`ws://127.0.0.1:1337/ws?auth=${deckyAuthToken}`);
+      this.ws = new WebSocket(buildWsUrl(deckyAuthToken, this.clientId));
 
       this.ws.addEventListener('open', () => {
         this.debug('WS Connected');

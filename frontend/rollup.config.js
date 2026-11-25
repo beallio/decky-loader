@@ -21,9 +21,10 @@ const dflGlobal = () => ({
     // These run before window.DFL is set, so neither they nor their static imports may read it.
     const bootModules = [
       'src/index.ts',
+      'src/bootGuard.ts',
       'src/wsrouter.ts',
+      'src/wsUrl.ts',
       'src/logger.ts',
-      'src/stable/client.ts',
       'src/stable/boot.ts',
     ];
     const chunks = Object.values(bundle).filter((output) => output.type === 'chunk');
@@ -50,12 +51,37 @@ const dflGlobal = () => ({
   },
 });
 
+// CEF injects `index.js?v=<version>`. Any chunk importing `./index.js` (without the query string)
+// evaluates the boot entry a second time as a distinct ES module, creating a second WSRouter.
+const noEntryReimport = () => ({
+  name: 'no-entry-reimport',
+  generateBundle(_, bundle) {
+    const chunks = Object.values(bundle).filter((output) => output.type === 'chunk');
+    const entries = new Set(chunks.filter((chunk) => chunk.isEntry).map((chunk) => chunk.fileName));
+    for (const chunk of chunks) {
+      if (chunk.isEntry && chunk.exports.length > 0) {
+        this.error(
+          `Entry chunk ${chunk.fileName} must not export bindings (${chunk.exports.join(', ')}); chunks importing it would re-run boot under a different URL than index.js?v=<version>`,
+        );
+      }
+      for (const imported of [...chunk.imports, ...chunk.dynamicImports]) {
+        if (entries.has(imported)) {
+          this.error(
+            `Chunk ${chunk.fileName} imports entry chunk ${imported}; this would re-run boot under a different URL than index.js?v=<version>`,
+          );
+        }
+      }
+    }
+  },
+});
+
 export default defineConfig([
   // Main bundle
   {
     input: 'src/index.ts',
     plugins: [
       dflGlobal(),
+      noEntryReimport(),
       del({ targets: ['../backend/decky_loader/static/*', '!../backend/decky_loader/static/fallback.js'], force: true }),
       commonjs(),
       nodeResolve({

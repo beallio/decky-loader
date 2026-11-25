@@ -41,6 +41,8 @@ SDK_OVERLAYS = (
     'frontend/src/components/settings/pages/general/Updater.tsx',
     'frontend/src/components/modals/RootPluginConfirmModal.tsx',
     'frontend/src/wsrouter.ts',
+    'frontend/src/wsUrl.ts',
+    'frontend/src/bootGuard.ts',
     'frontend/src/hooks/toaster.tsx',
     'frontend/src/hooks/vr-dashboard-bar.tsx',
     'frontend/package.json',
