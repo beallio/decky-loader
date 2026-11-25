@@ -31,6 +31,8 @@ SDK_OVERLAYS = (
     'backend/decky_loader/plugin/imports/native.pyi',
     'frontend/src/components/DeckyErrorBoundary.tsx',
     'frontend/src/plugin-loader.tsx',
+    'frontend/src/right-stick-navigation.ts',
+    'frontend/src/rightStickNavigationLogic.ts',
     'frontend/tsconfig.json',
     'frontend/src/components/settings/pages/general/RemoteDebugging.tsx',
     'backend/decky_loader/locales/en-US.json',

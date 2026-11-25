@@ -11,6 +11,7 @@ interface PublicDeckyState {
   installedPlugins: (Plugin | DisabledPlugin)[];
   pluginOrder: string[];
   sortPlugins: boolean;
+  rightStickNavigation: boolean;
   frozenPlugins: string[];
   hiddenPlugins: string[];
   activePlugin: Plugin | null;
@@ -33,6 +34,7 @@ export class DeckyState {
   private _installedPlugins: (Plugin | DisabledPlugin)[] = [];
   private _pluginOrder: string[] = [];
   private _sortPlugins: boolean = false;
+  private _rightStickNavigation: boolean = false;
   private _frozenPlugins: string[] = [];
   private _hiddenPlugins: string[] = [];
   private _activePlugin: Plugin | null = null;
@@ -52,6 +54,7 @@ export class DeckyState {
       installedPlugins: this._installedPlugins,
       pluginOrder: this._pluginOrder,
       sortPlugins: this._sortPlugins,
+      rightStickNavigation: this._rightStickNavigation,
       frozenPlugins: this._frozenPlugins,
       hiddenPlugins: this._hiddenPlugins,
       activePlugin: this._activePlugin,
@@ -93,6 +96,11 @@ export class DeckyState {
 
   setSortPlugins(sortPlugins: boolean) {
     this._sortPlugins = sortPlugins;
+    this.notifyUpdate();
+  }
+
+  setRightStickNavigation(rightStickNavigation: boolean) {
+    this._rightStickNavigation = rightStickNavigation;
     this.notifyUpdate();
   }
 
@@ -153,6 +161,7 @@ interface DeckyStateContext extends PublicDeckyState {
   setPluginOrder(pluginOrder: string[]): void;
   setDisabledPlugins(disabled: DisabledPlugin[]): void;
   setSortPlugins(sortPlugins: boolean): void;
+  setRightStickNavigation(rightStickNavigation: boolean): void;
   closeActivePlugin(): void;
 }
 
@@ -193,6 +202,7 @@ export const DeckyStateContextProvider: FC<Props> = ({ children, deckyState }) =
   const setPluginOrder = deckyState.setPluginOrder.bind(deckyState);
   const setDisabledPlugins = deckyState.setDisabledPlugins.bind(deckyState);
   const setSortPlugins = deckyState.setSortPlugins.bind(deckyState);
+  const setRightStickNavigation = deckyState.setRightStickNavigation.bind(deckyState);
 
   return (
     <DeckyStateContext.Provider
@@ -205,6 +215,7 @@ export const DeckyStateContextProvider: FC<Props> = ({ children, deckyState }) =
         setPluginOrder,
         setDisabledPlugins,
         setSortPlugins,
+        setRightStickNavigation,
       }}
     >
       {children}

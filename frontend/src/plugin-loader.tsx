@@ -39,6 +39,7 @@ import VRDashboardBarHook from './hooks/vr-dashboard-bar';
 import Logger from './logger';
 import { NotificationService } from './notification-service';
 import { DisabledPlugin, InstallType, Plugin, PluginLoadType } from './plugin';
+import { RightStickNavigationService } from './right-stick-navigation';
 import { PluginUpdateMapping, checkForPluginUpdatesWithStatus } from './store';
 import { createUpdateCheckDeduplicator } from './storeSources';
 import { getVersionInfo } from './updater';
@@ -84,6 +85,7 @@ class PluginLoader extends Logger {
   public frozenPluginsService = new FrozenPluginService(this.deckyState);
   public hiddenPluginsService = new HiddenPluginsService(this.deckyState);
   public notificationService = new NotificationService(this.deckyState);
+  public rightStickNavigationService = new RightStickNavigationService(this.deckyState);
 
   private reloadLock: boolean = false;
   // stores a list of plugin names which requested to be reloaded
@@ -491,9 +493,11 @@ class PluginLoader extends Logger {
     this.frozenPluginsService.init();
     this.hiddenPluginsService.init();
     this.notificationService.init();
+    this.rightStickNavigationService.init();
   }
 
   public deinit() {
+    this.rightStickNavigationService.deinit();
     this.routerHook.removeRoute('/decky/store');
     this.routerHook.removeRoute('/decky/settings');
     deinitFilepickerPatches();
