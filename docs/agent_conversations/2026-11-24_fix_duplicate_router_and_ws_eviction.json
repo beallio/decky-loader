@@ -1,0 +1,46 @@
+{
+  "date": "2026-11-24",
+  "task_objective": "Fix GitHub issues #19 (duplicate frontend router leaving window.DeckyBackend without listeners and suppressing install prompts) and #20 (single active WebSocket eviction loop stalling Loader calls up to 5 s), then open a pull request.",
+  "branch": "fix/duplicate-router-and-ws-eviction",
+  "base_branch": "perf/loader-startup-and-memory",
+  "issues": [
+    "#19: Frontend on Steam Stable has two routers: Decky listeners missing, install prompt never shows",
+    "#20: Single active socket: two routers evict each other and stall all Loader calls up to 5 s"
+  ],
+  "files_modified": [
+    "docs/plans/fix_duplicate_router_and_ws_eviction.md",
+    "frontend/rollup.config.js",
+    "frontend/src/bootGuard.ts",
+    "frontend/src/wsUrl.ts",
+    "frontend/src/index.ts",
+    "frontend/src/wsrouter.ts",
+    "tests/frontend/boot_router.test.mts",
+    "backend-rust/src/transport.rs",
+    "scripts/runtime/prepare_bundle.py"
+  ],
+  "tests_added": [
+    "frontend/rollup.config.js: noEntryReimport build-time guard rejecting entry exports or chunk imports of entry chunks",
+    "tests/frontend/boot_router.test.mts: claimFrontendBoot succeeds once per context and blocks duplicate boots",
+    "tests/frontend/boot_router.test.mts: createClientId generates distinct non-empty client identifiers",
+    "tests/frontend/boot_router.test.mts: buildWsUrl encodes auth token and stable client_id query parameter",
+    "backend-rust/src/transport.rs: concurrent_clients_do_not_evict_each_other_and_route_replies_independently",
+    "backend-rust/src/transport.rs: concurrent_anonymous_clients_do_not_evict_each_other",
+    "backend-rust/src/transport.rs: same_client_id_reconnect_replaces_own_socket_and_preserves_full_sync",
+    "backend-rust/src/transport.rs: anonymous_client_reconnect_after_disconnect_preserves_full_sync",
+    "backend-rust/src/transport.rs: disconnected_session_cleanup_bounds_ttl_and_count"
+  ],
+  "design_decisions": [
+    "Root cause of #19: commit ea72222 statically imported IS_ESM_CLIENT from ./stable/client in frontend/src/index.ts while Toast.tsx also statically imports it, causing Rollup to export I from index.js and emit import { I as IS_ESM_CLIENT } from './index.js' in the start.tsx chunk. Because CEF loads index.js?v=<version>, ./index.js evaluated as a second ES module and constructed a second WSRouter that overwrote window.DeckyBackend after PluginLoader registered listeners on router #1.",
+    "Inlined the one-line ESM client check in frontend/src/index.ts (keeping zero extra boot HTTP hops while keeping src/stable/client.ts private to the start.tsx chunk), added an idempotent claimFrontendBoot guard before any await, and added a Rollup noEntryReimport plugin so no future change can make any chunk import index.js.",
+    "Kept bootGuard.ts private to index.ts and wsUrl.ts private to wsrouter.ts so Rollup never shares them across entry and lazy chunks, and registered both in SDK_OVERLAYS in scripts/runtime/prepare_bundle.py.",
+    "Replaced the single active WebSocket and global PendingCalls map in backend-rust/src/transport.rs with a unified per-session SessionRegistry under one mutex (no .await held under lock). Each WSRouter sends a stable per-instance client_id so same-client reconnects replace only their own prior socket and preserve FULL_SYNC deduplication, while distinct or concurrent anonymous clients coexist without evicting each other, route call replies strictly to the originating session, isolate FULL_SYNC pruning per session, and all receive broadcast backend events.",
+    "Bounded disconnected session retention with immediate removal when pending calls are empty, a 60 s TTL, and a 16-session cap."
+  ],
+  "results": {
+    "frontend_build_typecheck_lint": "passed (index.js has zero exports and zero chunks import ./index.js)",
+    "frontend_unit_tests": "26 passed, 0 failed",
+    "rust_fmt_clippy": "passed (-D warnings across workspace)",
+    "rust_tests": "92 decky-loader-runtime + 10 decky-plugin + 1 doctest passed",
+    "python_runtime_tests": "verified via unittest discovery and SDK_OVERLAYS baseline diff check"
+  }
+}
