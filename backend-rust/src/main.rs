@@ -5,6 +5,7 @@ mod cef;
 mod launcher;
 mod platform;
 mod plugin_manager;
+mod right_stick;
 mod root_host;
 mod service_manager;
 #[cfg(test)]
@@ -332,6 +333,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(task) = injector_task {
         let _ = task.await;
     }
+    backend.shutdown_right_stick();
     if let Err(error) = backend.shutdown_utilities().await {
         eprintln!("Utility shutdown failed: {}", error.message());
     }
