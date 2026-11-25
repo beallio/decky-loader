@@ -269,6 +269,10 @@
         "plugin_stores": {
             "header": "Plugin stores"
         },
+        "right_stick_navigation": {
+            "desc": "Use the right stick to navigate Steam menus and Decky",
+            "label": "Right-stick navigation"
+        },
         "sort_plugins": {
             "label": "Sort plugins alphabetically"
         },

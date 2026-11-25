@@ -16,7 +16,7 @@ export default function GeneralSettings({
   isDeveloper: boolean;
   setIsDeveloper: (val: boolean) => void;
 }) {
-  const { versionInfo, sortPlugins, setSortPlugins } = useDeckyState();
+  const { versionInfo, sortPlugins, setSortPlugins, rightStickNavigation } = useDeckyState();
   const [_, setSortPluginsSetting] = useSetting<boolean>('sortPlugins', false);
   const { t } = useTranslation();
 
@@ -53,6 +53,14 @@ export default function GeneralSettings({
           onChange={(toggleValue) => {
             setSortPlugins(toggleValue);
             setSortPluginsSetting(toggleValue);
+          }}
+        />
+        <ToggleField
+          label={t('SettingsGeneralIndex.right_stick_navigation.label')}
+          description={t('SettingsGeneralIndex.right_stick_navigation.desc')}
+          checked={rightStickNavigation}
+          onChange={(toggleValue) => {
+            void DeckyPluginLoader.rightStickNavigationService.setEnabled(toggleValue);
           }}
         />
       </DialogControlsSection>

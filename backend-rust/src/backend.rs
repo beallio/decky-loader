@@ -5,7 +5,10 @@ use serde_json::{Map, Value, json, value::RawValue};
 use tokio::sync::Mutex;
 
 use crate::workers::{PluginRegistry, WorkerError};
-use crate::{cef::Cef, plugin_manager::PluginManager, updater::Updater, utilities::Utilities};
+use crate::{
+    cef::Cef, plugin_manager::PluginManager, right_stick::RightStickController, updater::Updater,
+    utilities::Utilities,
+};
 
 #[derive(Debug)]
 pub enum RpcError {
@@ -97,6 +100,7 @@ pub struct Backend {
     pub(crate) updater: Arc<Updater>,
     plugin_manager: PluginManager,
     utilities: Utilities,
+    right_stick: RightStickController,
 }
 
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -154,6 +158,23 @@ impl Backend {
         let client = http_client(&version)?;
         let download_client = download_http_client(&version)?;
         let cef = Cef::new(client.clone(), config.cef_url.clone());
+        let right_stick_enabled = settings
+            .get("rightStickNavigation")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let right_stick_registry = Arc::clone(&registry);
+        let right_stick = RightStickController::new(
+            right_stick_enabled,
+            Arc::new(move |session, direction| {
+                right_stick_registry.emit(
+                    "loader/right_stick_direction",
+                    vec![json!({
+                        "session": session,
+                        "direction": direction.map(|dir| dir.as_str()),
+                    })],
+                );
+            }),
+        );
         Ok(Self {
             registry,
             homebrew,
@@ -170,6 +191,7 @@ impl Backend {
             updater: Arc::new(Updater::new()),
             plugin_manager: PluginManager::new(),
             utilities: Utilities::new(),
+            right_stick,
         })
     }
 
@@ -222,6 +244,12 @@ impl Backend {
             }
             return Err(error);
         }
+        let right_stick_toggle = (key == "rightStickNavigation")
+            .then(|| settings.get(key).and_then(Value::as_bool).unwrap_or(false));
+        drop(settings);
+        if let Some(enabled) = right_stick_toggle {
+            self.right_stick.set_enabled(enabled);
+        }
         Ok(())
     }
 
@@ -266,6 +294,10 @@ impl Backend {
 
     pub(crate) async fn shutdown_utilities(&self) -> Result<(), RpcError> {
         self.utilities.shutdown(self).await
+    }
+
+    pub(crate) fn shutdown_right_stick(&self) {
+        self.right_stick.shutdown();
     }
 
     pub fn loader_version(&self) -> &str {
@@ -339,6 +371,24 @@ impl Backend {
             "utilities/get_user_info" => {
                 exact(&args, 0)?;
                 Ok(json!({"username": self.user, "path": self.user_home}))
+            }
+            "utilities/right_stick/get_session_mode" => {
+                exact(&args, 0)?;
+                Ok(self
+                    .right_stick
+                    .session_mode()
+                    .map(|mode| Value::String(mode.as_str().to_owned()))
+                    .unwrap_or(Value::Null))
+            }
+            "utilities/right_stick/set_focus" => {
+                exact(&args, 2)?;
+                let session = string(&args, 0)?;
+                let active = args
+                    .get(1)
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| RpcError::invalid("argument 1 must be a boolean"))?;
+                self.right_stick.set_focus(session, active);
+                Ok(Value::Null)
             }
             _ if route.starts_with("utilities/") => self
                 .utilities
