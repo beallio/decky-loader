@@ -15,8 +15,8 @@ importers:
         specifier: npm:@decky/ui@4.16.4
         version: '@decky/ui@4.16.4'
       '@decky/ui-v5':
-        specifier: npm:@decky/ui@5.0.1
-        version: '@decky/ui@5.0.1'
+        specifier: npm:@decky/ui@5.0.0
+        version: '@decky/ui@5.0.0'
       compare-versions:
         specifier: ^6.1.1
         version: 6.1.1
@@ -233,9 +233,6 @@ packages:
 
   '@decky/ui@5.0.0':
     resolution: {integrity: sha512-gOgB49uv4qSaMhIspfpqS5qJVbo7XXOgDFbIkaQ+bbOeqykC4CA39pUs8SiwaJL1gsRNtMh7Ed3DkRbTcLhgRA==}
-
-  '@decky/ui@5.0.1':
-    resolution: {integrity: sha512-9EKWDA3Au1de61kQBUPBl8b+xjo4HT/bbAlpyk7LsfSpr41Xu8/wh+Y1XHc1JpJDzzJB8Cyns7q5WfaWye+EuA==}
 
   '@esbuild/aix-ppc64@0.20.2':
     resolution: {integrity: sha512-D+EBOJHXdNZcLJRBkhENNG8Wji2kgc9AZ9KiPr1JuZjsNtyHzrsfLRrY0tk2H2aoFu6RANO1y1iPPUCDYWkb5g==}
@@ -2338,8 +2335,6 @@ snapshots:
   '@decky/ui@4.16.4': {}
 
   '@decky/ui@5.0.0': {}
-
-  '@decky/ui@5.0.1': {}
 
   '@esbuild/aix-ppc64@0.20.2':
     optional: true
