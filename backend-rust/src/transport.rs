@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -13,7 +13,7 @@ use axum::{
     body::{Body, Bytes},
     extract::{
         DefaultBodyLimit, FromRequest, Path as AxumPath, Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
     },
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode,
@@ -40,6 +40,9 @@ const CATALOG_TIMEOUT: Duration = Duration::from_secs(20);
 const CATALOG_MAX_BYTES: usize = 5_000_000;
 const INLINE_FILE_LIMIT: u64 = 2 * 1024 * 1024;
 const STREAM_CHUNK_SIZE: usize = 64 * 1024;
+const DISCONNECTED_SESSION_TTL: Duration = Duration::from_secs(60);
+const MAX_DISCONNECTED_SESSIONS: usize = 16;
+const MAX_CLIENT_ID_BYTES: usize = 128;
 
 enum AssetRoot {
     Canonical(PathBuf),
@@ -101,17 +104,200 @@ struct AppState {
     locales: Arc<AssetRoot>,
     backend: Arc<Backend>,
     user_agent: HeaderValue,
-    pending: Arc<Mutex<PendingCalls>>,
-    sockets: Arc<Mutex<SocketRegistry>>,
-    socket_lifecycle: Arc<Mutex<()>>,
+    sessions: Arc<Mutex<SessionRegistry>>,
     next_connection_id: Arc<AtomicU64>,
     http_client: Client,
     catalog_client: Client,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum SessionKey {
+    Client(String),
+    AnonymousDefault,
+    Anonymous(u64),
+}
+
+struct ClientSession {
+    socket: Option<ActiveSocket>,
+    pending: PendingCalls,
+    disconnected_at: Option<Instant>,
+}
+
+impl ClientSession {
+    fn new(socket: ActiveSocket) -> Self {
+        Self {
+            socket: Some(socket),
+            pending: PendingCalls::new(),
+            disconnected_at: None,
+        }
+    }
+}
+
 #[derive(Default)]
-struct SocketRegistry {
-    active: Option<ActiveSocket>,
+struct SessionRegistry {
+    sessions: HashMap<SessionKey, ClientSession>,
+}
+
+impl SessionRegistry {
+    fn attach(
+        &mut self,
+        client_id: Option<String>,
+        connection_id: u64,
+        sender: mpsc::UnboundedSender<Message>,
+    ) -> SessionKey {
+        self.prune_disconnected(Instant::now());
+        let key = match client_id {
+            Some(id) => SessionKey::Client(id),
+            None => {
+                let default_live = self
+                    .sessions
+                    .get(&SessionKey::AnonymousDefault)
+                    .is_some_and(|session| session.socket.is_some());
+                if default_live {
+                    SessionKey::Anonymous(connection_id)
+                } else {
+                    SessionKey::AnonymousDefault
+                }
+            }
+        };
+        let socket = ActiveSocket {
+            id: connection_id,
+            sender,
+        };
+        match self.sessions.get_mut(&key) {
+            Some(session) => {
+                if let Some(older) = session.socket.replace(socket) {
+                    let _ = older.sender.send(Message::Close(None));
+                }
+                session.disconnected_at = None;
+            }
+            None => {
+                self.sessions
+                    .insert(key.clone(), ClientSession::new(socket));
+            }
+        }
+        key
+    }
+
+    fn detach(&mut self, key: &SessionKey, connection_id: u64) {
+        let now = Instant::now();
+        let remove = if let Some(session) = self.sessions.get_mut(key) {
+            if session
+                .socket
+                .as_ref()
+                .is_some_and(|active| active.id == connection_id)
+            {
+                session.socket = None;
+                if session.pending.is_empty() {
+                    true
+                } else {
+                    session.disconnected_at = Some(now);
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if remove {
+            self.sessions.remove(key);
+        }
+        self.prune_disconnected(now);
+    }
+
+    fn is_current_socket(&self, key: &SessionKey, connection_id: u64) -> bool {
+        self.sessions
+            .get(key)
+            .and_then(|session| session.socket.as_ref())
+            .is_some_and(|active| active.id == connection_id)
+    }
+
+    fn send_to_session(&mut self, key: &SessionKey, text: &str) {
+        let now = Instant::now();
+        let remove = if let Some(session) = self.sessions.get_mut(key) {
+            let failed = session
+                .socket
+                .as_ref()
+                .is_some_and(|active| active.sender.send(Message::Text(text.into())).is_err());
+            if failed {
+                session.socket = None;
+                if session.pending.is_empty() {
+                    true
+                } else {
+                    session.disconnected_at = Some(now);
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if remove {
+            self.sessions.remove(key);
+        }
+    }
+
+    fn broadcast_event(&mut self, text: &str) {
+        let now = Instant::now();
+        let payload = Utf8Bytes::from(text);
+        let mut dead = Vec::new();
+        for (key, session) in &mut self.sessions {
+            let failed = session
+                .socket
+                .as_ref()
+                .is_some_and(|active| active.sender.send(Message::Text(payload.clone())).is_err());
+            if failed {
+                session.socket = None;
+                if session.pending.is_empty() {
+                    dead.push(key.clone());
+                } else {
+                    session.disconnected_at = Some(now);
+                }
+            }
+        }
+        for key in dead {
+            self.sessions.remove(&key);
+        }
+    }
+
+    fn close_all(&mut self) {
+        for session in self.sessions.values_mut() {
+            if let Some(active) = session.socket.take() {
+                let _ = active.sender.send(Message::Close(None));
+            }
+        }
+        self.sessions.clear();
+    }
+
+    fn prune_disconnected(&mut self, now: Instant) {
+        self.sessions.retain(|_, session| {
+            if session.socket.is_some() {
+                return true;
+            }
+            if session.pending.is_empty() {
+                return false;
+            }
+            session
+                .disconnected_at
+                .is_none_or(|at| now.saturating_duration_since(at) < DISCONNECTED_SESSION_TTL)
+        });
+
+        let mut disconnected: Vec<(SessionKey, Instant)> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.socket.is_none())
+            .map(|(key, session)| (key.clone(), session.disconnected_at.unwrap_or(now)))
+            .collect();
+        if disconnected.len() > MAX_DISCONNECTED_SESSIONS {
+            disconnected.sort_by_key(|(_, at)| *at);
+            let excess = disconnected.len() - MAX_DISCONNECTED_SESSIONS;
+            for (key, _) in disconnected.into_iter().take(excess) {
+                self.sessions.remove(&key);
+            }
+        }
+    }
 }
 
 struct ActiveSocket {
@@ -122,6 +308,11 @@ struct ActiveSocket {
 #[derive(Deserialize)]
 struct WsQuery {
     auth: Option<String>,
+    client_id: Option<String>,
+}
+
+fn normalize_client_id(client_id: Option<String>) -> Option<String> {
+    client_id.filter(|id| !id.is_empty() && id.len() <= MAX_CLIENT_ID_BYTES)
 }
 
 #[derive(Deserialize)]
@@ -156,9 +347,7 @@ pub async fn serve(
         locales: Arc::new(locales),
         backend,
         user_agent,
-        pending: Arc::new(Mutex::new(HashMap::new())),
-        sockets: Arc::new(Mutex::new(SocketRegistry::default())),
-        socket_lifecycle: Arc::new(Mutex::new(())),
+        sessions: Arc::new(Mutex::new(SessionRegistry::default())),
         next_connection_id: Arc::new(AtomicU64::new(1)),
         http_client,
         catalog_client: catalog_client(CATALOG_TIMEOUT)?,
@@ -166,7 +355,7 @@ pub async fn serve(
 
     let mut event_receiver = events.subscribe();
     let (event_stop_sender, mut event_stop_receiver) = oneshot::channel::<()>();
-    let event_sockets = state.sockets.clone();
+    let event_sessions = state.sessions.clone();
     let event_task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -174,7 +363,7 @@ pub async fn serve(
                 event = event_receiver.recv() => match event {
                     Ok(event) => {
                         if let Ok(text) = serde_json::to_string(&event) {
-                            send_to_active_socket(&event_sockets, &text).await;
+                            event_sessions.lock().await.broadcast_event(&text);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -241,7 +430,7 @@ pub async fn serve(
         ))
         .with_state(state.clone());
 
-    let result = serve_http(listener, app, state.sockets.clone(), shutdown).await;
+    let result = serve_http(listener, app, state.sessions.clone(), shutdown).await;
     drop(events);
     let _ = event_stop_sender.send(());
     let _ = event_task.await;
@@ -252,15 +441,15 @@ pub async fn serve(
 async fn serve_http(
     listener: TcpListener,
     app: Router,
-    sockets: Arc<Mutex<SocketRegistry>>,
+    sessions: Arc<Mutex<SessionRegistry>>,
     shutdown: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
     let (drain_started_sender, drain_started_receiver) = oneshot::channel();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
         let _ = shutdown.await;
-        // Include active-socket closure in the bounded shutdown interval.
+        // Include connected-socket closure in the bounded shutdown interval.
         let _ = drain_started_sender.send(());
-        close_active_socket(&sockets).await;
+        sessions.lock().await.close_all();
     });
     let server = std::future::IntoFuture::into_future(server);
     tokio::pin!(server);
@@ -438,12 +627,13 @@ async fn websocket(
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
     }
 
+    let client_id = normalize_client_id(query.client_id);
     upgrade
-        .on_upgrade(move |socket| run_websocket(socket, state))
+        .on_upgrade(move |socket| run_websocket(socket, state, client_id))
         .into_response()
 }
 
-async fn run_websocket(socket: WebSocket, state: AppState) {
+async fn run_websocket(socket: WebSocket, state: AppState, client_id: Option<String>) {
     let (sink, mut stream) = socket.split();
     let (sender, mut receiver) = mpsc::unbounded_channel::<Message>();
     let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
@@ -459,96 +649,106 @@ async fn run_websocket(socket: WebSocket, state: AppState) {
         let _ = sink.close().await;
     });
 
-    {
-        let _lifecycle = state.socket_lifecycle.lock().await;
-        let mut sockets = state.sockets.lock().await;
-        if let Some(older) = sockets.active.take() {
-            let _ = older.sender.send(Message::Close(None));
-        }
-        sockets.active = Some(ActiveSocket {
-            id: connection_id,
-            sender: sender.clone(),
-        });
-    }
+    let session_key = state
+        .sessions
+        .lock()
+        .await
+        .attach(client_id, connection_id, sender.clone());
 
     while let Some(message) = stream.next().await {
         let Ok(message) = message else {
             break;
         };
-        let _lifecycle = state.socket_lifecycle.lock().await;
-        if !is_active_socket(&state.sockets, connection_id).await {
-            break;
-        }
         match message {
             Message::Text(text) => {
-                if let Some((call_id, legacy, args)) = plugin_call_frame(text.as_str()) {
-                    start_call(&state, call_id, Call::Plugin { legacy, args }).await;
-                } else if let Ok(data) = serde_json::from_str::<Value>(text.as_str()) {
-                    handle_client_message(&state, data).await;
+                let calls_to_spawn = {
+                    let mut sessions = state.sessions.lock().await;
+                    if !sessions.is_current_socket(&session_key, connection_id) {
+                        break;
+                    }
+                    prepare_text_frame(&mut sessions, &session_key, text.as_str())
+                };
+                for (call_id, identity, call) in calls_to_spawn {
+                    spawn_call(&state, session_key.clone(), call_id, identity, call);
                 }
             }
             Message::Ping(payload) => {
+                if !state
+                    .sessions
+                    .lock()
+                    .await
+                    .is_current_socket(&session_key, connection_id)
+                {
+                    break;
+                }
                 let _ = sender.send(Message::Pong(payload));
             }
             Message::Close(_) => break,
-            Message::Binary(_) | Message::Pong(_) => {}
+            Message::Binary(_) | Message::Pong(_) => {
+                if !state
+                    .sessions
+                    .lock()
+                    .await
+                    .is_current_socket(&session_key, connection_id)
+                {
+                    break;
+                }
+            }
         }
     }
 
-    {
-        let _lifecycle = state.socket_lifecycle.lock().await;
-        let mut sockets = state.sockets.lock().await;
-        if sockets
-            .active
-            .as_ref()
-            .is_some_and(|active| active.id == connection_id)
-        {
-            sockets.active = None;
-        }
-    }
+    state
+        .sessions
+        .lock()
+        .await
+        .detach(&session_key, connection_id);
     let _ = sender.send(Message::Close(None));
     drop(sender);
     let _ = writer.await;
 }
 
-async fn is_active_socket(sockets: &Arc<Mutex<SocketRegistry>>, connection_id: u64) -> bool {
-    sockets
-        .lock()
-        .await
-        .active
-        .as_ref()
-        .is_some_and(|active| active.id == connection_id)
-}
+type PreparedCall = (i64, Arc<()>, Call);
 
-async fn send_to_active_socket(sockets: &Arc<Mutex<SocketRegistry>>, text: &str) {
-    let mut registry = sockets.lock().await;
-    let send_failed = registry
-        .active
-        .as_ref()
-        .map(|active| active.sender.send(Message::Text(text.into())).is_err())
-        .unwrap_or(false);
-    if send_failed {
-        registry.active = None;
+fn prepare_text_frame(
+    sessions: &mut SessionRegistry,
+    session_key: &SessionKey,
+    text: &str,
+) -> Vec<PreparedCall> {
+    if let Some((call_id, legacy, args)) = plugin_call_frame(text) {
+        return register_session_call(
+            sessions,
+            session_key,
+            call_id,
+            Call::Plugin { legacy, args },
+        )
+        .into_iter()
+        .collect();
     }
-}
-
-async fn close_active_socket(sockets: &Arc<Mutex<SocketRegistry>>) {
-    let mut registry = sockets.lock().await;
-    if let Some(active) = registry.active.take() {
-        let _ = active.sender.send(Message::Close(None));
+    if let Ok(data) = serde_json::from_str::<Value>(text) {
+        return prepare_client_message(sessions, session_key, data);
     }
+    Vec::new()
 }
 
-async fn handle_client_message(state: &AppState, data: Value) {
+fn prepare_client_message(
+    sessions: &mut SessionRegistry,
+    session_key: &SessionKey,
+    data: Value,
+) -> Vec<PreparedCall> {
     match data.get("type").and_then(Value::as_i64) {
-        Some(0) => handle_call(state, data).await,
+        Some(0) => prepare_call(sessions, session_key, data)
+            .into_iter()
+            .collect(),
         Some(3) => {
-            if let Some(call_id) = data.get("id").and_then(Value::as_i64) {
-                state.pending.lock().await.remove(&call_id);
+            if let Some(call_id) = data.get("id").and_then(Value::as_i64)
+                && let Some(session) = sessions.sessions.get_mut(session_key)
+            {
+                session.pending.remove(&call_id);
             }
+            Vec::new()
         }
-        Some(4) => handle_full_sync(state, data).await,
-        _ => {}
+        Some(4) => prepare_full_sync(sessions, session_key, data),
+        _ => Vec::new(),
     }
 }
 
@@ -589,40 +789,59 @@ enum Call {
     },
 }
 
-async fn handle_call(state: &AppState, data: Value) {
+fn prepare_call(
+    sessions: &mut SessionRegistry,
+    session_key: &SessionKey,
+    data: Value,
+) -> Option<PreparedCall> {
     let Value::Object(mut fields) = data else {
-        return;
+        return None;
     };
-    let Some(call_id) = fields.get("id").and_then(Value::as_i64) else {
-        return;
+    let call_id = fields.get("id").and_then(Value::as_i64)?;
+    let Value::String(route) = fields.remove("route")? else {
+        return None;
     };
-    let Some(Value::String(route)) = fields.remove("route") else {
-        return;
+    let Value::Array(args) = fields.remove("args")? else {
+        return None;
     };
-    let Some(Value::Array(args)) = fields.remove("args") else {
-        return;
-    };
-    start_call(state, call_id, Call::Dispatch { route, args }).await;
+    register_session_call(
+        sessions,
+        session_key,
+        call_id,
+        Call::Dispatch { route, args },
+    )
 }
 
-async fn start_call(state: &AppState, call_id: i64, call: Call) {
-    let identity = {
-        let mut pending = state.pending.lock().await;
-        match register_call(&mut pending, call_id) {
-            CallRegistration::Existing(reply) => {
-                drop(pending);
-                if let Some(reply) = reply {
-                    send_to_active_socket(&state.sockets, &reply).await;
-                }
-                return;
-            }
-            CallRegistration::New(identity) => identity,
-        }
+fn register_session_call(
+    sessions: &mut SessionRegistry,
+    session_key: &SessionKey,
+    call_id: i64,
+    call: Call,
+) -> Option<PreparedCall> {
+    let registration = {
+        let session = sessions.sessions.get_mut(session_key)?;
+        register_call(&mut session.pending, call_id)
     };
+    match registration {
+        CallRegistration::Existing(reply) => {
+            if let Some(reply) = reply {
+                sessions.send_to_session(session_key, &reply);
+            }
+            None
+        }
+        CallRegistration::New(identity) => Some((call_id, identity, call)),
+    }
+}
 
+fn spawn_call(
+    state: &AppState,
+    session_key: SessionKey,
+    call_id: i64,
+    identity: Arc<()>,
+    call: Call,
+) {
     let backend = state.backend.clone();
-    let pending = state.pending.clone();
-    let sockets = state.sockets.clone();
+    let sessions = state.sessions.clone();
     tokio::spawn(async move {
         let result = match call {
             Call::Dispatch { route, args } => backend
@@ -657,39 +876,63 @@ async fn start_call(state: &AppState, call_id: i64, call: Call) {
             }
         };
 
-        let should_send = {
-            let mut pending = pending.lock().await;
-            match pending.get_mut(&call_id) {
-                Some(current) if Arc::ptr_eq(&current.identity, &identity) => {
+        let mut sessions = sessions.lock().await;
+        let should_send = sessions
+            .sessions
+            .get_mut(&session_key)
+            .and_then(|session| session.pending.get_mut(&call_id))
+            .is_some_and(|current| {
+                if Arc::ptr_eq(&current.identity, &identity) {
                     current.reply = Some(message.clone());
                     true
+                } else {
+                    false
                 }
-                _ => false,
-            }
-        };
+            });
         if should_send {
-            send_to_active_socket(&sockets, &message).await;
+            sessions.send_to_session(&session_key, &message);
         }
     });
 }
 
-async fn handle_full_sync(state: &AppState, data: Value) {
+fn prepare_full_sync(
+    sessions: &mut SessionRegistry,
+    session_key: &SessionKey,
+    data: Value,
+) -> Vec<PreparedCall> {
     let Value::Object(mut fields) = data else {
-        return;
+        return Vec::new();
     };
     let Some(Value::Array(messages)) = fields.remove("messages") else {
-        return;
+        return Vec::new();
     };
 
     let mut live_ids = HashSet::with_capacity(messages.len());
+    let mut prepared = Vec::new();
     for message in messages {
         if let Some(call_id) = message.get("id").and_then(Value::as_i64) {
             live_ids.insert(call_id);
         }
-        handle_call(state, message).await;
+        if let Some(call) = prepare_call(sessions, session_key, message) {
+            prepared.push(call);
+        }
     }
 
-    prune_pending_calls(&mut *state.pending.lock().await, &live_ids);
+    if let Some(session) = sessions.sessions.get_mut(session_key) {
+        prune_pending_calls(&mut session.pending, &live_ids);
+    }
+    prepared
+}
+
+#[cfg(test)]
+async fn handle_client_message(state: &AppState, session_key: &SessionKey, data: Value) {
+    let calls_to_spawn = {
+        let mut sessions = state.sessions.lock().await;
+        prepare_client_message(&mut sessions, session_key, data)
+    };
+    for (call_id, identity, call) in calls_to_spawn {
+        spawn_call(state, session_key.clone(), call_id, identity, call);
+    }
 }
 
 fn frontend_cache_control(path: &str) -> &'static str {
@@ -1302,9 +1545,9 @@ mod tests {
                 }),
             )
             .route("/ordinary", get(|| async { "ordinary response" }));
-        let sockets = Arc::new(Mutex::new(SocketRegistry::default()));
+        let sessions = Arc::new(Mutex::new(SessionRegistry::default()));
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let server = tokio::spawn(serve_http(listener, app, sockets, shutdown_receiver));
+        let server = tokio::spawn(serve_http(listener, app, sessions, shutdown_receiver));
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let base_url = format!("http://{address}");
 
@@ -1360,9 +1603,9 @@ mod tests {
                 LocalClients::new(address),
                 local_client_guard,
             ));
-        let sockets = Arc::new(Mutex::new(SocketRegistry::default()));
+        let sessions = Arc::new(Mutex::new(SessionRegistry::default()));
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let server = tokio::spawn(serve_http(listener, app, sockets, shutdown_receiver));
+        let server = tokio::spawn(serve_http(listener, app, sessions, shutdown_receiver));
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let port = address.port();
         let cases: [(&str, Option<&str>, StatusCode); 9] = [
@@ -1488,17 +1731,15 @@ mod tests {
         let directory = TestDirectory::new("decky-rpc-test");
         let (registry, backend) = test_backend(&directory).await;
         let (sender, mut replies) = mpsc::unbounded_channel();
+        let mut sessions = SessionRegistry::default();
+        let session_key = sessions.attach(Some("replay-test".into()), 1, sender);
         let state = AppState {
             token: Arc::from("test-token"),
             assets: Arc::new(AssetRoot::Raw(directory.0.clone())),
             locales: Arc::new(AssetRoot::Raw(directory.0.clone())),
             backend,
             user_agent: HeaderValue::from_static("Decky/dev"),
-            pending: Arc::new(Mutex::new(PendingCalls::new())),
-            sockets: Arc::new(Mutex::new(SocketRegistry {
-                active: Some(ActiveSocket { id: 1, sender }),
-            })),
-            socket_lifecycle: Arc::new(Mutex::new(())),
+            sessions: Arc::new(Mutex::new(sessions)),
             next_connection_id: Arc::new(AtomicU64::new(2)),
             http_client: Client::new(),
             catalog_client: catalog_client(CATALOG_TIMEOUT).unwrap(),
@@ -1506,6 +1747,7 @@ mod tests {
 
         handle_client_message(
             &state,
+            &session_key,
             json!({
                 "type": 0, "id": 17, "route": "utilities/settings/set",
                 "args": ["replay-proof", 1]
@@ -1523,6 +1765,7 @@ mod tests {
 
         handle_client_message(
             &state,
+            &session_key,
             json!({
                 "type": 4, "messages": [{
                     "type": 0, "id": 17, "route": "utilities/settings/set",
@@ -1545,9 +1788,10 @@ mod tests {
 
         // A full sync with no outstanding calls removes the old request ID.
         // Reusing that ID must apply a genuinely new settings change.
-        handle_client_message(&state, json!({"type": 4, "messages": []})).await;
+        handle_client_message(&state, &session_key, json!({"type": 4, "messages": []})).await;
         handle_client_message(
             &state,
+            &session_key,
             json!({
                 "type": 0, "id": 17, "route": "utilities/settings/set",
                 "args": ["replay-proof", 3]
@@ -1623,5 +1867,440 @@ mod tests {
                 .unwrap();
             assert_eq!(body.as_ref(), expected.as_slice());
         }
+    }
+
+    async fn start_ws_test_server(
+        directory: &TestDirectory,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<crate::workers::PluginRegistry>,
+        broadcast::Sender<Value>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let (registry, backend) = test_backend(directory).await;
+        let (events, _) = broadcast::channel(32);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let server = tokio::spawn(serve(
+            address,
+            "test-token".into(),
+            directory.0.clone(),
+            directory.0.clone(),
+            backend,
+            events.clone(),
+            shutdown_rx,
+        ));
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(address).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (address, registry, events, shutdown_tx, server)
+    }
+
+    async fn recv_ws_json(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Value {
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("timed out waiting for WebSocket message")
+            .expect("WebSocket stream ended unexpectedly")
+            .expect("WebSocket read error");
+        let tokio_tungstenite::tungstenite::Message::Text(text) = frame else {
+            panic!("expected text WebSocket frame, got {frame:?}");
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn concurrent_clients_do_not_evict_each_other_and_route_replies_independently() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        let directory = TestDirectory::new("decky-ws-multi-client");
+        let (address, registry, events, shutdown_tx, server) =
+            start_ws_test_server(&directory).await;
+
+        let (mut client_a, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{address}/ws?auth=test-token&client_id=router-a"
+        ))
+        .await
+        .unwrap();
+        let (mut client_b, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{address}/ws?auth=test-token&client_id=router-b"
+        ))
+        .await
+        .unwrap();
+
+        // Both clients use the same call_id = 1 concurrently and must each receive their own reply.
+        client_a
+            .send(ClientMessage::Text(
+                json!({"type":0,"id":1,"route":"utilities/settings/get","args":["k-a","val-a"]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        client_b
+            .send(ClientMessage::Text(
+                json!({"type":0,"id":1,"route":"utilities/settings/get","args":["k-b","val-b"]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        let reply_a = recv_ws_json(&mut client_a).await;
+        let reply_b = recv_ws_json(&mut client_b).await;
+        assert_eq!(reply_a, json!({"type":1,"id":1,"result":"val-a"}));
+        assert_eq!(reply_b, json!({"type":1,"id":1,"result":"val-b"}));
+
+        // Client A leaves call_id = 2 unacknowledged; Client B's empty FULL_SYNC must not prune it.
+        client_a
+            .send(ClientMessage::Text(
+                json!({"type":0,"id":2,"route":"utilities/settings/set","args":["isolated-key",10]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let set_reply = recv_ws_json(&mut client_a).await;
+        assert_eq!(set_reply["type"], 1);
+        assert_eq!(set_reply["id"], 2);
+
+        client_b
+            .send(ClientMessage::Text(
+                json!({"type":4,"messages":[]}).to_string().into(),
+            ))
+            .await
+            .unwrap();
+        // Round-trip on Client B so its FULL_SYNC is guaranteed to have been processed.
+        client_b
+            .send(ClientMessage::Text(
+                json!({"type":0,"id":2,"route":"utilities/settings/get","args":["k-b","after-sync"]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_ws_json(&mut client_b).await,
+            json!({"type":1,"id":2,"result":"after-sync"})
+        );
+
+        client_a
+            .send(ClientMessage::Text(
+                json!({
+                    "type": 4,
+                    "messages": [{
+                        "type": 0,
+                        "id": 2,
+                        "route": "utilities/settings/set",
+                        "args": ["isolated-key", 99]
+                    }]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let replay = recv_ws_json(&mut client_a).await;
+        assert_eq!(replay["type"], 1);
+        assert_eq!(replay["id"], 2);
+        let persisted: Value = serde_json::from_slice(
+            &tokio::fs::read(directory.0.join("settings/loader.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["isolated-key"], 10);
+
+        // Backend pub/sub events reach every connected client.
+        let event = json!({
+            "type": 5,
+            "event": "loader/add_plugin_install_prompt",
+            "args": [{"request_id": "req-1"}]
+        });
+        events.send(event.clone()).unwrap();
+        assert_eq!(recv_ws_json(&mut client_a).await, event);
+        assert_eq!(recv_ws_json(&mut client_b).await, event);
+
+        // Closing Client B must leave Client A connected and responsive.
+        let _ = client_b.close(None).await;
+        client_a
+            .send(ClientMessage::Text(
+                json!({"type":0,"id":3,"route":"utilities/settings/get","args":["k-a","still-alive"]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_ws_json(&mut client_a).await,
+            json!({"type":1,"id":3,"result":"still-alive"})
+        );
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
+        registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_anonymous_clients_do_not_evict_each_other() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        let directory = TestDirectory::new("decky-ws-multi-anon");
+        let (address, registry, events, shutdown_tx, server) =
+            start_ws_test_server(&directory).await;
+
+        let (mut first, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws?auth=test-token"))
+                .await
+                .unwrap();
+        let (mut second, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws?auth=test-token"))
+                .await
+                .unwrap();
+
+        first
+            .send(ClientMessage::Text(
+                json!({"type":0,"id":1,"route":"utilities/settings/get","args":["a","one"]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        second
+            .send(ClientMessage::Text(
+                json!({"type":0,"id":1,"route":"utilities/settings/get","args":["b","two"]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recv_ws_json(&mut first).await,
+            json!({"type":1,"id":1,"result":"one"})
+        );
+        assert_eq!(
+            recv_ws_json(&mut second).await,
+            json!({"type":1,"id":1,"result":"two"})
+        );
+
+        let event = json!({"type": 5, "event": "loader/notify_updates", "args": []});
+        events.send(event.clone()).unwrap();
+        assert_eq!(recv_ws_json(&mut first).await, event);
+        assert_eq!(recv_ws_json(&mut second).await, event);
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
+        registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn same_client_id_reconnect_replaces_own_socket_and_preserves_full_sync() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        let directory = TestDirectory::new("decky-ws-same-client-reconnect");
+        let (address, registry, _events, shutdown_tx, server) =
+            start_ws_test_server(&directory).await;
+
+        let (mut router_1_old, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{address}/ws?auth=test-token&client_id=router-1"
+        ))
+        .await
+        .unwrap();
+        let (mut router_2, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{address}/ws?auth=test-token&client_id=router-2"
+        ))
+        .await
+        .unwrap();
+
+        router_1_old
+            .send(ClientMessage::Text(
+                json!({"type":0,"id":17,"route":"utilities/settings/set","args":["same-client",1]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(recv_ws_json(&mut router_1_old).await["type"], 1);
+
+        // Reconnect with the same client_id: replaces router_1_old, keeps router_2 untouched.
+        let (mut router_1_new, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{address}/ws?auth=test-token&client_id=router-1"
+        ))
+        .await
+        .unwrap();
+
+        let evicted = tokio::time::timeout(Duration::from_secs(5), router_1_old.next())
+            .await
+            .expect("replaced socket should close promptly");
+        assert!(matches!(evicted, None | Some(Ok(ClientMessage::Close(_)))));
+
+        // router_2 is still live.
+        router_2
+            .send(ClientMessage::Text(
+                json!({"type":0,"id":1,"route":"utilities/settings/get","args":["r2","ok"]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_ws_json(&mut router_2).await,
+            json!({"type":1,"id":1,"result":"ok"})
+        );
+
+        // Replaying id=17 on router_1_new deduplicates against the cached reply.
+        router_1_new
+            .send(ClientMessage::Text(
+                json!({
+                    "type": 4,
+                    "messages": [{
+                        "type": 0,
+                        "id": 17,
+                        "route": "utilities/settings/set",
+                        "args": ["same-client", 2]
+                    }]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(recv_ws_json(&mut router_1_new).await["type"], 1);
+        let persisted: Value = serde_json::from_slice(
+            &tokio::fs::read(directory.0.join("settings/loader.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["same-client"], 1);
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
+        registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn anonymous_client_reconnect_after_disconnect_preserves_full_sync() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        let directory = TestDirectory::new("decky-ws-anon-reconnect");
+        let (address, registry, _events, shutdown_tx, server) =
+            start_ws_test_server(&directory).await;
+
+        let (mut first, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws?auth=test-token"))
+                .await
+                .unwrap();
+        first
+            .send(ClientMessage::Text(
+                json!({"type":0,"id":17,"route":"utilities/settings/set","args":["anon-key",1]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(recv_ws_json(&mut first).await["type"], 1);
+        let _ = first.close(None).await;
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (mut reconnected, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws?auth=test-token"))
+                .await
+                .unwrap();
+        reconnected
+            .send(ClientMessage::Text(
+                json!({
+                    "type": 4,
+                    "messages": [{
+                        "type": 0,
+                        "id": 17,
+                        "route": "utilities/settings/set",
+                        "args": ["anon-key", 2]
+                    }]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(recv_ws_json(&mut reconnected).await["type"], 1);
+        let persisted: Value = serde_json::from_slice(
+            &tokio::fs::read(directory.0.join("settings/loader.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["anon-key"], 1);
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
+        registry.shutdown().await;
+    }
+
+    #[test]
+    fn disconnected_session_cleanup_bounds_ttl_and_count() {
+        let mut registry = SessionRegistry::default();
+        let base = Instant::now();
+
+        // A disconnected session with no pending calls is removed immediately on detach.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty_key = registry.attach(Some("empty".into()), 1, tx);
+        registry.detach(&empty_key, 1);
+        assert!(!registry.sessions.contains_key(&empty_key));
+
+        // Disconnected sessions with pending calls stay until TTL or MAX_DISCONNECTED_SESSIONS.
+        for index in 0..(MAX_DISCONNECTED_SESSIONS + 3) {
+            let key = SessionKey::Client(format!("stale-{index}"));
+            let mut pending = PendingCalls::new();
+            register_call(&mut pending, 1);
+            registry.sessions.insert(
+                key,
+                ClientSession {
+                    socket: None,
+                    pending,
+                    disconnected_at: Some(base + Duration::from_secs(index as u64)),
+                },
+            );
+        }
+        // Keep one live session that must never be evicted.
+        let (live_tx, _live_rx) = mpsc::unbounded_channel();
+        let live_key = SessionKey::Client("live".into());
+        registry.sessions.insert(
+            live_key.clone(),
+            ClientSession::new(ActiveSocket {
+                id: 999,
+                sender: live_tx,
+            }),
+        );
+
+        let after_attach = base + Duration::from_secs((MAX_DISCONNECTED_SESSIONS + 4) as u64);
+        registry.prune_disconnected(after_attach);
+        assert!(registry.sessions.contains_key(&live_key));
+        assert_eq!(registry.sessions.len(), MAX_DISCONNECTED_SESSIONS + 1);
+        assert!(
+            !registry
+                .sessions
+                .contains_key(&SessionKey::Client("stale-0".into()))
+        );
+        assert!(registry.sessions.contains_key(&SessionKey::Client(format!(
+            "stale-{}",
+            MAX_DISCONNECTED_SESSIONS + 2
+        ))));
+
+        // After TTL passes, all disconnected sessions expire while the live one remains.
+        registry.prune_disconnected(after_attach + DISCONNECTED_SESSION_TTL);
+        assert_eq!(registry.sessions.len(), 1);
+        assert!(registry.sessions.contains_key(&live_key));
     }
 }
