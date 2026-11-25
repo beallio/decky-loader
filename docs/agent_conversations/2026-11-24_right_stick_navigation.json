@@ -1,0 +1,53 @@
+{
+  "date": "2026-11-24",
+  "task_objective": "Port right-stick navigation from dimmujed/Right-Stick-Navigation natively into decky-loader for any dual-joystick handheld/controller, add a General Settings toggle (default OFF), and verify functional behavior and performance live on steamdeck-vm across both Steam Beta (ESM) and Steam Stable (Webpack).",
+  "branch": "feat/right-stick-navigation",
+  "files_modified": [
+    "docs/plans/right_stick_navigation.md",
+    "backend-rust/src/right_stick.rs",
+    "backend-rust/src/backend.rs",
+    "backend-rust/src/main.rs",
+    "frontend/src/rightStickNavigationLogic.ts",
+    "frontend/src/right-stick-navigation.ts",
+    "frontend/src/components/DeckyState.tsx",
+    "frontend/src/plugin-loader.tsx",
+    "frontend/src/components/settings/pages/general/index.tsx",
+    "backend/decky_loader/locales/en-US.json",
+    "scripts/runtime/prepare_bundle.py",
+    "tests/frontend/right_stick_navigation.test.mts"
+  ],
+  "tests_added": [
+    "backend-rust/src/right_stick.rs (7 unit tests: stick_hysteresis_requires_center_and_diagonal_margin, arbiter_supports_multiple_controllers_and_unplug_release, normalize_axis_handles_asymmetric_ranges_and_clamping, parse_deck_hid_report_reads_right_stick_bytes, steam_session_mode_detection_from_cmdline, disabled_controller_does_not_spawn_worker_and_disable_stops_active_focus, right_stick_controller_shutdown_is_idempotent)",
+    "tests/frontend/right_stick_navigation.test.mts (4 unit tests: focusedWindow validates gamescope/desktop rules, findGamepadSourceBase walks prototype chain, controller handles direction push/hysteresis/focus loss/suspend/disable release, controller clears held direction on stop)"
+  ],
+  "design_decisions": [
+    "Universal dual-stick evdev discovery (ABS_X + ABS_Y + ABS_RX + ABS_RY + BTN_SOUTH) with Steam Deck hidraw (0x28DE:0x1205) fallback so any handheld or controller (Legion Go S, ROG Ally, Steam Deck, Xbox, DualSense, Switch Pro) works out of the box.",
+    "Zero-overhead disabled state: default OFF (rightStickNavigation = false) spawns no reader thread, opens zero input fds, registers no event listener, and runs no frontend focus timer.",
+    "Event-driven kernel-blocked libc::poll() + inotify /dev/input hotplug + push-only WebSocket EVENT (loader/right_stick_direction) instead of upstream's 4 Hz long-poll RPC loop.",
+    "Multi-controller ControllerArbiter with per-device centering, active-controller handoff, and automatic release on unplug or disable.",
+    "Resilient prototype-chain walk (findGamepadSourceBase) to construct a synthetic GamepadInputSource across both Steam Beta (ESM) and Steam Stable (Webpack)."
+  ],
+  "results": {
+    "local_validation": {
+      "frontend": "lint, typecheck, build (dfl-global & no-entry-reimport), and 30/30 node --test passed",
+      "rust": "cargo fmt --check, cargo clippy --locked --workspace --all-targets -- -D warnings, and 99 runtime + 10 decky-plugin + 1 doctest passed",
+      "python": "161 OK, 2 skipped"
+    },
+    "vm_verification_beta": {
+      "steam_version": 1795048523,
+      "is_esm": true,
+      "ui_focus_moved": true,
+      "latency_ms": { "p50": 0.92, "p95": 38.35, "max": 38.44 },
+      "perf_off_5s": { "cpu_pct": 0.0, "vol_ctxt_per_sec": 0.0, "input_fds": 0, "pss_kb": 15501 },
+      "perf_on_idle_5s": { "cpu_pct": 0.0, "vol_ctxt_per_sec": 0.0, "input_fds": 4, "pss_kb": 15361 }
+    },
+    "vm_verification_stable": {
+      "steam_version": 1794536281,
+      "is_esm": false,
+      "ui_focus_moved": true,
+      "latency_ms": { "p50": 2.38, "p95": 32.32, "max": 54.07 },
+      "perf_off_5s": { "cpu_pct": 0.0, "vol_ctxt_per_sec": 0.0, "input_fds": 0, "pss_kb": 14530 },
+      "perf_on_idle_5s": { "cpu_pct": 0.0, "vol_ctxt_per_sec": 0.0, "input_fds": 4, "pss_kb": 14374 }
+    }
+  }
+}
