@@ -1,0 +1,28 @@
+{
+  "date": "2026-11-24",
+  "task_objective": "Fix strict per-track @decky/ui version tracking in Upstream UI Library workflow and align @decky/ui-v5 to 5.0.0 so issue #14 can be cleanly closed without weakening strict drift alerts.",
+  "branch": "fix/upstream-ui-strict-check",
+  "files_modified": [
+    "docs/plans/strict_upstream_ui_check.md",
+    "scripts/runtime/upstream_ui_check.py",
+    "tests/runtime/test_upstream_ui_check.py",
+    ".github/workflows/upstream-ui.yml",
+    "frontend/package.json",
+    "frontend/pnpm-lock.yaml",
+    "docs/development.md"
+  ],
+  "tests_added": [
+    "tests/runtime/test_upstream_ui_check.py (11 unit tests covering lockfile parsing for dual-client/single-client/peer-suffix/missing cases, strict exact-equality comparison for main/release/alias drift, Markdown table rendering, and CLI JSON/Markdown output)"
+  ],
+  "design_decisions": [
+    "Extracted upstream UI lockfile parsing, strict comparison, and Markdown rendering from inline workflow bash into scripts/runtime/upstream_ui_check.py (pure Python stdlib, compatible with Python 3.10+ on ubuntu-22.04 and pinned Python 3.14).",
+    "Enforced strict exact equality per track in dual-client mode (@decky/ui == upstream main, @decky/ui-v5 == upstream main, @decky/ui-legacy == upstream latest release) with automatic fallback to single-client strict equality when @decky/ui-legacy and @decky/ui-v5 are removed.",
+    "Pinned @decky/ui-v5 from 5.0.1 to 5.0.0 in frontend/package.json after verifying decky-frontend-lib v5.0.0..v5.0.2 diffs contain only TypeScript type annotations and zero runtime JS changes, eliminating duplicate 5.x entries in pnpm-lock.yaml and establishing exact parity with upstream v4.0.0-pre1."
+  ],
+  "results": {
+    "python_runtime_tests": "172 tests OK (2 skipped)",
+    "ruff_check": "All checks passed",
+    "frontend": "pnpm install --frozen-lockfile, lint, typecheck, build, and 30/30 node --test passed",
+    "live_dry_run": "in_sync=true (@decky/ui=5.0.0, @decky/ui-v5=5.0.0 vs upstream main 5.0.0; @decky/ui-legacy=4.16.4 vs upstream v3.3.1 4.16.4; decky-frontend-lib v5.0.2)"
+  }
+}
