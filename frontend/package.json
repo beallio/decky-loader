@@ -49,7 +49,7 @@
   "dependencies": {
     "@decky/ui": "^5.0.0",
     "@decky/ui-legacy": "npm:@decky/ui@4.16.4",
-    "@decky/ui-v5": "npm:@decky/ui@5.0.1",
+    "@decky/ui-v5": "npm:@decky/ui@5.0.0",
     "compare-versions": "^6.1.1",
     "filesize": "^10.1.2",
     "i18next": "^25.6.0",
