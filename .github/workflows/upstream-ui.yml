@@ -31,47 +31,41 @@ jobs:
       - name: Compare, then open, update or close the tracking issue
         run: |
           set -euo pipefail
-          # The resolved version, from the lockfile's package keys '@decky/ui@X.Y.Z':. Read all input:
-          # stopping early would kill the gh writer with SIGPIPE under pipefail.
-          locked() { grep -oP "^  '@decky/ui@\K[^']+(?=':)" | sort -u; }
-          upstream_locked() {
-            gh api -H 'Accept: application/vnd.github.raw' "repos/$UPSTREAM/contents/frontend/pnpm-lock.yaml?ref=$1" | locked
-          }
-          ours="$(locked < frontend/pnpm-lock.yaml)"
-          main="$(upstream_locked main)"
           release="$(gh release view -R "$UPSTREAM" --json tagName --jq .tagName)"
-          released="$(upstream_locked "$release")"
           library="$(gh release view -R "$LIBRARY" --json tagName --jq .tagName)"
-          existing="$(gh issue list --label upstream-ui --state open --limit 1 --json number --jq '.[0].number // empty')"
 
-          if [[ "$main" == "$ours" && "$released" == "$ours" ]]; then
-            echo "Upstream main and $release lock @decky/ui $ours, the same as this fork."
+          gh api -H 'Accept: application/vnd.github.raw' "repos/$UPSTREAM/contents/frontend/pnpm-lock.yaml?ref=main" \
+            > "$RUNNER_TEMP/upstream-main-pnpm-lock.yaml"
+          gh api -H 'Accept: application/vnd.github.raw' "repos/$UPSTREAM/contents/frontend/pnpm-lock.yaml?ref=$release" \
+            > "$RUNNER_TEMP/upstream-release-pnpm-lock.yaml"
+          gh api "repos/$UPSTREAM/commits?path=frontend/pnpm-lock.yaml&per_page=5" \
+            > "$RUNNER_TEMP/upstream-commits.json"
+
+          report="$RUNNER_TEMP/upstream-ui-report.json"
+          body="$RUNNER_TEMP/upstream-ui.md"
+          python3 scripts/runtime/upstream_ui_check.py \
+            --ours-lock frontend/pnpm-lock.yaml \
+            --upstream-main-lock "$RUNNER_TEMP/upstream-main-pnpm-lock.yaml" \
+            --upstream-release-lock "$RUNNER_TEMP/upstream-release-pnpm-lock.yaml" \
+            --upstream-release-tag "$release" \
+            --library-release "$library" \
+            --repo "$GH_REPO" \
+            --commits-json "$RUNNER_TEMP/upstream-commits.json" \
+            --markdown "$body" > "$report"
+
+          existing="$(gh issue list --label upstream-ui --state open --limit 1 --json number --jq '.[0].number // empty')"
+          in_sync="$(jq -r '.in_sync' "$report")"
+          close_comment="$(jq -r '.close_comment' "$report")"
+          title="$(jq -r '.issue_title' "$report")"
+
+          if [[ "$in_sync" == "true" ]]; then
+            echo "$close_comment"
             if [[ -n "$existing" ]]; then
-              gh issue close "$existing" --comment "Upstream main and $release now lock @decky/ui $ours, the same as this fork."
+              gh issue close "$existing" --comment "$close_comment"
             fi
             exit 0
           fi
 
-          body="$RUNNER_TEMP/upstream-ui.md"
-          {
-            echo "Upstream Decky Loader locks a different \`@decky/ui\` version than this fork."
-            echo
-            echo "| Where | \`@decky/ui\` |"
-            echo "|---|---|"
-            echo "| This fork (\`frontend/pnpm-lock.yaml\`) | $ours |"
-            echo "| Upstream \`main\` | $main |"
-            echo "| Upstream release $release | $released |"
-            echo "| Newest decky-frontend-lib release | $library |"
-            echo
-            echo "Recent upstream commits that change \`frontend/pnpm-lock.yaml\`:"
-            echo
-            gh api "repos/$UPSTREAM/commits?path=frontend/pnpm-lock.yaml&per_page=5" \
-              --jq '.[] | "- [`\(.sha[0:7])`](\(.html_url)) \(.commit.committer.date[0:10]) \(.commit.message | split("\n")[0])"'
-            echo
-            echo "Plugins use the loader's copy of this library at runtime. Before the fork moves to a new version, check the [UI library section](https://github.com/$GH_REPO/blob/main/docs/development.md#ui-library) of the development guide."
-          } > "$body"
-
-          title="Upstream decky-loader locks @decky/ui $main"
           gh label create upstream-ui --force \
             --description "Upstream Decky Loader uses a different @decky/ui version" --color 1D76DB
           if [[ -n "$existing" ]]; then

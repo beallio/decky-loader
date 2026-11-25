@@ -279,11 +279,11 @@ The frontend has three `@decky/ui` entries:
 
 | Package | Version | Role |
 | --- | --- | --- |
-| `@decky/ui` | 5.x | Types for loader code. The `dfl-global` rule replaces this import at build time. |
-| `@decky/ui-v5` | 5.0.1 | Runtime library that the ES module client boots. |
+| `@decky/ui` | 5.0.0 | Types for loader code. The `dfl-global` rule replaces this import at build time. |
+| `@decky/ui-v5` | 5.0.0 | Runtime library that the ES module client boots. |
 | `@decky/ui-legacy` | 4.16.4 | Runtime library that the Webpack client boots. |
 
-Keep the versions that the pinned SDK tag locks in `frontend/pnpm-lock.yaml`; `frontend/package.json` and the lockfile are upstream files, so a different version needs `SDK_OVERLAYS` entries. The `Upstream UI Library` workflow runs every day and can be started by hand. It compares the locked `@decky/ui` version with upstream `main` and the newest upstream release. When either differs, it opens one issue with the `upstream-ui` label and updates it on later runs. When both match again, it closes the issue.
+Keep the versions that the pinned SDK tag locks in `frontend/pnpm-lock.yaml`; `frontend/package.json` and the lockfile are upstream files, so a different version needs `SDK_OVERLAYS` entries. The `Upstream UI Library` workflow runs every day and can be started by hand. It runs `scripts/runtime/upstream_ui_check.py`, which strictly compares every active track in `frontend/pnpm-lock.yaml` against upstream: in dual-client mode, `@decky/ui` and `@decky/ui-v5` must equal upstream `main`, and `@decky/ui-legacy` must equal the newest upstream stable release (falling back to comparing `@decky/ui` against both once the Stable branch is removed). When any track differs, it opens one issue with the `upstream-ui` label and updates it on later runs. When all tracks strictly match again, it closes the issue.
 
 The `dfl-global` rule in [rollup.config.js](../frontend/rollup.config.js) maps the bare import `@decky/ui` to `window.DFL`. Loader code therefore reads the library at runtime, as plugins do. Code that runs before `window.DFL` exists must not import `@decky/ui`, directly or through a static import. The build fails if [index.ts](../frontend/src/index.ts), [wsrouter.ts](../frontend/src/wsrouter.ts), [logger.ts](../frontend/src/logger.ts), or a file in `frontend/src/stable/` does this. Those files import `@decky/ui-v5` or `@decky/ui-legacy` when they need the real library.
 
