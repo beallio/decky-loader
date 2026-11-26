@@ -332,6 +332,12 @@ class InstallGuiTests(unittest.TestCase):
         call = self.read_installer_call()
         self.assertEqual(call['argv'], ['--channel', 'stable'])
 
+    def test_channel_override_reaches_menu_and_installer(self):
+        res = self.run_gui('zenity', 'install', extra_env={'DECKY_CHANNEL': 'preview'})
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertEqual(self.read_installer_call()['argv'], ['--channel', 'preview'])
+        self.assertIn('latest preview release', (self.log_dir / 'gui_calls.log').read_text(encoding='utf-8'))
+
     def test_auto_backend_selection_across_desktops(self):
         # KDE session prefers kdialog even when zenity is present
         env_kde = self.base_env(

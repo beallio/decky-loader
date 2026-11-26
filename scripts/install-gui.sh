@@ -348,7 +348,7 @@ if [[ $OFFICIAL == true && $INSTALLED == false ]]; then
     add_opt "migrate" "Move from Official Decky" "Switch to Decky (Rust), keep plugins & backup (asks password)"
 fi
 if [[ $INSTALLED == false && $OFFICIAL == false ]]; then
-    add_opt "install" "Install Decky (Rust)" "Download and install the latest stable release (no password)"
+    add_opt "install" "Install Decky (Rust)" "Download and install the latest $CHANNEL release (no password)"
 fi
 if [[ $INSTALLED == true ]]; then
     add_opt "update" "Update / Reinstall Decky (Rust)" "Download latest build and back up plugins (no password)"
