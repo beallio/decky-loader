@@ -6,6 +6,10 @@ Open Decky settings from the Quick Access Menu to manage plugins, stores, update
 
 The **General** page has update settings and plugin stores. Scroll to **Plugin stores** to manage stable and pre-release stores. See the [Plugin Stores Guide](./plugin-stores.md).
 
+### Right-stick navigation
+
+Turn on **General** -> **Other** -> **Right-stick navigation** to move through Steam menus and Decky with the right stick, the same way as with the D-pad. It works in Steam's own screens, such as the Quick Access Menu and the main menu. While a game runs, it works only when a Steam menu is open over the game, and it does not change how the right stick works in the game. The setting is off by default.
+
 ## Plugins
 
 Use **Enable all** or **Disable all** to change every plugin's state. Decky processes plugins one at a time. If one change fails, Decky shows an error and continues with the others. **Enable all** also enables plugins that you had turned off before.

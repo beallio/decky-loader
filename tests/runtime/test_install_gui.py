@@ -321,7 +321,7 @@ class InstallGuiTests(unittest.TestCase):
                 res = self.run_gui(backend, 'install')
                 self.assertEqual(res.returncode, 0, res.stdout)
                 call = self.read_installer_call()
-                self.assertEqual(call['argv'], ['--channel', 'preview'])
+                self.assertEqual(call['argv'], ['--channel', 'stable'])
                 self.assertEqual(call['sudo_askpass'], '')
                 self.assertFalse(self.sudo_calls.exists())
 
@@ -330,7 +330,13 @@ class InstallGuiTests(unittest.TestCase):
         res_tty = self.run_gui('tty', '', stdin_text='1\n')
         self.assertEqual(res_tty.returncode, 0, res_tty.stdout)
         call = self.read_installer_call()
-        self.assertEqual(call['argv'], ['--channel', 'preview'])
+        self.assertEqual(call['argv'], ['--channel', 'stable'])
+
+    def test_channel_override_reaches_menu_and_installer(self):
+        res = self.run_gui('zenity', 'install', extra_env={'DECKY_CHANNEL': 'preview'})
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertEqual(self.read_installer_call()['argv'], ['--channel', 'preview'])
+        self.assertIn('latest preview release', (self.log_dir / 'gui_calls.log').read_text(encoding='utf-8'))
 
     def test_auto_backend_selection_across_desktops(self):
         # KDE session prefers kdialog even when zenity is present
@@ -378,7 +384,7 @@ class InstallGuiTests(unittest.TestCase):
         res = self.run_gui('zenity', 'migrate')
         self.assertEqual(res.returncode, 0, res.stdout)
         call = self.read_installer_call()
-        self.assertEqual(call['argv'], ['--migrate-legacy', '--channel', 'preview', '--non-interactive'])
+        self.assertEqual(call['argv'], ['--migrate-legacy', '--channel', 'stable', '--non-interactive'])
         self.assertTrue(call['askpass_exists'])
         self.assertFalse(Path(call['sudo_askpass']).exists(), 'Askpass file must be cleaned up on exit')
         self.assertFalse(Path(call['sudo_askpass']).parent.exists(), 'Askpass dir must be cleaned up on exit')
@@ -389,7 +395,7 @@ class InstallGuiTests(unittest.TestCase):
         res_fail = self.run_gui('kdialog', 'enable-root', extra_env={'TEST_INSTALLER_FAIL': '1'})
         self.assertNotEqual(res_fail.returncode, 0)
         call = self.read_installer_call()
-        self.assertEqual(call['argv'], ['--enable-root-plugins', '--channel', 'preview', '--non-interactive'])
+        self.assertEqual(call['argv'], ['--enable-root-plugins', '--channel', 'stable', '--non-interactive'])
         self.assertTrue(call['askpass_exists'])
         self.assertFalse(Path(call['sudo_askpass']).exists(), 'Askpass must be cleaned up even when installer fails')
 

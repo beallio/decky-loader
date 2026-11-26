@@ -15,7 +15,7 @@ To turn support on once:
 - **With the graphical installer:** Open `Install-Decky-Rust.desktop` and choose **Enable Root Plugins** (only appears if Decky Rust is already installed).
 - **From Konsole / Terminal:**
   ```sh
-  bash ~/Downloads/install-to-deck.sh --enable-root-plugins --channel preview
+  bash ~/Downloads/install-to-deck.sh --enable-root-plugins
   ```
 
 What happens when you enable it:

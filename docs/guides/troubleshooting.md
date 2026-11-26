@@ -55,7 +55,7 @@ Two older preview ranges cannot self-update inside Gaming Mode because of runtim
 - **Running `v3.2.10-rust.8-rc.1` through `rc.10`:** Cannot self-update directly to `v3.3.0+`.
 - **Error `"bundle requires a frozen CPython 3.11 worker"` (versions up to `v3.3.0-rust.1-rc.12`):** Older CPython 3.11 installers cannot self-update to Python 3.14 builds in Gaming Mode.
 
-**Fix:** Run the graphical installer ([Installation Guide](./installation.md)) or run the terminal installer **once** with `--channel preview`. After that one update, in-app Gaming Mode updates work again.
+**Fix:** Run the graphical installer ([Installation Guide](./installation.md)) or run the terminal installer **once**. After that one update, in-app Gaming Mode updates work again.
 
 ---
 
@@ -79,7 +79,7 @@ The installer checks free space before changing anything on disk and aborts safe
 
 - Free up disk space in `~`, **or** store the backup archive on an SD card or another drive:
   ```sh
-  bash install-to-deck.sh --backup-dir /run/media/mmcblk0p1/decky-backups --channel preview
+  bash install-to-deck.sh --backup-dir /run/media/mmcblk0p1/decky-backups
   ```
 
 ---

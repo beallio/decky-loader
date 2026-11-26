@@ -99,6 +99,10 @@ Failed plugin installs and uninstalls close their confirmation window and show a
 
 WebSocket error replies have two shapes: missing-route errors use `error.error`, and failures inside a route use `error.message`. The frontend reads both so that error notifications retain the backend's explanation.
 
+The General settings page has a **Right-stick navigation** toggle. The `rightStickNavigation` setting defaults to `false`. When enabled, the frontend service coordinates navigation with the backend. The backend reads controller input from `/dev/input/event*` and, when needed, the built-in Steam Deck controller from `/dev/hidraw*`. It sends `loader/right_stick_direction` events and provides the `utilities/right_stick/get_session_mode` and `utilities/right_stick/set_focus` routes.
+
+The service needs read access to the device files as the account running Decky. This fork ships no udev rule to grant that access. If a device cannot be read, or no supported controller is found, the backend skips it; the service continues without input from that device. It scans again when input devices change.
+
 ### Testing page
 
 The Testing page calls `updater/get_testing_versions`, which returns each pull request's `id`, `name`, `link`, `head_sha`, `created_at`, `updated_at`, and `author` (an empty string if GitHub has no user). Installing calls `updater/download_testing_version` with the pull request number and head SHA. The backend verifies the testing bundle, stamps a development bundle `PR-<number>`, then sets the update channel to Testing before handing off the install. If the handoff fails, it restores the previous channel.
@@ -300,9 +304,9 @@ A new library version that removes exports breaks plugins built against the old 
 
 Steam Beta loads the Steam UI as native ES modules (Vite/Rolldown, Oxc minifier). Steam Stable still loads it as Webpack chunks. Upstream `v4.0.0-pre1` supports only the ES module client. This fork supports both clients in one release.
 
-At start-up, [index.ts](../frontend/src/index.ts) imports `IS_ESM_CLIENT` from [stable/client.ts](../frontend/src/stable/client.ts). The check looks for `script[type=module][src*="library.js"]`. [index.ts](../frontend/src/index.ts) then boots one of two paths:
+At start-up, [index.ts](../frontend/src/index.ts) first claims the boot. A duplicate boot in the same context stops there. It then fetches the auth token and imports the WebSocket router concurrently. It imports `IS_ESM_CLIENT` from [stable/client.ts](../frontend/src/stable/client.ts), which looks for `script[type=module][src*="library.js"]`. After the router connects, [index.ts](../frontend/src/index.ts) boots one of two paths:
 
-- **ES module client (Beta):** The loader imports `@decky/ui-v5/dist/module-system` and calls `initModules`. Module scopes contain non-exported variables, not only exports. `initModules` resolves a scope through the callback that [index.ts](../frontend/src/index.ts) gives it. The callback calls the backend route `instrumentation/resolve_scope` over the WebSocket. [cef.rs](../backend-rust/src/cef.rs) keeps one lazily connected CDP session to `SharedJSContext`. Concurrent requests share it, with one request id per call. Each resolve uses one CDP object group and always releases it. `window.DFL` is then `@decky/ui-v5`.
+- **ES module client (Beta):** The loader starts the `@decky/ui-v5/dist/module-system` import while it waits for SteamApp initialization, then calls `initModules`. Module scopes contain non-exported variables, not only exports. `initModules` resolves a scope through the callback that [index.ts](../frontend/src/index.ts) gives it. The callback calls the backend route `instrumentation/resolve_scope` over the WebSocket. [cef.rs](../backend-rust/src/cef.rs) keeps one lazily connected CDP session to `SharedJSContext`. Concurrent requests share it, with one request id per call. Each resolve uses one CDP object group and always releases it. `window.DFL` is then `@decky/ui-v5`.
 - **Webpack client (Stable):** [stable/boot.ts](../frontend/src/stable/boot.ts) sets `window.SP_REACT` and `window.SP_JSX` from Webpack, then boots `@decky/ui-legacy` (4.16.4). It adds the 5.x names that loader code reads (`findVar`, `findModuleScopeByVar`, `findScopeDetailsByVar`, `findScope`, `createScopeMapping`, `createVarMapping`, `moduleScopes`, `processedModules`, `toastClasses`, `tabsClasses`) on an object that inherits from the 4.16.4 namespace.
 
 Plugins see on each client what upstream gives them:
