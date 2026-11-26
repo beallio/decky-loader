@@ -6,7 +6,7 @@ umask 077
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 RAW_INSTALLER_URL=${DECKY_RAW_INSTALLER_URL:-"https://raw.githubusercontent.com/beallio/decky-loader/main/scripts/install-to-deck.sh"}
-CHANNEL=${DECKY_CHANNEL:-preview}
+CHANNEL=${DECKY_CHANNEL:-stable}
 HOMEBREW_DIR=${DECKY_HOMEBREW_DIR:-"$HOME/homebrew"}
 TARGET_USER=${DECK_USER:-$(id -un)}
 SYSTEM_UNIT_DIRS=${DECKY_SYSTEM_UNIT_DIRS:-"/etc/systemd/system:/usr/lib/systemd/system:/lib/systemd/system"}
@@ -348,7 +348,7 @@ if [[ $OFFICIAL == true && $INSTALLED == false ]]; then
     add_opt "migrate" "Move from Official Decky" "Switch to Decky (Rust), keep plugins & backup (asks password)"
 fi
 if [[ $INSTALLED == false && $OFFICIAL == false ]]; then
-    add_opt "install" "Install Decky (Rust)" "Download and install the latest preview build (no password)"
+    add_opt "install" "Install Decky (Rust)" "Download and install the latest stable release (no password)"
 fi
 if [[ $INSTALLED == true ]]; then
     add_opt "update" "Update / Reinstall Decky (Rust)" "Download latest build and back up plugins (no password)"
