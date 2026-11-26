@@ -5,7 +5,7 @@ Decky Loader (Rust fork) installs into your normal Linux user account using `sys
 You do not need a GitHub account, developer mode, or build tools.
 
 > [!NOTE]
-> This fork currently has preview releases (`--channel preview`) rather than stable releases yet. Both the graphical launcher and the Gaming Mode **Prerelease** update channel use those preview builds.
+> The installers download the newest **stable** release by default. To try preview builds, add `--channel preview` to the terminal installer, or choose **Prerelease** under **Update Channel** in Gaming Mode.
 
 ---
 
@@ -39,7 +39,7 @@ Official Decky runs as administrator (`root`). You do not need to uninstall it f
 - **From Konsole / Terminal:**
   ```sh
   curl -fsSL https://raw.githubusercontent.com/beallio/decky-loader/main/scripts/install-to-deck.sh -o ~/Downloads/install-to-deck.sh
-  bash ~/Downloads/install-to-deck.sh --migrate-legacy --channel preview
+  bash ~/Downloads/install-to-deck.sh --migrate-legacy
   ```
 
 You will be asked for your login password once so the installer can stop and park the Official Decky system service. If you have never set a desktop password on a fresh Steam Deck, open Konsole and run `passwd` first to create one.
@@ -50,7 +50,7 @@ You will be asked for your login password once so the installer can stop and par
 
 In Gaming Mode, open Decky settings -> **General** -> **Updates** -> **Check For Updates**.
 
-- Choose **Prerelease** under **Update Channel** for preview releases (currently recommended while this fork is in preview), or **Stable** once stable releases are published.
+- Under **Update Channel**, choose **Stable** to get stable releases only (recommended). Choose **Prerelease** to also get preview builds. Prerelease installs the newest release, stable or preview.
 - You can also update anytime by running `Install-Decky-Rust.desktop` or re-running the terminal installer.
 
 ---
@@ -116,13 +116,16 @@ cd ~/Downloads
 curl -fsSL https://raw.githubusercontent.com/beallio/decky-loader/main/scripts/install-to-deck.sh -o install-to-deck.sh
 
 # Dry-run check: tests download and target without changing anything
-bash install-to-deck.sh --check --channel preview
+bash install-to-deck.sh --check
 
-# Install or update the latest preview build
+# Install or update the latest stable release
+bash install-to-deck.sh
+
+# Install or update the latest preview build instead
 bash install-to-deck.sh --channel preview
 
 # Install one exact release tag
-bash install-to-deck.sh --version v3.3.1-rust.1-rc.9
+bash install-to-deck.sh --version v3.3.1-rust.1
 
 # Check service health and live CPU / memory per plugin
 bash install-to-deck.sh --status
@@ -133,7 +136,7 @@ bash install-to-deck.sh --status
 Add `--remote` followed by your Steam Deck's hostname or SSH alias:
 
 ```sh
-bash install-to-deck.sh --remote steamdeck --channel preview
+bash install-to-deck.sh --remote steamdeck
 ```
 
 ---

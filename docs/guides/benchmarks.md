@@ -2,6 +2,9 @@
 
 This fork replaces Official Decky's Python backend loader with a compiled **Rust** service, reducing Decky's own memory footprint, startup time, shutdown time, and idle CPU usage.
 
+> [!NOTE]
+> These are historical measurements of `v3.3.0-rust.1-rc.1` (17 October 2026) and a development build from 19 October 2026. Later releases, including the current stable `v3.3.1-rust.1`, include startup and frontend performance changes that these measurements do not reflect. The figures have not been re-measured.
+
 ---
 
 ## Official Decky vs. This Fork
