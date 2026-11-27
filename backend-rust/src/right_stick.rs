@@ -517,6 +517,18 @@ fn is_steam_deck_builtin(vendor: u16, product: u16, name: &str) -> bool {
     lower.contains("steamdeck") || lower.contains("steam deck")
 }
 
+/// Any Valve HID device, not only the Deck PID: InputPlumber (SteamOS on Legion Go S, ROG Ally,
+/// and others) emulates the Deck controller as a UHID device with its own 0x28DE product ID.
+/// The Deck report header check in `parse_deck_hid_report` rejects other Valve report formats.
+fn is_valve_hid_uevent(uevent: &str) -> bool {
+    uevent.lines().any(|line| {
+        line.strip_prefix("HID_ID=")
+            .and_then(|id| id.split(':').nth(1))
+            .and_then(|vendor| u32::from_str_radix(vendor, 16).ok())
+            == Some(u32::from(STEAM_VENDOR_ID))
+    })
+}
+
 enum DeviceKind {
     Evdev { resync: bool, is_steam_deck: bool },
     SteamDeckHidraw { last_report: Instant },
@@ -624,10 +636,7 @@ fn open_steam_deck_hidraw(
         let Ok(uevent) = std::fs::read_to_string(uevent_path) else {
             continue;
         };
-        if !uevent
-            .lines()
-            .any(|line| line.eq_ignore_ascii_case("HID_ID=0003:000028DE:00001205"))
-        {
+        if !is_valve_hid_uevent(&uevent) {
             continue;
         }
         let dev_path = Path::new("/dev").join(&name);
@@ -1060,6 +1069,21 @@ mod tests {
         assert!(parse_deck_hid_report(&report[..63]).is_none());
         report[0] = 0x02;
         assert!(parse_deck_hid_report(&report).is_none());
+    }
+
+    #[test]
+    fn valve_hidraw_match_includes_inputplumber_deck_emulation() {
+        assert!(is_valve_hid_uevent(
+            "DRIVER=hid-steam\nHID_ID=0003:000028DE:00001205\nHID_NAME=Valve Software Steam Deck Controller\n"
+        ));
+        // InputPlumber deck-uhid target on Legion Go S.
+        assert!(is_valve_hid_uevent(
+            "DRIVER=hid-generic\nHID_ID=0003:000028de:000012FF\nHID_NAME=Legion Go S Controller\n"
+        ));
+        assert!(!is_valve_hid_uevent(
+            "HID_ID=0003:00001A86:0000E310\nHID_NAME=QH Electronics Controller\n"
+        ));
+        assert!(!is_valve_hid_uevent("HID_NAME=28DE\n"));
     }
 
     #[test]

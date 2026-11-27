@@ -99,7 +99,7 @@ Failed plugin installs and uninstalls close their confirmation window and show a
 
 WebSocket error replies have two shapes: missing-route errors use `error.error`, and failures inside a route use `error.message`. The frontend reads both so that error notifications retain the backend's explanation.
 
-The General settings page has a **Right-stick navigation** toggle. The `rightStickNavigation` setting defaults to `false`. When enabled, the frontend service coordinates navigation with the backend. The backend reads controller input from `/dev/input/event*` and, when needed, the built-in Steam Deck controller from `/dev/hidraw*`. It sends `loader/right_stick_direction` events and provides the `utilities/right_stick/get_session_mode` and `utilities/right_stick/set_focus` routes.
+The General settings page has a **Right-stick navigation** toggle. The `rightStickNavigation` setting defaults to `false`. When enabled, the frontend service coordinates navigation with the backend. The backend reads controller input from `/dev/input/event*` and, when needed, Steam Deck-format controllers from `/dev/hidraw*`: the built-in Steam Deck controller, and the Steam Deck controller that InputPlumber emulates on other SteamOS handhelds such as the Legion Go S. It sends `loader/right_stick_direction` events and provides the `utilities/right_stick/get_session_mode` and `utilities/right_stick/set_focus` routes.
 
 The service needs read access to the device files as the account running Decky. This fork ships no udev rule to grant that access. If a device cannot be read, or no supported controller is found, the backend skips it; the service continues without input from that device. It scans again when input devices change.
 
