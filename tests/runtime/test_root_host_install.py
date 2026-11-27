@@ -314,31 +314,42 @@ class InstallRequestTest(unittest.TestCase):
             self.assertEqual([path.name for path in plugins.iterdir()], ["Tools"])
             self.assertEqual(config.state["Tools"]["tree_sha256"], "new-tree")
 
-    def test_startup_cleanup_removes_stale_backup_directories(self) -> None:
+    def test_startup_cleanup_removes_stale_backup_and_root_stage_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             plugins = Path(temporary) / "homebrew" / "plugins"
             plugins.mkdir(parents=True)
             stale = plugins / (".decky-root-backup-" + "a" * 32)
             stale.mkdir()
+            stage = plugins / (".decky-root-stage-" + "b" * 32)
+            stage.mkdir()
             unrelated = plugins / ".decky-root-backup-not-a-token"
             unrelated.mkdir()
             host, config = self.transaction_host(plugins)
             config.uid = os.getuid()
+            real_stat = os.stat
 
-            host._cleanup_stale_backups()
+            def root_owned_stage(name: Any, *args: Any, **kwargs: Any) -> Any:
+                info = real_stat(name, *args, **kwargs)
+                if str(name).startswith(".decky-root-stage-"):
+                    return SimpleNamespace(st_uid=0, st_mode=info.st_mode, st_dev=info.st_dev, st_ino=info.st_ino)
+                return info
+
+            with mock.patch.object(root_host.os, "stat", side_effect=root_owned_stage):
+                host._cleanup_stale_backups()
 
             self.assertFalse(stale.exists())
+            self.assertFalse(stage.exists())
             self.assertTrue(unrelated.is_dir())
 
     def test_new_install_resolves_an_older_pending_install_for_the_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             plugins = Path(temporary) / "homebrew" / "plugins"
-            plugins.mkdir(parents=True)
+            (plugins / "Tools").mkdir(parents=True)
             host, config = self.transaction_host(plugins)
             first = self.install_with_mocks(
                 host, self.install_request(defer_commit=True), ["first-tree"],
             )
-            config.uid = 0
+            self.assertEqual(len(list(plugins.glob(".decky-root-backup-*"))), 1)
             second = self.install_with_mocks(
                 host, self.install_request(), ["second-tree"],
             )
@@ -348,6 +359,82 @@ class InstallRequestTest(unittest.TestCase):
             self.assertEqual(host.pending_installs, {})
             self.assertEqual(config.state["Tools"]["tree_sha256"], "second-tree")
             self.assertEqual(len(list(plugins.glob(".decky-root-backup-*"))), 0)
+
+    def test_closed_connection_commits_pending_install(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            plugins = Path(temporary) / "homebrew" / "plugins"
+            (plugins / "Tools").mkdir(parents=True)
+            host, config = self.transaction_host(plugins)
+            response = self.install_with_mocks(
+                host, self.install_request(defer_commit=True), ["new-tree"],
+            )
+            self.assertTrue(response["ok"], response)
+            config.uid = os.getuid()
+
+            host.drop_connection()
+
+            self.assertEqual(host.pending_installs, {})
+            self.assertEqual(len(list(plugins.glob(".decky-root-backup-*"))), 0)
+            self.assertEqual(config.state["Tools"]["tree_sha256"], "new-tree")
+
+    def test_rollback_with_stale_approval_and_no_folder_removes_the_install(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            plugins = Path(temporary) / "homebrew" / "plugins"
+            plugins.mkdir(parents=True)
+            stale_entry = {"name": "Tools", "version": "0.9.0", "tree_sha256": "old-tree"}
+            host, config = self.transaction_host(plugins, {"Tools": stale_entry})
+            response = self.install_with_mocks(
+                host, self.install_request(defer_commit=True), ["new-tree"],
+            )
+            config.uid = os.getuid()
+            rolled_back = self.rollback_with_mocks(host, {
+                "op": "rollback_install", "directory": "Tools",
+                "transaction": response["transaction"],
+            }, ["new-tree"])
+
+            self.assertTrue(rolled_back["ok"], rolled_back)
+            self.assertFalse((plugins / "Tools").exists())
+            self.assertEqual(config.state, {})
+
+    def test_rollback_refuses_while_the_plugin_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            plugins = Path(temporary) / "homebrew" / "plugins"
+            (plugins / "Tools").mkdir(parents=True)
+            host, config = self.transaction_host(plugins)
+            response = self.install_with_mocks(
+                host, self.install_request(defer_commit=True), ["new-tree"],
+            )
+            host.directories["child"] = ("Tools", -1)
+            refused = self.rollback_with_mocks(host, {
+                "op": "rollback_install", "directory": "Tools",
+                "transaction": response["transaction"],
+            }, [])
+            del host.directories["child"]
+
+            self.assertFalse(refused["ok"], refused)
+            self.assertIn("Tools", host.pending_installs)
+            self.assertEqual(config.state["Tools"]["tree_sha256"], "new-tree")
+
+    def test_uninstall_resolves_a_pending_install_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            plugins = Path(temporary) / "homebrew" / "plugins"
+            (plugins / "Tools").mkdir(parents=True)
+            host, config = self.transaction_host(plugins)
+            self.install_with_mocks(host, self.install_request(defer_commit=True), ["new-tree"])
+            config.uid = os.getuid()
+            real_stat = os.stat
+
+            def root_owned(name: Any, *args: Any, **kwargs: Any) -> Any:
+                info = real_stat(name, *args, **kwargs)
+                return SimpleNamespace(st_uid=0, st_mode=info.st_mode, st_dev=info.st_dev, st_ino=info.st_ino)
+
+            with mock.patch.object(root_host.os, "stat", side_effect=root_owned):
+                removed = host.handle_line(json.dumps({"op": "uninstall", "directory": "Tools"}).encode())
+
+            self.assertTrue(removed["ok"], removed)
+            self.assertEqual(host.pending_installs, {})
+            self.assertEqual(sorted(path.name for path in plugins.iterdir()), [])
+            self.assertEqual(config.state, {})
 
     def test_install_refuses_requests_without_https_download_hash_or_folder(self) -> None:
         good = {"op": "install", "directory": "Tools", "name": "Tools", "sha256": "a" * 64,

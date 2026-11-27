@@ -666,24 +666,21 @@ impl PluginManager {
             let mut after = before.clone();
             reconcile_install_settings(&mut after, name, was_registered, was_installed);
             if let Err(error) = persist_settings_lists(backend, before, &after).await {
-                let rollback_error = if let Some(transaction) = &transaction {
-                    Self::rollback_root_install(
-                        backend,
-                        &host,
-                        directory,
-                        transaction,
-                        Some(before),
-                        was_registered,
-                        old_directory.as_deref(),
-                    )
-                    .await
-                    .err()
-                } else {
-                    None
-                };
-                if transaction.is_none() {
+                let Some(transaction) = &transaction else {
                     return Err(error);
-                }
+                };
+                // persist_settings_lists already restored the lists it changed.
+                let rollback_error = Self::rollback_root_install(
+                    backend,
+                    &host,
+                    directory,
+                    transaction,
+                    None,
+                    was_registered,
+                    old_directory.as_deref(),
+                )
+                .await
+                .err();
                 return Err(RpcError::failure(with_rollback_error(
                     rpc_error_text(&error),
                     rollback_error,
@@ -1768,7 +1765,9 @@ fn find_plugin_directory(plugin_root: &Path, name: &str) -> Result<Option<PathBu
             continue;
         }
         if entry.file_name().to_str().is_some_and(|name| {
-            name.starts_with(".decky-stage-") || name.starts_with(".decky-backup-")
+            name.starts_with(".decky-stage-")
+                || name.starts_with(".decky-backup-")
+                || name.starts_with(".decky-root-")
         }) {
             continue;
         }

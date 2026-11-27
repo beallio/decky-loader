@@ -164,7 +164,7 @@ impl RootHost {
     }
 
     pub(crate) async fn release_child(&self, id: &str) -> Result<()> {
-        self.request(
+        self.request_waiting(
             json!({"op": "release", "id": id}),
             "released",
             CONTROL_TIMEOUT,
@@ -176,7 +176,7 @@ impl RootHost {
     /// `None` while the plugin runs; its wait status after it exits.
     pub(crate) async fn child_status(&self, id: &str) -> Result<Option<i32>> {
         let response = self
-            .request(json!({"op": "status", "id": id}), "status", CONTROL_TIMEOUT)
+            .request_waiting(json!({"op": "status", "id": id}), "status", CONTROL_TIMEOUT)
             .await?;
         if response["running"].as_bool() == Some(true) {
             return Ok(None);
@@ -191,7 +191,7 @@ impl RootHost {
     /// Stops the plugin's process group (SIGTERM, then SIGKILL) and returns its wait status.
     pub(crate) async fn stop_child(&self, id: &str) -> Result<i32> {
         let response = self
-            .request(json!({"op": "stop", "id": id}), "stopped", STOP_TIMEOUT)
+            .request_waiting(json!({"op": "stop", "id": id}), "stopped", STOP_TIMEOUT)
             .await?;
         wait_status(&response)
     }
@@ -251,13 +251,29 @@ impl RootHost {
     }
 
     pub(crate) async fn forget_child(&self, id: &str) -> Result<()> {
-        self.request(
+        self.request_waiting(
             json!({"op": "forget", "id": id}),
             "forgotten",
             CONTROL_TIMEOUT,
         )
         .await
         .map(drop)
+    }
+
+    /// Plugin lifecycle requests must finish, as before the lock wait had a deadline:
+    /// wait through another request (such as a long install) instead of returning busy.
+    async fn request_waiting(
+        &self,
+        request: Value,
+        expected: &str,
+        limit: Duration,
+    ) -> Result<Value> {
+        loop {
+            match self.request(request.clone(), expected, limit).await {
+                Err(error) if error.downcast_ref::<Busy>().is_some() => continue,
+                result => return result,
+            }
+        }
     }
 
     async fn request(&self, request: Value, expected: &str, limit: Duration) -> Result<Value> {
@@ -507,6 +523,70 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("busy"), "{error}");
         assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(!host.is_failed());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_requests_wait_through_another_request() {
+        let (path, server) = serve(vec![
+            json!({"ok": true, "op": "hello", "protocol": 1}),
+            json!({"ok": true, "op": "status", "id": "a", "running": true}),
+        ])
+        .await;
+        let host = RootHost::connect(&path, ENVIRONMENT).await.unwrap();
+        let guard = host.control.lock().await;
+        let (result, ()) = tokio::join!(
+            host.request_waiting(
+                json!({"op": "status", "id": "a"}),
+                "status",
+                Duration::from_millis(20),
+            ),
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(guard);
+            }
+        );
+
+        assert_eq!(result.unwrap()["running"], true);
+        assert!(!host.is_failed());
+        assert_eq!(server.await.unwrap()[1], json!({"op": "status", "id": "a"}));
+    }
+
+    #[tokio::test]
+    async fn deferred_install_uses_the_transaction_only_when_the_host_returns_one() {
+        let (path, server) = serve(vec![
+            json!({"ok": true, "op": "hello", "protocol": 1}),
+            json!({"ok": true, "op": "installed", "directory": "Tools", "transaction": "t1"}),
+            json!({"ok": true, "op": "install_committed", "directory": "Tools"}),
+            json!({"ok": true, "op": "installed", "directory": "Tools"}),
+            json!({"ok": true, "op": "install_rolled_back", "directory": "Tools"}),
+        ])
+        .await;
+        let host = RootHost::connect(&path, ENVIRONMENT).await.unwrap();
+        let token = host
+            .install("Tools", "Tools", "hash", "https://x/t.zip", "pw")
+            .await
+            .unwrap();
+        assert_eq!(token.as_deref(), Some("t1"));
+        host.commit_install("Tools", "t1").await.unwrap();
+        // An older host ignores defer_commit and returns no token.
+        let legacy = host
+            .install("Tools", "Tools", "hash", "https://x/t.zip", "pw")
+            .await
+            .unwrap();
+        assert_eq!(legacy, None);
+        host.rollback_install("Tools", "t2").await.unwrap();
+
+        let seen = server.await.unwrap();
+        assert_eq!(seen[1]["defer_commit"], true);
+        assert_eq!(
+            seen[2],
+            json!({"op": "commit_install", "directory": "Tools", "transaction": "t1"})
+        );
+        assert_eq!(
+            seen[4],
+            json!({"op": "rollback_install", "directory": "Tools", "transaction": "t2"})
+        );
         assert!(!host.is_failed());
     }
 }

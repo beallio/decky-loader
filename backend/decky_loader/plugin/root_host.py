@@ -736,6 +736,9 @@ class Host:
                     os.close(stage_fd)
                 backup = self._replace(plugins_fd, stage, directory)
                 backup_info = os.stat(backup, dir_fd=plugins_fd, follow_symlinks=False) if defer_commit and backup else None
+                if not backup:
+                    # An approval whose folder is gone has nothing to roll back to.
+                    previous_entry = None
             except BaseException:
                 shutil.rmtree(stage, dir_fd=plugins_fd, ignore_errors=True)
                 raise
@@ -809,8 +812,8 @@ class Host:
     def rollback_install(self, request: dict[str, Any]) -> dict[str, Any]:
         directory = _directory_name(request.get("directory"))
         _, backup, identity, previous_entry, new_entry = self._pending_install(request)
-        if previous_entry is not None and not backup:
-            raise RootHostError(f"the previous plugin folder for {directory} is missing")
+        if any(running == directory for running, _ in self.directories.values()):
+            raise RootHostError(f"{directory} is running; stop it first")
         plugins_fd = self._plugin_root_fd()
         failed = f".decky-root-stage-{uuid.uuid4().hex}"
         try:
@@ -822,9 +825,6 @@ class Host:
             finally:
                 os.close(current_fd)
             if backup:
-                info = os.stat(backup, dir_fd=plugins_fd, follow_symlinks=False)
-                if identity != (info.st_dev, info.st_ino) or not stat.S_ISDIR(info.st_mode):
-                    raise RootHostError("the pending install backup changed")
                 backup_fd = os.open(backup, _DIRECTORY_FLAGS, dir_fd=plugins_fd)
                 try:
                     backup_info = os.fstat(backup_fd)
@@ -852,12 +852,15 @@ class Host:
                         else:
                             os.rename(directory, backup, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
                     os.rename(failed, directory, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
-                    self.config.record(directory, new_entry)
                 except BaseException as restore_error:
                     raise RootHostError(f"{error}; restoring the installed plugin also failed: {restore_error}") from error
                 raise
             del self.pending_installs[directory]
-            shutil.rmtree(failed, dir_fd=plugins_fd)
+            try:
+                shutil.rmtree(failed, dir_fd=plugins_fd)
+            except OSError as error:
+                # The rollback is complete; startup cleanup removes what is left.
+                print(f"DeckyRootHost: could not remove rolled-back plugin folder {failed}: {error}", file=sys.stderr, flush=True)
         finally:
             os.close(plugins_fd)
         return {"ok": True, "op": "install_rolled_back", "directory": directory}
@@ -885,6 +888,7 @@ class Host:
         directory = _directory_name(request.get("directory"))
         if any(running == directory for running, _ in self.directories.values()):
             raise RootHostError(f"{directory} is running; stop it first")
+        self._commit_pending_install(directory)
         plugins_fd = self._plugin_root_fd()
         try:
             try:
@@ -1025,11 +1029,12 @@ class Host:
             return
         try:
             for name in os.listdir(plugins_fd):
-                if re.fullmatch(r"\.decky-root-backup-[0-9a-f]{32}", name) is None:
+                match = re.fullmatch(r"\.decky-root-(backup|stage)-[0-9a-f]{32}", name)
+                if match is None:
                     continue
                 try:
                     info = os.stat(name, dir_fd=plugins_fd, follow_symlinks=False)
-                    if info.st_uid in (0, self.config.uid):
+                    if info.st_uid == 0 or (match[1] == "backup" and info.st_uid == self.config.uid):
                         if stat.S_ISDIR(info.st_mode):
                             shutil.rmtree(name, dir_fd=plugins_fd)
                         else:

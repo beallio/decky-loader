@@ -2821,7 +2821,11 @@ fn is_managed_plugin_directory(plugin_root: &Path, directory: &Path) -> bool {
     directory
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with(".decky-stage-") || name.starts_with(".decky-backup-"))
+        .is_some_and(|name| {
+            name.starts_with(".decky-stage-")
+                || name.starts_with(".decky-backup-")
+                || name.starts_with(".decky-root-")
+        })
 }
 
 fn changed_plugin_directory(plugin_root: &Path, source: &Path) -> Option<String> {
@@ -3995,7 +3999,7 @@ mod worker_message_tests {
 }
 #[cfg(test)]
 mod inotify_parser_tests {
-    use super::{INOTIFY_EVENT_HEADER_SIZE, parse_inotify_events};
+    use super::{INOTIFY_EVENT_HEADER_SIZE, is_managed_plugin_directory, parse_inotify_events};
     use std::path::Path;
 
     fn event_header(watch_descriptor: i32, mask: u32, name_length: u32) -> Vec<u8> {
@@ -4031,6 +4035,23 @@ mod inotify_parser_tests {
         assert_eq!(events[0].watch_descriptor, 7);
         assert_eq!(events[0].mask, 3);
         assert_eq!(events[0].name.as_deref(), Some(Path::new("abc")));
+    }
+
+    #[test]
+    fn loader_and_root_host_work_folders_are_not_plugins() {
+        let root = Path::new("/home/deck/homebrew/plugins");
+        for name in [
+            ".decky-stage-a",
+            ".decky-backup-a",
+            ".decky-root-stage-a",
+            ".decky-root-backup-a",
+        ] {
+            assert!(
+                is_managed_plugin_directory(root, &root.join(name)),
+                "{name}"
+            );
+        }
+        assert!(!is_managed_plugin_directory(root, &root.join("Tools")));
     }
 }
 
@@ -4487,7 +4508,7 @@ mod worker_shutdown_tests {
         let mut command = Command::new("sh");
         command
             .arg("-c")
-            .arg("sh -c 'trap \"\" TERM; echo $$ > \"$1\"; exec sleep 30' sh \"$1\" & trap \"\" TERM; wait")
+            .arg("trap \"\" TERM; sh -c 'trap \"\" TERM; echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec sleep 30' sh \"$1\" & wait")
             .arg("worker")
             .arg(&pid_file)
             .stdin(Stdio::null())
