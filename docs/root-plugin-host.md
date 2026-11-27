@@ -120,8 +120,11 @@ One JSON object per line on the control socket. The host accepts a connection on
 
 Older backends omit `defer_commit` and keep the immediate install behavior. Newer
 backends fall back to that behavior when an older host does not return a token.
-The host commits a pending install when its connection closes, it restarts, or a
-later install targets the same folder.
+The host commits a pending install when its connection closes, it restarts, a
+later install targets the same folder, or the folder is uninstalled. It refuses a
+rollback while the plugin runs. At start it deletes leftover `.decky-root-backup-*`
+folders and root-owned `.decky-root-stage-*` folders; the loader never treats them
+as plugins.
 
 The host never takes file paths, file descriptors or code from the backend. It takes names, an
 https download URL with its SHA-256, and for installs the user's sudo password.
