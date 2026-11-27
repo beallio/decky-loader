@@ -89,6 +89,23 @@ class FailingRecordConfig(FakeConfig):
         raise RuntimeError("approval write failed")
 
 
+class TransactionConfig(FakeConfig):
+    uid = 0
+
+    def __init__(self, homebrew: Path, state: dict[str, Any] | None = None) -> None:
+        self.homebrew = homebrew
+        self.state = dict(state or {})
+
+    def approved_directories(self) -> dict[str, Any]:
+        return dict(self.state)
+
+    def record(self, directory: str, entry: dict[str, Any] | None) -> None:
+        if entry is None:
+            self.state.pop(directory, None)
+        else:
+            self.state[directory] = entry
+
+
 class InstallRequestTest(unittest.TestCase):
     def host(self) -> root_host.Host:
         left, right = socket.socketpair()
@@ -98,6 +115,58 @@ class InstallRequestTest(unittest.TestCase):
         host = root_host.Host(config, left)
         host.greeted = True
         return host
+
+    def transaction_host(
+        self, plugins: Path, state: dict[str, Any] | None = None,
+    ) -> tuple[root_host.Host, TransactionConfig]:
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        config = TransactionConfig(plugins.parent, state)
+        host = root_host.Host(config, left)
+        host.greeted = True
+        return host, config
+
+    @staticmethod
+    def install_request(**extra: Any) -> dict[str, Any]:
+        payload = b"plugin archive"
+        return {
+            "op": "install",
+            "directory": "Tools",
+            "name": "Tools",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "artifact": "https://example.com/Tools.zip",
+            "password": "secret",
+            **extra,
+        }
+
+    def install_with_mocks(
+        self, host: root_host.Host, request: dict[str, Any], tree_hashes: list[str],
+    ) -> dict[str, Any]:
+        payload = b"plugin archive"
+        real_fstat = os.fstat
+
+        def root_owned(descriptor: int) -> Any:
+            info = real_fstat(descriptor)
+            return SimpleNamespace(st_uid=0, st_mode=info.st_mode, st_dev=info.st_dev, st_ino=info.st_ino)
+
+        with mock.patch.object(root_host, "_check_password"), \
+                mock.patch.object(root_host, "_download", return_value=payload), \
+                mock.patch.object(root_host.os, "fstat", side_effect=root_owned), \
+                mock.patch.object(root_host, "_extract_plugin_archive"), \
+                mock.patch.object(root_host, "plugin_metadata", return_value={
+                    "name": "Tools", "version": "1.0.0", "flags": ["root"],
+                }), \
+                mock.patch.object(root_host, "_download_remote_binaries"), \
+                mock.patch.object(root_host, "plugin_tree_sha256", side_effect=tree_hashes):
+            return host.handle_line(json.dumps(request).encode())
+
+    @staticmethod
+    def rollback_with_mocks(
+        host: root_host.Host, request: dict[str, Any], tree_hashes: list[str],
+    ) -> dict[str, Any]:
+        with mock.patch.object(root_host, "plugin_tree_sha256", side_effect=tree_hashes):
+            return host.handle_line(json.dumps(request).encode())
 
     def test_install_restores_the_old_plugin_when_approval_record_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -142,6 +211,143 @@ class InstallRequestTest(unittest.TestCase):
 
             self.assertEqual((old_plugin / "sentinel").read_text(), "old plugin")
             self.assertEqual(sorted(path.name for path in plugins.iterdir()), ["Tools"])
+
+    def test_deferred_update_commit_deletes_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            plugins = Path(temporary) / "homebrew" / "plugins"
+            old_plugin = plugins / "Tools"
+            old_plugin.mkdir(parents=True)
+            (old_plugin / "sentinel").write_text("old plugin")
+            old_entry = {"name": "Tools", "version": "0.9.0", "tree_sha256": "old-tree"}
+            host, config = self.transaction_host(plugins, {"Tools": old_entry})
+            response = self.install_with_mocks(
+                host, self.install_request(defer_commit=True), ["new-tree"],
+            )
+            self.assertTrue(response["ok"], response)
+            config.uid = os.getuid()
+            transaction = response["transaction"]
+            backup = next(path for path in plugins.iterdir() if path.name.startswith(".decky-root-backup-"))
+            self.assertEqual(config.state["Tools"]["tree_sha256"], "new-tree")
+
+            committed = host.handle_line(json.dumps({
+                "op": "commit_install", "directory": "Tools", "transaction": transaction,
+            }).encode())
+            self.assertTrue(committed["ok"], committed)
+            self.assertFalse(backup.exists())
+            self.assertNotIn("Tools", host.pending_installs)
+
+    def test_deferred_update_rollback_restores_files_and_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            plugins = Path(temporary) / "homebrew" / "plugins"
+            old_plugin = plugins / "Tools"
+            old_plugin.mkdir(parents=True)
+            (old_plugin / "sentinel").write_text("old plugin")
+            old_entry = {"name": "Tools", "version": "0.9.0", "tree_sha256": "old-tree"}
+            host, config = self.transaction_host(plugins, {"Tools": old_entry})
+            response = self.install_with_mocks(
+                host, self.install_request(defer_commit=True), ["new-tree"],
+            )
+            config.uid = os.getuid()
+            rolled_back = self.rollback_with_mocks(host, {
+                "op": "rollback_install", "directory": "Tools",
+                "transaction": response["transaction"],
+            }, ["new-tree", "old-tree"])
+
+            self.assertTrue(rolled_back["ok"], rolled_back)
+            self.assertEqual((plugins / "Tools" / "sentinel").read_text(), "old plugin")
+            self.assertEqual(config.state["Tools"], old_entry)
+            self.assertEqual(sorted(path.name for path in plugins.iterdir()), ["Tools"])
+            self.assertNotIn("Tools", host.pending_installs)
+
+    def test_deferred_fresh_install_rollback_removes_plugin_and_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            plugins = Path(temporary) / "homebrew" / "plugins"
+            plugins.mkdir(parents=True)
+            host, config = self.transaction_host(plugins)
+            response = self.install_with_mocks(
+                host, self.install_request(defer_commit=True), ["new-tree"],
+            )
+            config.uid = os.getuid()
+            rolled_back = self.rollback_with_mocks(host, {
+                "op": "rollback_install", "directory": "Tools",
+                "transaction": response["transaction"],
+            }, ["new-tree"])
+
+            self.assertTrue(rolled_back["ok"], rolled_back)
+            self.assertFalse((plugins / "Tools").exists())
+            self.assertEqual(config.state, {})
+            self.assertNotIn("Tools", host.pending_installs)
+
+    def test_pending_install_refuses_wrong_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            plugins = Path(temporary) / "homebrew" / "plugins"
+            plugins.mkdir(parents=True)
+            host, config = self.transaction_host(plugins)
+            response = self.install_with_mocks(
+                host, self.install_request(defer_commit=True), ["new-tree"],
+            )
+            before = dict(config.state)
+            refused = host.handle_line(json.dumps({
+                "op": "rollback_install", "directory": "Tools", "transaction": "wrong",
+            }).encode())
+
+            self.assertIn("transaction", response)
+            self.assertFalse(refused["ok"], refused)
+            self.assertEqual(config.state, before)
+            self.assertTrue((plugins / "Tools").is_dir())
+            self.assertEqual(len(list(plugins.glob(".decky-root-backup-*"))), 0)
+
+    def test_install_without_defer_flag_keeps_legacy_immediate_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            plugins = Path(temporary) / "homebrew" / "plugins"
+            old_plugin = plugins / "Tools"
+            old_plugin.mkdir(parents=True)
+            (old_plugin / "sentinel").write_text("old plugin")
+            host, config = self.transaction_host(
+                plugins, {"Tools": {"name": "Tools", "version": "0.9.0", "tree_sha256": "old-tree"}},
+            )
+            response = self.install_with_mocks(host, self.install_request(), ["new-tree"])
+
+            self.assertTrue(response["ok"], response)
+            self.assertNotIn("transaction", response)
+            self.assertEqual(host.pending_installs, {})
+            self.assertEqual([path.name for path in plugins.iterdir()], ["Tools"])
+            self.assertEqual(config.state["Tools"]["tree_sha256"], "new-tree")
+
+    def test_startup_cleanup_removes_stale_backup_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            plugins = Path(temporary) / "homebrew" / "plugins"
+            plugins.mkdir(parents=True)
+            stale = plugins / (".decky-root-backup-" + "a" * 32)
+            stale.mkdir()
+            unrelated = plugins / ".decky-root-backup-not-a-token"
+            unrelated.mkdir()
+            host, config = self.transaction_host(plugins)
+            config.uid = os.getuid()
+
+            host._cleanup_stale_backups()
+
+            self.assertFalse(stale.exists())
+            self.assertTrue(unrelated.is_dir())
+
+    def test_new_install_resolves_an_older_pending_install_for_the_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            plugins = Path(temporary) / "homebrew" / "plugins"
+            plugins.mkdir(parents=True)
+            host, config = self.transaction_host(plugins)
+            first = self.install_with_mocks(
+                host, self.install_request(defer_commit=True), ["first-tree"],
+            )
+            config.uid = 0
+            second = self.install_with_mocks(
+                host, self.install_request(), ["second-tree"],
+            )
+
+            self.assertTrue(first["ok"], first)
+            self.assertTrue(second["ok"], second)
+            self.assertEqual(host.pending_installs, {})
+            self.assertEqual(config.state["Tools"]["tree_sha256"], "second-tree")
+            self.assertEqual(len(list(plugins.glob(".decky-root-backup-*"))), 0)
 
     def test_install_refuses_requests_without_https_download_hash_or_folder(self) -> None:
         good = {"op": "install", "directory": "Tools", "name": "Tools", "sha256": "a" * 64,

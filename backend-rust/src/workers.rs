@@ -3046,7 +3046,11 @@ async fn live_reload_loop(
                 owner.live_reload_resync.store(true, Ordering::Release);
                 break;
             }
-            let _ = owner.import_directory(&directory, true, false).await;
+            if let Err(error) = owner.import_directory(&directory, true, false).await
+                && error != WorkerError::Stopped
+            {
+                eprintln!("Could not reload plugin directory {directory}: {error}");
+            }
         }
     }
 }
@@ -4474,5 +4478,59 @@ mod worker_shutdown_tests {
             write_result.is_err(),
             "socket shutdown did not cancel the write"
         );
+    }
+
+    #[tokio::test]
+    async fn teardown_kills_sigterm_ignoring_worker_descendants() {
+        let directory = crate::test_support::TestDirectory::new("worker-descendants");
+        let pid_file = directory.0.join("descendant.pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sh -c 'trap \"\" TERM; echo $$ > \"$1\"; exec sleep 30' sh \"$1\" & trap \"\" TERM; wait")
+            .arg("worker")
+            .arg(&pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.as_std_mut().process_group(0);
+        let child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        let group = ProcessGroupGuard { pid };
+        timeout(Duration::from_secs(1), async {
+            while !pid_file.exists() {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("worker descendant did not start");
+        let descendant: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let (stop, stop_receiver) = mpsc::unbounded_channel();
+        stop.send(()).unwrap();
+        timeout(
+            WORKER_GRACEFUL_TIMEOUT + Duration::from_secs(2),
+            reap_child(child, stop_receiver, pid, group),
+        )
+        .await
+        .expect("worker teardown exceeded its deadline")
+        .unwrap();
+        // The killed descendant can stay a zombie briefly until its new parent reaps it.
+        let error = timeout(Duration::from_secs(1), async {
+            loop {
+                // SAFETY: signal 0 only checks whether the process exists.
+                if unsafe { libc::kill(descendant, 0) } == -1 {
+                    break io::Error::last_os_error();
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("SIGTERM-ignoring worker descendant survived teardown");
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
     }
 }

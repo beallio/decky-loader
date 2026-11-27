@@ -5632,7 +5632,12 @@ def _copy_tree_at(source_fd: int, destination_fd: int) -> None:
                 destination = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=destination_fd)
                 try:
                     while chunk := os.read(source, 1024 * 1024):
-                        os.write(destination, chunk)
+                        remaining = memoryview(chunk)
+                        while remaining:
+                            written = os.write(destination, remaining)
+                            if written <= 0:
+                                raise OSError('short write while copying plugin file')
+                            remaining = remaining[written:]
                     os.fchmod(destination, stat.S_IMODE(info.st_mode) & 0o755)
                 finally:
                     os.close(destination)

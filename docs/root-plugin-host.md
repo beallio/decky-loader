@@ -113,8 +113,15 @@ One JSON object per line on the control socket. The host accepts a connection on
 | `list` | Approved root plugins: folder, name, version, running |
 | `start {id, directory}` | Check the plugin folder (below), start it, and return its PID and IPC socket path |
 | `release`, `status`, `stop`, `forget {id}` | The same plugin lifecycle as the user service's launcher; `stop` sends SIGTERM, then SIGKILL after 5 s |
-| `install {directory, name, sha256, artifact, password}` | Check `password` with `sudo -S -k -p '' -- /usr/bin/true` run as the user with the user's groups (after `sudo -n -k` proves that sudo needs a password; `-k` never uses or updates cached credentials; 5 s wait after a wrong password). Then download `artifact` (https), check its SHA-256, unpack the folder into a root-owned staging folder through descriptors, check `plugin.json` (name matches, `root` flag present), fetch `remote_binary` files (each checked by its SHA-256), record the tree hash, then swap it into place |
+| `install {directory, name, sha256, artifact, password, defer_commit?}` | Check `password` with `sudo -S -k -p '' -- /usr/bin/true` run as the user with the user's groups (after `sudo -n -k` proves that sudo needs a password; 5 s wait after a wrong password). Then download `artifact` (https), check its SHA-256, unpack the folder into a root-owned staging folder through descriptors, check `plugin.json` (name matches, `root` flag present), fetch `remote_binary` files (each checked by its SHA-256), record the tree hash, then swap it into place. With `defer_commit: true`, keep the old folder and approval until the backend sends `commit_install` or `rollback_install` with the returned transaction token. |
+| `commit_install {directory, transaction}` | Delete the saved backup after the backend loads the plugin. |
+| `rollback_install {directory, transaction}` | Restore the saved folder and approval after the backend cannot load the plugin. |
 | `uninstall {directory}` | Delete a root-owned plugin folder and its approval. Settings and data stay, as on official Decky |
+
+Older backends omit `defer_commit` and keep the immediate install behavior. Newer
+backends fall back to that behavior when an older host does not return a token.
+The host commits a pending install when its connection closes, it restarts, or a
+later install targets the same folder.
 
 The host never takes file paths, file descriptors or code from the backend. It takes names, an
 https download URL with its SHA-256, and for installs the user's sudo password.

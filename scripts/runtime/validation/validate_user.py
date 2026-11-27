@@ -175,25 +175,33 @@ def main() -> int:
     except BaseException as error:
         report['error'] = str(error)
     finally:
-        cleanup_error = None
-        try:
-            if installed:
+        cleanup_errors = []
+        if installed:
+            try:
                 for _ in range(3):
                     status = install_command('status')
                     if not status['rollback_available']:
                         break
                     install_command('rollback')
+            except BaseException as error:
+                cleanup_errors.append(str(error))
+        try:
             spec = importlib.util.spec_from_file_location('probe_installer', bundle / 'install.py')
             module = importlib.util.module_from_spec(spec)
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
             module.stop_service(unit)
+        except BaseException as error:
+            cleanup_errors.append(str(error))
+        try:
             assert_drained(epochs)
             remaining = properties(unit)
             if remaining.get('LoadState') not in (None, 'not-found'):
                 raise RuntimeError(f'temporary unit was not removed: {remaining}')
         except BaseException as error:
-            cleanup_error = str(error)
+            cleanup_errors.append(str(error))
+        cleanup_error = '; '.join(cleanup_errors) if cleanup_errors else None
+        if cleanup_error is not None:
             report.update(ok=False, cleanup_error=cleanup_error)
         report['normal_unchanged'] = normal == {
             scope: properties('plugin_loader.service', user=scope == 'user') for scope in ('user', 'system')

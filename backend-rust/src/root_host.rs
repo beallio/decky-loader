@@ -72,6 +72,20 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
+#[derive(Debug)]
+struct Busy;
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the root plugin host is busy; timed out waiting for another request"
+        )
+    }
+}
+
+impl std::error::Error for Busy {}
+
 impl RootHost {
     pub(crate) async fn connect(path: &Path, environment: HostEnvironment<'_>) -> Result<Self> {
         let stream = timeout(CONTROL_TIMEOUT, UnixStream::connect(path))
@@ -191,13 +205,35 @@ impl RootHost {
         sha256: &str,
         artifact: &str,
         password: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
+        let response = self
+            .request(
+                json!({
+                    "op": "install", "directory": directory, "name": name,
+                    "sha256": sha256, "artifact": artifact, "password": password,
+                    "defer_commit": true,
+                }),
+                "installed",
+                INSTALL_TIMEOUT,
+            )
+            .await?;
+        Ok(response["transaction"].as_str().map(str::to_owned))
+    }
+
+    pub(crate) async fn commit_install(&self, directory: &str, transaction: &str) -> Result<()> {
         self.request(
-            json!({
-                "op": "install", "directory": directory, "name": name,
-                "sha256": sha256, "artifact": artifact, "password": password,
-            }),
-            "installed",
+            json!({"op": "commit_install", "directory": directory, "transaction": transaction}),
+            "install_committed",
+            INSTALL_TIMEOUT,
+        )
+        .await
+        .map(drop)
+    }
+
+    pub(crate) async fn rollback_install(&self, directory: &str, transaction: &str) -> Result<()> {
+        self.request(
+            json!({"op": "rollback_install", "directory": directory, "transaction": transaction}),
+            "install_rolled_back",
             INSTALL_TIMEOUT,
         )
         .await
@@ -228,6 +264,7 @@ impl RootHost {
         let result = self.request_inner(request, expected, limit).await;
         if let Err(error) = &result
             && error.downcast_ref::<Refused>().is_none()
+            && error.downcast_ref::<Busy>().is_none()
         {
             self.mark_failed();
         }
@@ -240,34 +277,46 @@ impl RootHost {
         expected: &str,
         limit: Duration,
     ) -> Result<Value> {
-        if self.is_failed() {
-            bail!("the root plugin host connection has failed");
+        let mut acquired_control = false;
+        match timeout(limit, async {
+            if self.is_failed() {
+                bail!("the root plugin host connection has failed");
+            }
+            let mut control = self.control.lock().await;
+            acquired_control = true;
+            let mut bytes = serde_json::to_vec(&request).context("encoding root host request")?;
+            bytes.push(b'\n');
+            control
+                .input
+                .write_all(&bytes)
+                .await
+                .context("writing root host request")?;
+            let mut line = String::new();
+            let count = control
+                .output
+                .read_line(&mut line)
+                .await
+                .context("reading root host response")?;
+            if count == 0 {
+                bail!("the root plugin host closed its control connection");
+            }
+            let response: Value =
+                serde_json::from_str(&line).context("decoding root host response")?;
+            if response["ok"].as_bool() != Some(true) {
+                let error = response["error"].as_str().unwrap_or("unspecified error");
+                return Err(Refused(error.to_owned()).into());
+            }
+            if response["op"].as_str() != Some(expected) {
+                bail!("the root plugin host returned an unexpected response: {response}");
+            }
+            Ok(response)
+        })
+        .await
+        {
+            Err(_) if !acquired_control => Err(Busy.into()),
+            Err(_) => bail!("timed out waiting for the root plugin host"),
+            Ok(result) => result,
         }
-        let mut control = self.control.lock().await;
-        let mut bytes = serde_json::to_vec(&request).context("encoding root host request")?;
-        bytes.push(b'\n');
-        control
-            .input
-            .write_all(&bytes)
-            .await
-            .context("writing root host request")?;
-        let mut line = String::new();
-        let count = timeout(limit, control.output.read_line(&mut line))
-            .await
-            .context("timed out waiting for the root plugin host")?
-            .context("reading root host response")?;
-        if count == 0 {
-            bail!("the root plugin host closed its control connection");
-        }
-        let response: Value = serde_json::from_str(&line).context("decoding root host response")?;
-        if response["ok"].as_bool() != Some(true) {
-            let error = response["error"].as_str().unwrap_or("unspecified error");
-            return Err(Refused(error.to_owned()).into());
-        }
-        if response["op"].as_str() != Some(expected) {
-            bail!("the root plugin host returned an unexpected response: {response}");
-        }
-        Ok(response)
     }
 }
 
@@ -435,5 +484,29 @@ mod tests {
             server.await.unwrap(),
             "the old host session did not see EOF"
         );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_includes_waiting_for_the_control_lock() {
+        let (path, _server) = serve(vec![json!({"ok": true, "op": "hello", "protocol": 1})]).await;
+        let host = RootHost::connect(&path, ENVIRONMENT).await.unwrap();
+        let guard = host.control.lock().await;
+        let result = timeout(
+            Duration::from_millis(250),
+            host.request(
+                json!({"op": "stall"}),
+                "finished",
+                Duration::from_millis(20),
+            ),
+        )
+        .await;
+        drop(guard);
+
+        let error = result
+            .expect("request did not enforce its own deadline")
+            .unwrap_err();
+        assert!(error.to_string().contains("busy"), "{error}");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(!host.is_failed());
     }
 }
