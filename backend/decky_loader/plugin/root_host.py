@@ -466,6 +466,9 @@ class Host:
         self.greeted = False
         self.children: dict[str, launcher._Child] = {}
         self.directories: dict[str, tuple[str, int]] = {}
+        self.pending_installs: dict[
+            str, tuple[str, str, tuple[int, int] | None, dict[str, Any] | None, dict[str, Any]]
+        ] = {}
         self.stopping = False
         self.children_changed = False
         self.wake_read, self.wake_write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
@@ -493,6 +496,7 @@ class Host:
         if self.connection is not None:
             self.connection.close()
             self.connection = None
+        self._resolve_pending_installs()
         self.stop_all()
 
     def read_connection(self) -> None:
@@ -553,6 +557,10 @@ class Host:
             return self.start(request)
         if operation == "install":
             return self.install(request)
+        if operation == "commit_install":
+            return self.commit_install(request)
+        if operation == "rollback_install":
+            return self.rollback_install(request)
         if operation == "uninstall":
             return self.uninstall(request)
         identifier = request.get("id")
@@ -697,9 +705,13 @@ class Host:
         except RootHostError:
             self.password_retry_at = time.monotonic() + _PASSWORD_RETRY_SECONDS
             raise
+        self._commit_pending_install(directory)
         archive = _download(artifact, _MAX_ARCHIVE_BYTES)
         if hashlib.sha256(archive).hexdigest() != sha256:
             raise RootHostError("the downloaded plugin does not match its SHA-256")
+        defer_commit = request.get("defer_commit") is True
+        old_entry = self.config.approved_directories().get(directory) if defer_commit else None
+        previous_entry = dict(old_entry) if isinstance(old_entry, dict) else None
 
         plugins_fd = self._plugin_root_fd()
         stage = f".decky-root-stage-{uuid.uuid4().hex}"
@@ -723,6 +735,10 @@ class Host:
                 finally:
                     os.close(stage_fd)
                 backup = self._replace(plugins_fd, stage, directory)
+                backup_info = os.stat(backup, dir_fd=plugins_fd, follow_symlinks=False) if defer_commit and backup else None
+                if not backup:
+                    # An approval whose folder is gone has nothing to roll back to.
+                    previous_entry = None
             except BaseException:
                 shutil.rmtree(stage, dir_fd=plugins_fd, ignore_errors=True)
                 raise
@@ -734,11 +750,120 @@ class Host:
                 if backup:
                     os.rename(backup, directory, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
                 raise
-            if backup:
+            transaction = None
+            if defer_commit:
+                transaction = uuid.uuid4().hex
+                identity = (backup_info.st_dev, backup_info.st_ino) if backup_info is not None else None
+                self.pending_installs[directory] = (
+                    transaction, backup, identity, previous_entry, entry,
+                )
+            elif backup:
                 shutil.rmtree(backup, dir_fd=plugins_fd, ignore_errors=True)
         finally:
             os.close(plugins_fd)
-        return {"ok": True, "op": "installed", "directory": directory, **entry}
+        response = {"ok": True, "op": "installed", "directory": directory, **entry}
+        if transaction is not None:
+            response["transaction"] = transaction
+        return response
+
+    def _pending_install(
+        self, request: dict[str, Any],
+    ) -> tuple[str, str, tuple[int, int] | None, dict[str, Any] | None, dict[str, Any]]:
+        directory = _directory_name(request.get("directory"))
+        pending = self.pending_installs.get(directory)
+        if pending is None or not isinstance(request.get("transaction"), str) or request["transaction"] != pending[0]:
+            raise RootHostError(f"there is no pending install for {directory} with that transaction")
+        return pending
+
+    def _remove_install_backup(
+        self, plugins_fd: int, backup: str, identity: tuple[int, int] | None,
+    ) -> None:
+        if not backup:
+            return
+        info = os.stat(backup, dir_fd=plugins_fd, follow_symlinks=False)
+        if identity != (info.st_dev, info.st_ino):
+            raise RootHostError("the pending install backup changed")
+        if stat.S_ISDIR(info.st_mode):
+            shutil.rmtree(backup, dir_fd=plugins_fd)
+        else:
+            os.unlink(backup, dir_fd=plugins_fd)
+
+    def _commit_pending_install(self, directory: str) -> None:
+        pending = self.pending_installs.get(directory)
+        if pending is None:
+            return
+        _, backup, identity, _, _ = pending
+        plugins_fd = self._plugin_root_fd()
+        try:
+            try:
+                self._remove_install_backup(plugins_fd, backup, identity)
+            except FileNotFoundError:
+                pass
+        finally:
+            os.close(plugins_fd)
+        del self.pending_installs[directory]
+
+    def commit_install(self, request: dict[str, Any]) -> dict[str, Any]:
+        directory = _directory_name(request.get("directory"))
+        self._pending_install(request)
+        self._commit_pending_install(directory)
+        return {"ok": True, "op": "install_committed", "directory": directory}
+
+    def rollback_install(self, request: dict[str, Any]) -> dict[str, Any]:
+        directory = _directory_name(request.get("directory"))
+        _, backup, identity, previous_entry, new_entry = self._pending_install(request)
+        if any(running == directory for running, _ in self.directories.values()):
+            raise RootHostError(f"{directory} is running; stop it first")
+        plugins_fd = self._plugin_root_fd()
+        failed = f".decky-root-stage-{uuid.uuid4().hex}"
+        try:
+            current_fd = os.open(directory, _DIRECTORY_FLAGS, dir_fd=plugins_fd)
+            try:
+                current_info = os.fstat(current_fd)
+                if plugin_tree_sha256(current_fd) != new_entry.get("tree_sha256"):
+                    raise RootHostError(f"the installed plugin folder for {directory} changed")
+            finally:
+                os.close(current_fd)
+            if backup:
+                backup_fd = os.open(backup, _DIRECTORY_FLAGS, dir_fd=plugins_fd)
+                try:
+                    backup_info = os.fstat(backup_fd)
+                    if identity != (backup_info.st_dev, backup_info.st_ino):
+                        raise RootHostError("the pending install backup changed")
+                    if previous_entry is not None and plugin_tree_sha256(backup_fd) != previous_entry.get("tree_sha256"):
+                        raise RootHostError("the pending install backup does not match the previous approval")
+                finally:
+                    os.close(backup_fd)
+            current_path = os.stat(directory, dir_fd=plugins_fd, follow_symlinks=False)
+            if (current_info.st_dev, current_info.st_ino) != (current_path.st_dev, current_path.st_ino):
+                raise RootHostError(f"the installed plugin folder for {directory} changed")
+            os.rename(directory, failed, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+            try:
+                if backup:
+                    os.rename(backup, directory, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+                self.config.record(directory, previous_entry)
+            except BaseException as error:
+                try:
+                    if backup:
+                        try:
+                            os.stat(directory, dir_fd=plugins_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            os.rename(directory, backup, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+                    os.rename(failed, directory, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+                except BaseException as restore_error:
+                    raise RootHostError(f"{error}; restoring the installed plugin also failed: {restore_error}") from error
+                raise
+            del self.pending_installs[directory]
+            try:
+                shutil.rmtree(failed, dir_fd=plugins_fd)
+            except OSError as error:
+                # The rollback is complete; startup cleanup removes what is left.
+                print(f"DeckyRootHost: could not remove rolled-back plugin folder {failed}: {error}", file=sys.stderr, flush=True)
+        finally:
+            os.close(plugins_fd)
+        return {"ok": True, "op": "install_rolled_back", "directory": directory}
 
     @staticmethod
     def _replace(plugins_fd: int, stage: str, directory: str) -> str:
@@ -763,6 +888,7 @@ class Host:
         directory = _directory_name(request.get("directory"))
         if any(running == directory for running, _ in self.directories.values()):
             raise RootHostError(f"{directory} is running; stop it first")
+        self._commit_pending_install(directory)
         plugins_fd = self._plugin_root_fd()
         try:
             try:
@@ -896,6 +1022,35 @@ class Host:
     def request_poll(self, _signum: int, _frame: Any) -> None:
         self.children_changed = True
 
+    def _cleanup_stale_backups(self) -> None:
+        try:
+            plugins_fd = self._plugin_root_fd()
+        except FileNotFoundError:
+            return
+        try:
+            for name in os.listdir(plugins_fd):
+                match = re.fullmatch(r"\.decky-root-(backup|stage)-[0-9a-f]{32}", name)
+                if match is None:
+                    continue
+                try:
+                    info = os.stat(name, dir_fd=plugins_fd, follow_symlinks=False)
+                    if info.st_uid == 0 or (match[1] == "backup" and info.st_uid == self.config.uid):
+                        if stat.S_ISDIR(info.st_mode):
+                            shutil.rmtree(name, dir_fd=plugins_fd)
+                        else:
+                            os.unlink(name, dir_fd=plugins_fd)
+                except OSError as error:
+                    print(f"DeckyRootHost: could not remove stale plugin backup {name}: {error}", file=sys.stderr, flush=True)
+        finally:
+            os.close(plugins_fd)
+
+    def _resolve_pending_installs(self) -> None:
+        for directory in list(self.pending_installs):
+            try:
+                self._commit_pending_install(directory)
+            except (OSError, RootHostError) as error:
+                print(f"DeckyRootHost: could not commit pending install for {directory}: {error}", file=sys.stderr, flush=True)
+
     def run(self) -> int:
         signal.set_wakeup_fd(self.wake_write)
         signal.signal(signal.SIGTERM, self.request_stop)
@@ -903,6 +1058,7 @@ class Host:
         signal.signal(signal.SIGCHLD, self.request_poll)
         idle_since = time.monotonic()
         try:
+            self._cleanup_stale_backups()
             while not self.stopping:
                 if self.children_changed:
                     self.children_changed = False
@@ -941,6 +1097,7 @@ class Host:
             return 0
         finally:
             signal.set_wakeup_fd(-1)
+            self._resolve_pending_installs()
             self.stop_all()
 
 

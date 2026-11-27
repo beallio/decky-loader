@@ -22,6 +22,7 @@ import {
   restoreStoreView,
   sortStorePlugins,
   tagGroups,
+  versionsFromPluginList,
   withoutPrereleases,
 } from '../../frontend/src/storeSources.ts';
 
@@ -439,4 +440,15 @@ test('createUpdateCheckDeduplicator coalesces in-flight checks and caches only c
   assert.equal(calls, 4);
   resolveRun!();
   assert.equal(await fifth, 4);
+});
+test('plugin-list versions include names that collide with object prototype keys', () => {
+  const versions = versionsFromPluginList([
+    plugin('__proto__', '2.0.0', '1.0.0'),
+    plugin('constructor', '2.0.0', '1.0.0'),
+    plugin('toString', '2.0.0', '1.0.0'),
+    plugin('normal', '2.0.0', '1.0.0'),
+  ]);
+  for (const name of ['__proto__', 'constructor', 'toString', 'normal']) {
+    assert.deepEqual(versions[name], ['2.0.0', `${name}-2.0.0`]);
+  }
 });

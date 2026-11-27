@@ -2821,7 +2821,11 @@ fn is_managed_plugin_directory(plugin_root: &Path, directory: &Path) -> bool {
     directory
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with(".decky-stage-") || name.starts_with(".decky-backup-"))
+        .is_some_and(|name| {
+            name.starts_with(".decky-stage-")
+                || name.starts_with(".decky-backup-")
+                || name.starts_with(".decky-root-")
+        })
 }
 
 fn changed_plugin_directory(plugin_root: &Path, source: &Path) -> Option<String> {
@@ -3046,7 +3050,11 @@ async fn live_reload_loop(
                 owner.live_reload_resync.store(true, Ordering::Release);
                 break;
             }
-            let _ = owner.import_directory(&directory, true, false).await;
+            if let Err(error) = owner.import_directory(&directory, true, false).await
+                && error != WorkerError::Stopped
+            {
+                eprintln!("Could not reload plugin directory {directory}: {error}");
+            }
         }
     }
 }
@@ -3991,7 +3999,7 @@ mod worker_message_tests {
 }
 #[cfg(test)]
 mod inotify_parser_tests {
-    use super::{INOTIFY_EVENT_HEADER_SIZE, parse_inotify_events};
+    use super::{INOTIFY_EVENT_HEADER_SIZE, is_managed_plugin_directory, parse_inotify_events};
     use std::path::Path;
 
     fn event_header(watch_descriptor: i32, mask: u32, name_length: u32) -> Vec<u8> {
@@ -4027,6 +4035,23 @@ mod inotify_parser_tests {
         assert_eq!(events[0].watch_descriptor, 7);
         assert_eq!(events[0].mask, 3);
         assert_eq!(events[0].name.as_deref(), Some(Path::new("abc")));
+    }
+
+    #[test]
+    fn loader_and_root_host_work_folders_are_not_plugins() {
+        let root = Path::new("/home/deck/homebrew/plugins");
+        for name in [
+            ".decky-stage-a",
+            ".decky-backup-a",
+            ".decky-root-stage-a",
+            ".decky-root-backup-a",
+        ] {
+            assert!(
+                is_managed_plugin_directory(root, &root.join(name)),
+                "{name}"
+            );
+        }
+        assert!(!is_managed_plugin_directory(root, &root.join("Tools")));
     }
 }
 
@@ -4474,5 +4499,59 @@ mod worker_shutdown_tests {
             write_result.is_err(),
             "socket shutdown did not cancel the write"
         );
+    }
+
+    #[tokio::test]
+    async fn teardown_kills_sigterm_ignoring_worker_descendants() {
+        let directory = crate::test_support::TestDirectory::new("worker-descendants");
+        let pid_file = directory.0.join("descendant.pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap \"\" TERM; sh -c 'trap \"\" TERM; echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec sleep 30' sh \"$1\" & wait")
+            .arg("worker")
+            .arg(&pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.as_std_mut().process_group(0);
+        let child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        let group = ProcessGroupGuard { pid };
+        timeout(Duration::from_secs(1), async {
+            while !pid_file.exists() {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("worker descendant did not start");
+        let descendant: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let (stop, stop_receiver) = mpsc::unbounded_channel();
+        stop.send(()).unwrap();
+        timeout(
+            WORKER_GRACEFUL_TIMEOUT + Duration::from_secs(2),
+            reap_child(child, stop_receiver, pid, group),
+        )
+        .await
+        .expect("worker teardown exceeded its deadline")
+        .unwrap();
+        // The killed descendant can stay a zombie briefly until its new parent reaps it.
+        let error = timeout(Duration::from_secs(1), async {
+            loop {
+                // SAFETY: signal 0 only checks whether the process exists.
+                if unsafe { libc::kill(descendant, 0) } == -1 {
+                    break io::Error::last_os_error();
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("SIGTERM-ignoring worker descendant survived teardown");
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
     }
 }

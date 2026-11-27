@@ -72,6 +72,20 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
+#[derive(Debug)]
+struct Busy;
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the root plugin host is busy; timed out waiting for another request"
+        )
+    }
+}
+
+impl std::error::Error for Busy {}
+
 impl RootHost {
     pub(crate) async fn connect(path: &Path, environment: HostEnvironment<'_>) -> Result<Self> {
         let stream = timeout(CONTROL_TIMEOUT, UnixStream::connect(path))
@@ -150,7 +164,7 @@ impl RootHost {
     }
 
     pub(crate) async fn release_child(&self, id: &str) -> Result<()> {
-        self.request(
+        self.request_waiting(
             json!({"op": "release", "id": id}),
             "released",
             CONTROL_TIMEOUT,
@@ -162,7 +176,7 @@ impl RootHost {
     /// `None` while the plugin runs; its wait status after it exits.
     pub(crate) async fn child_status(&self, id: &str) -> Result<Option<i32>> {
         let response = self
-            .request(json!({"op": "status", "id": id}), "status", CONTROL_TIMEOUT)
+            .request_waiting(json!({"op": "status", "id": id}), "status", CONTROL_TIMEOUT)
             .await?;
         if response["running"].as_bool() == Some(true) {
             return Ok(None);
@@ -177,7 +191,7 @@ impl RootHost {
     /// Stops the plugin's process group (SIGTERM, then SIGKILL) and returns its wait status.
     pub(crate) async fn stop_child(&self, id: &str) -> Result<i32> {
         let response = self
-            .request(json!({"op": "stop", "id": id}), "stopped", STOP_TIMEOUT)
+            .request_waiting(json!({"op": "stop", "id": id}), "stopped", STOP_TIMEOUT)
             .await?;
         wait_status(&response)
     }
@@ -191,13 +205,35 @@ impl RootHost {
         sha256: &str,
         artifact: &str,
         password: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
+        let response = self
+            .request(
+                json!({
+                    "op": "install", "directory": directory, "name": name,
+                    "sha256": sha256, "artifact": artifact, "password": password,
+                    "defer_commit": true,
+                }),
+                "installed",
+                INSTALL_TIMEOUT,
+            )
+            .await?;
+        Ok(response["transaction"].as_str().map(str::to_owned))
+    }
+
+    pub(crate) async fn commit_install(&self, directory: &str, transaction: &str) -> Result<()> {
         self.request(
-            json!({
-                "op": "install", "directory": directory, "name": name,
-                "sha256": sha256, "artifact": artifact, "password": password,
-            }),
-            "installed",
+            json!({"op": "commit_install", "directory": directory, "transaction": transaction}),
+            "install_committed",
+            INSTALL_TIMEOUT,
+        )
+        .await
+        .map(drop)
+    }
+
+    pub(crate) async fn rollback_install(&self, directory: &str, transaction: &str) -> Result<()> {
+        self.request(
+            json!({"op": "rollback_install", "directory": directory, "transaction": transaction}),
+            "install_rolled_back",
             INSTALL_TIMEOUT,
         )
         .await
@@ -215,7 +251,7 @@ impl RootHost {
     }
 
     pub(crate) async fn forget_child(&self, id: &str) -> Result<()> {
-        self.request(
+        self.request_waiting(
             json!({"op": "forget", "id": id}),
             "forgotten",
             CONTROL_TIMEOUT,
@@ -224,10 +260,27 @@ impl RootHost {
         .map(drop)
     }
 
+    /// Plugin lifecycle requests must finish, as before the lock wait had a deadline:
+    /// wait through another request (such as a long install) instead of returning busy.
+    async fn request_waiting(
+        &self,
+        request: Value,
+        expected: &str,
+        limit: Duration,
+    ) -> Result<Value> {
+        loop {
+            match self.request(request.clone(), expected, limit).await {
+                Err(error) if error.downcast_ref::<Busy>().is_some() => continue,
+                result => return result,
+            }
+        }
+    }
+
     async fn request(&self, request: Value, expected: &str, limit: Duration) -> Result<Value> {
         let result = self.request_inner(request, expected, limit).await;
         if let Err(error) = &result
             && error.downcast_ref::<Refused>().is_none()
+            && error.downcast_ref::<Busy>().is_none()
         {
             self.mark_failed();
         }
@@ -240,34 +293,46 @@ impl RootHost {
         expected: &str,
         limit: Duration,
     ) -> Result<Value> {
-        if self.is_failed() {
-            bail!("the root plugin host connection has failed");
+        let mut acquired_control = false;
+        match timeout(limit, async {
+            if self.is_failed() {
+                bail!("the root plugin host connection has failed");
+            }
+            let mut control = self.control.lock().await;
+            acquired_control = true;
+            let mut bytes = serde_json::to_vec(&request).context("encoding root host request")?;
+            bytes.push(b'\n');
+            control
+                .input
+                .write_all(&bytes)
+                .await
+                .context("writing root host request")?;
+            let mut line = String::new();
+            let count = control
+                .output
+                .read_line(&mut line)
+                .await
+                .context("reading root host response")?;
+            if count == 0 {
+                bail!("the root plugin host closed its control connection");
+            }
+            let response: Value =
+                serde_json::from_str(&line).context("decoding root host response")?;
+            if response["ok"].as_bool() != Some(true) {
+                let error = response["error"].as_str().unwrap_or("unspecified error");
+                return Err(Refused(error.to_owned()).into());
+            }
+            if response["op"].as_str() != Some(expected) {
+                bail!("the root plugin host returned an unexpected response: {response}");
+            }
+            Ok(response)
+        })
+        .await
+        {
+            Err(_) if !acquired_control => Err(Busy.into()),
+            Err(_) => bail!("timed out waiting for the root plugin host"),
+            Ok(result) => result,
         }
-        let mut control = self.control.lock().await;
-        let mut bytes = serde_json::to_vec(&request).context("encoding root host request")?;
-        bytes.push(b'\n');
-        control
-            .input
-            .write_all(&bytes)
-            .await
-            .context("writing root host request")?;
-        let mut line = String::new();
-        let count = timeout(limit, control.output.read_line(&mut line))
-            .await
-            .context("timed out waiting for the root plugin host")?
-            .context("reading root host response")?;
-        if count == 0 {
-            bail!("the root plugin host closed its control connection");
-        }
-        let response: Value = serde_json::from_str(&line).context("decoding root host response")?;
-        if response["ok"].as_bool() != Some(true) {
-            let error = response["error"].as_str().unwrap_or("unspecified error");
-            return Err(Refused(error.to_owned()).into());
-        }
-        if response["op"].as_str() != Some(expected) {
-            bail!("the root plugin host returned an unexpected response: {response}");
-        }
-        Ok(response)
     }
 }
 
@@ -435,5 +500,93 @@ mod tests {
             server.await.unwrap(),
             "the old host session did not see EOF"
         );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_includes_waiting_for_the_control_lock() {
+        let (path, _server) = serve(vec![json!({"ok": true, "op": "hello", "protocol": 1})]).await;
+        let host = RootHost::connect(&path, ENVIRONMENT).await.unwrap();
+        let guard = host.control.lock().await;
+        let result = timeout(
+            Duration::from_millis(250),
+            host.request(
+                json!({"op": "stall"}),
+                "finished",
+                Duration::from_millis(20),
+            ),
+        )
+        .await;
+        drop(guard);
+
+        let error = result
+            .expect("request did not enforce its own deadline")
+            .unwrap_err();
+        assert!(error.to_string().contains("busy"), "{error}");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(!host.is_failed());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_requests_wait_through_another_request() {
+        let (path, server) = serve(vec![
+            json!({"ok": true, "op": "hello", "protocol": 1}),
+            json!({"ok": true, "op": "status", "id": "a", "running": true}),
+        ])
+        .await;
+        let host = RootHost::connect(&path, ENVIRONMENT).await.unwrap();
+        let guard = host.control.lock().await;
+        let (result, ()) = tokio::join!(
+            host.request_waiting(
+                json!({"op": "status", "id": "a"}),
+                "status",
+                Duration::from_millis(20),
+            ),
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(guard);
+            }
+        );
+
+        assert_eq!(result.unwrap()["running"], true);
+        assert!(!host.is_failed());
+        assert_eq!(server.await.unwrap()[1], json!({"op": "status", "id": "a"}));
+    }
+
+    #[tokio::test]
+    async fn deferred_install_uses_the_transaction_only_when_the_host_returns_one() {
+        let (path, server) = serve(vec![
+            json!({"ok": true, "op": "hello", "protocol": 1}),
+            json!({"ok": true, "op": "installed", "directory": "Tools", "transaction": "t1"}),
+            json!({"ok": true, "op": "install_committed", "directory": "Tools"}),
+            json!({"ok": true, "op": "installed", "directory": "Tools"}),
+            json!({"ok": true, "op": "install_rolled_back", "directory": "Tools"}),
+        ])
+        .await;
+        let host = RootHost::connect(&path, ENVIRONMENT).await.unwrap();
+        let token = host
+            .install("Tools", "Tools", "hash", "https://x/t.zip", "pw")
+            .await
+            .unwrap();
+        assert_eq!(token.as_deref(), Some("t1"));
+        host.commit_install("Tools", "t1").await.unwrap();
+        // An older host ignores defer_commit and returns no token.
+        let legacy = host
+            .install("Tools", "Tools", "hash", "https://x/t.zip", "pw")
+            .await
+            .unwrap();
+        assert_eq!(legacy, None);
+        host.rollback_install("Tools", "t2").await.unwrap();
+
+        let seen = server.await.unwrap();
+        assert_eq!(seen[1]["defer_commit"], true);
+        assert_eq!(
+            seen[2],
+            json!({"op": "commit_install", "directory": "Tools", "transaction": "t1"})
+        );
+        assert_eq!(
+            seen[4],
+            json!({"op": "rollback_install", "directory": "Tools", "transaction": "t2"})
+        );
+        assert!(!host.is_failed());
     }
 }

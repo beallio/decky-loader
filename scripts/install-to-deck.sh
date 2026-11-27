@@ -832,6 +832,11 @@ for suffix in range(1000):
     for _, name in sorted(archives, reverse=True)[KEEP:]:
         if name != final.name:
             os.unlink(backup_directory / name)
+    directory_fd = os.open(backup_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
     print(final)
     break
 else:

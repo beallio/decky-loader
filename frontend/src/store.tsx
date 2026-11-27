@@ -14,6 +14,7 @@ import {
   migrateStoreSettings,
   providerVersion,
   storeSources,
+  versionsFromPluginList,
   withoutPrereleases,
 } from './storeSources';
 import { getSetting, setSetting } from './utils/settings';
@@ -223,16 +224,6 @@ async function fetchVersionList(storeURL: string, signal: AbortSignal): Promise<
   const plugins = await fetchPluginList(storeURL, signal);
   const { includePrereleases } = await getStoreSettings();
   return versionsFromPluginList(includePrereleases ? plugins : withoutPrereleases(plugins));
-}
-
-function versionsFromPluginList(plugins: StorePlugin[]): UpdateEndpointVersions {
-  const versions: UpdateEndpointVersions = {};
-  for (const plugin of plugins) {
-    const latest = plugin.versions?.[0];
-    if (!latest || plugin.name in versions) continue;
-    versions[plugin.name] = latest.artifact ? [latest.name, latest.hash, latest.artifact] : [latest.name, latest.hash];
-  }
-  return versions;
 }
 
 export async function installFromURL(url: string) {

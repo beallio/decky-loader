@@ -156,6 +156,15 @@ export function githubRepoUrl(artifact: string | null | undefined): string | nul
     return null;
   }
 }
+export function versionsFromPluginList(plugins: StorePlugin[]): UpdateEndpointVersions {
+  const versions = Object.create(null) as UpdateEndpointVersions;
+  for (const plugin of plugins) {
+    const latest = plugin.versions?.[0];
+    if (!latest || plugin.name in versions) continue;
+    versions[plugin.name] = latest.artifact ? [latest.name, latest.hash, latest.artifact] : [latest.name, latest.hash];
+  }
+  return versions;
+}
 
 export function storeSources(settings: StoreSettings): StoreSource[] {
   return [

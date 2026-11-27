@@ -802,6 +802,30 @@ class UserServiceInstallerTests(unittest.TestCase):
             self.assertEqual(target.stat().st_mtime_ns, 2_000_000_000)
             self.assertEqual(os.getxattr(target, "user.decky"), b"kept")
 
+    def test_copy_tree_at_retries_short_writes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_path = root / "source"
+            destination_path = root / "destination"
+            source_path.mkdir()
+            destination_path.mkdir()
+            payload = b"the complete plugin file contents"
+            (source_path / "plugin.py").write_bytes(payload)
+            source_fd = os.open(source_path, os.O_RDONLY | os.O_DIRECTORY)
+            destination_fd = os.open(destination_path, os.O_RDONLY | os.O_DIRECTORY)
+            real_write = os.write
+
+            def short_write(descriptor, data):
+                return real_write(descriptor, data[:3])
+
+            try:
+                with patch.object(installer.os, "write", side_effect=short_write):
+                    installer._copy_tree_at(source_fd, destination_fd)
+            finally:
+                os.close(source_fd)
+                os.close(destination_fd)
+            self.assertEqual((destination_path / "plugin.py").read_bytes(), payload)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -642,35 +642,116 @@ impl PluginManager {
             95,
             "Store.download_progress_info.installing_plugin",
         );
-        if let Err(error) = host
+        let transaction = match host
             .install(directory, name, sha256, &request.artifact, password)
             .await
         {
-            let restore_error = if was_registered {
-                restore_registered_plugin(backend, old_directory.as_deref())
-                    .await
-                    .err()
-            } else {
-                None
-            };
-            return Err(RpcError::failure(with_rollback_error(
-                format!("Could not install {name}: {error:#}"),
-                restore_error,
-            )));
-        }
+            Ok(transaction) => transaction,
+            Err(error) => {
+                let restore_error = if was_registered {
+                    restore_registered_plugin(backend, old_directory.as_deref())
+                        .await
+                        .err()
+                } else {
+                    None
+                };
+                return Err(RpcError::failure(with_rollback_error(
+                    format!("Could not install {name}: {error:#}"),
+                    restore_error,
+                )));
+            }
+        };
 
         if let Some(before) = &before_settings {
             let mut after = before.clone();
             reconcile_install_settings(&mut after, name, was_registered, was_installed);
-            persist_settings_lists(backend, before, &after).await?;
+            if let Err(error) = persist_settings_lists(backend, before, &after).await {
+                let Some(transaction) = &transaction else {
+                    return Err(error);
+                };
+                // persist_settings_lists already restored the lists it changed.
+                let rollback_error = Self::rollback_root_install(
+                    backend,
+                    &host,
+                    directory,
+                    transaction,
+                    None,
+                    was_registered,
+                    old_directory.as_deref(),
+                )
+                .await
+                .err();
+                return Err(RpcError::failure(with_rollback_error(
+                    rpc_error_text(&error),
+                    rollback_error,
+                )));
+            }
         }
-        backend
+        if let Err(error) = backend
             .registry
             .import_directory(directory, false, false)
             .await
-            .map_err(|error| {
-                RpcError::failure(format!("Could not load installed plugin {name}: {error}"))
-            })
+        {
+            let message = format!("Could not load installed plugin {name}: {error}");
+            let rollback_error = if let Some(transaction) = &transaction {
+                Self::rollback_root_install(
+                    backend,
+                    &host,
+                    directory,
+                    transaction,
+                    before_settings.as_ref(),
+                    was_registered,
+                    old_directory.as_deref(),
+                )
+                .await
+                .err()
+            } else {
+                None
+            };
+            return Err(RpcError::failure(with_rollback_error(
+                message,
+                rollback_error,
+            )));
+        }
+
+        if let Some(transaction) = &transaction
+            && let Err(error) = host.commit_install(directory, transaction).await
+        {
+            eprintln!("Could not commit root plugin install for {name}: {error:#}");
+        }
+        Ok(())
+    }
+
+    async fn rollback_root_install(
+        backend: &Backend,
+        host: &crate::root_host::RootHost,
+        directory: &str,
+        transaction: &str,
+        before_settings: Option<&SettingsLists>,
+        was_registered: bool,
+        old_directory: Option<&Path>,
+    ) -> Result<(), String> {
+        let mut failures = Vec::new();
+        if let Some(before) = before_settings
+            && let Err(error) = restore_settings_lists(backend, before).await
+        {
+            failures.push(rpc_error_text(&error));
+        }
+        match host.rollback_install(directory, transaction).await {
+            Ok(()) => {
+                if was_registered
+                    && let Err(error) = restore_registered_plugin(backend, old_directory).await
+                {
+                    failures.push(error);
+                }
+            }
+            Err(error) => failures.push(format!("restoring root plugin files failed: {error:#}")),
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
     }
 
     async fn commit_staged_plugin(
@@ -1684,7 +1765,9 @@ fn find_plugin_directory(plugin_root: &Path, name: &str) -> Result<Option<PathBu
             continue;
         }
         if entry.file_name().to_str().is_some_and(|name| {
-            name.starts_with(".decky-stage-") || name.starts_with(".decky-backup-")
+            name.starts_with(".decky-stage-")
+                || name.starts_with(".decky-backup-")
+                || name.starts_with(".decky-root-")
         }) {
             continue;
         }
